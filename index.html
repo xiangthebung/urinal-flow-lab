@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Urinal Flow Lab — splashback &amp; drainage simulator</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div class="brand">
+          <strong>Urinal Flow Lab</strong>
+          <span class="sub">splashback &amp; drainage simulator</span>
+        </div>
+        <div id="preset-slot"></div>
+        <div id="topbar-actions"></div>
+      </header>
+
+      <aside id="left" class="sidebar"></aside>
+
+      <main id="stage">
+        <div id="view-tabs" class="tabs" role="tablist" aria-label="Surface data view"></div>
+        <canvas id="gl"></canvas>
+        <div id="legend" class="legend"></div>
+        <div id="hud" class="hud"></div>
+        <div id="overlay-note" class="overlay-note"></div>
+        <div id="progress" class="progress hidden">
+          <div class="progress-label">Running analysis…</div>
+          <div class="progress-track"><div class="progress-fill"></div></div>
+        </div>
+      </main>
+
+      <aside id="right" class="sidebar"></aside>
+
+      <footer id="transport"></footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

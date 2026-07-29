@@ -1,0 +1,23 @@
+{
+  "name": "urinal-flow-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Physics-based urinal splashback and drainage simulator for sanitaryware designers",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "validate": "tsx src/validation/runCli.ts"
+  },
+  "dependencies": {
+    "three": "0.169.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.169.0",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vite": "5.4.10"
+  }
+}
