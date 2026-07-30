@@ -1,4 +1,5 @@
 import { App } from './ui/app';
+import { attachAutomation } from './ui/automation';
 
 /**
  * Entry point.
@@ -8,7 +9,11 @@ import { App } from './ui/app';
  */
 function boot(): void {
   try {
-    new App();
+    // The scripted control surface is attached unconditionally. It is a few
+    // hundred bytes, it has no effect unless something calls it, and gating it
+    // behind a build flag would mean the thing used to verify the app is not
+    // present in the app that ships.
+    attachAutomation(new App());
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const stage = document.getElementById('stage');

@@ -3,3 +3,7 @@ dist/
 .DS_Store
 *.log
 .vite/
+
+# Offline render output from tools/shoot.mts and tools/preview.mts
+tools/shots/
+tools/out.png

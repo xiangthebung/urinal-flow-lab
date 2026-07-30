@@ -3,11 +3,11 @@ import {
   ProfileParams,
   buildProfile,
   defaultProfileParams,
-  profileTangent,
   resampleByArclength,
 } from './profile';
 import { Vec3, v3 } from '../core/vec3';
 import { Bvh } from './bvh';
+import { buildWrapProfile as computeWrapProfile, defaultWrapOptions } from './wrap';
 
 /**
  * The urinal as a parametric lofted surface S(u, v).
@@ -206,6 +206,7 @@ export class UrinalSurface {
     this.triUv = new Float32Array(this.nu * this.nv * 2 * 6);
 
     this.buildWrapProfile();
+    this.buildSections();
     this.buildVertices();
     this.buildIndices();
     this.buildCellMetrics();
@@ -273,12 +274,24 @@ export class UrinalSurface {
     const wSump = Math.max(0.008, p.widthSump * 0.5);
     const wLip = p.widthLip * 0.5;
     const e = Math.max(0.3, p.taperExponent);
+    // Smoothstepped, so the width arrives at the sump with zero slope from both
+    // sides. The previous form was continuous but not smooth there: it used
+    // pow(t, 1/e) on the way up the front rise, which for any exponent above 1 has
+    // an infinite derivative at the sump. The width therefore changed
+    // discontinuously fast at exactly the point where the profile is horizontal,
+    // the v tangent picked up an unbounded lateral component, and the cells at the
+    // outer edge of the sump ended up skewed to 6 degrees with their normals
+    // flipped against their neighbours -- which silently inverts gravity and the
+    // impact angle in the few cells that decide drainage. The exponent still
+    // controls whether the taper is delayed or early; it no longer controls
+    // whether the surface is differentiable.
+    const S = (x: number) => x * x * (3 - 2 * x);
     if (v <= vSump) {
-      const t = vSump > 1e-6 ? v / vSump : 0;
-      return wRim + (wSump - wRim) * Math.pow(t, e);
+      const t = vSump > 1e-6 ? Math.min(1, v / vSump) : 0;
+      return wRim + (wSump - wRim) * S(Math.pow(t, e));
     }
-    const t = vSump < 1 - 1e-6 ? (v - vSump) / (1 - vSump) : 0;
-    return wSump + (wLip - wSump) * Math.pow(t, 1 / e);
+    const t = vSump < 1 - 1e-6 ? Math.min(1, (v - vSump) / (1 - vSump)) : 0;
+    return wSump + (wLip - wSump) * S(t);
   }
 
   /**
@@ -303,48 +316,95 @@ export class UrinalSurface {
    */
   private wrapProfile!: Float64Array;
 
-  /**
-   * Precompute and smooth the wrap along the profile.
-   *
-   * Smoothing is not cosmetic. The v-direction tangent picks up d(wrap)/dv times
-   * the section shape, so wherever the wrap changes quickly it injects a large
-   * z-component into that tangent -- and near the throat, where the profile swings
-   * from vertical to horizontal over a couple of centimetres, the raw factor
-   * changes fast enough to re-create the same near-parallel tangents it was
-   * introduced to remove. A few 1-2-1 passes bound the gradient and spread the
-   * transition over several cells, which is where a real fixture blends it anyway.
-   */
+  /** Side-edge stand-off along the profile. See geometry/wrap.ts for the why. */
   private buildWrapProfile(): void {
     const p = this.params;
-    const decay = Math.max(0.1, p.wrapDecay);
-    const n = this.nv + 1;
-    const raw = new Float64Array(n);
-    for (let j = 0; j < n; j++) {
-      const v = j / this.nv;
-      const taper = Math.pow(Math.max(0, 1 - v), decay);
-      const t = profileTangent(this.profile, j);
-      raw[j] = p.wrapDepth * taper * Math.abs(t.y);
-    }
-    // Endpoints are held: the rim must keep its full wrap and the lip its zero.
-    const tmp = new Float64Array(n);
-    for (let pass = 0; pass < 10; pass++) {
-      tmp[0] = raw[0];
-      tmp[n - 1] = raw[n - 1];
-      for (let j = 1; j < n - 1; j++) {
-        tmp[j] = 0.25 * raw[j - 1] + 0.5 * raw[j] + 0.25 * raw[j + 1];
-      }
-      raw.set(tmp);
-    }
-    this.wrapProfile = raw;
+    this.wrapProfile = computeWrapProfile(this.profile, this.sumpIndex(), this.nv + 1, {
+      ...defaultWrapOptions(),
+      depth: p.wrapDepth,
+      decay: p.wrapDecay,
+    });
   }
 
-  /** Forward stand-off of the side edges relative to the centreline at v. */
-  private wrapAt(v: number): number {
-    const n = this.nv;
-    const x = Math.min(n, Math.max(0, v * n));
-    const j = Math.min(n - 1, Math.floor(x));
-    const f = x - j;
-    return this.wrapProfile[j] * (1 - f) + this.wrapProfile[j + 1] * f;
+  /**
+   * Lateral and forward offset of every vertex in every horizontal section,
+   * indexed the same way as the vertex grid.
+   *
+   * The section used to be written directly as x = halfWidth * u and
+   * z = profile.z + wrap * |u|^exponent. That is compact and it has a defect that
+   * cost this project a great deal: it displaces depth but never builds a side
+   * wall. Near |u| = 1 the surface runs almost entirely in z while dx/du stays
+   * constant, so cells there are stretched along one axis, the two parametric
+   * tangents come close to parallel, the cell area collapses and the normal is
+   * decided by rounding noise -- which flips it against its neighbours and inverts
+   * gravity and the impact angle in those cells.
+   *
+   * The practical consequence was worse than a few bad cells. Deepening the wrap
+   * to enclose the bowl made the skew worse, and reducing it to keep the grid
+   * clean left an open scoop that neither looked like a urinal nor contained any
+   * splash. Enclosure and grid quality were in direct conflict, and no value of
+   * the parameter was good.
+   *
+   * So the section is now a superellipse quadrant walked at constant arclength.
+   * It leaves the centreline heading straight across and arrives at the side edge
+   * heading straight forward, which is a genuine wall whose normal is +-x, and
+   * because u advances by equal arclength rather than equal width the cells stay
+   * near-square however deep the wrap goes. Enclosure and conditioning stop
+   * fighting: both improve together.
+   */
+  private sectionX!: Float64Array;
+  private sectionZ!: Float64Array;
+
+  private buildSections(): void {
+    const stride = this.nu + 1;
+    const total = stride * (this.nv + 1);
+    this.sectionX = new Float64Array(total);
+    this.sectionZ = new Float64Array(total);
+
+    // Resolution of the traced quadrant. Independent of nu so the arclength
+    // measure does not change when the solver grid changes.
+    const SAMPLES = 128;
+    const xs = new Float64Array(SAMPLES + 1);
+    const zs = new Float64Array(SAMPLES + 1);
+    const arc = new Float64Array(SAMPLES + 1);
+    // 2 is a circular quarter arc, higher is squarer in plan. Clamped low so the
+    // start and end tangents stay well defined.
+    const n = Math.min(8, Math.max(1.4, this.params.wrapExponent));
+
+    for (let j = 0; j <= this.nv; j++) {
+      const hw = this.halfWidthAt(j / this.nv);
+      const wrap = this.wrapProfile[j];
+      for (let k = 0; k <= SAMPLES; k++) {
+        // phi runs from the centreline to the side edge.
+        const phi = (Math.PI / 2) * (k / SAMPLES);
+        const xi = Math.pow(Math.max(0, Math.sin(phi)), 2 / n);
+        const zeta = 1 - Math.pow(Math.max(0, Math.cos(phi)), 2 / n);
+        xs[k] = hw * xi;
+        zs[k] = wrap * zeta;
+        arc[k] =
+          k === 0 ? 0 : arc[k - 1] + Math.hypot(xs[k] - xs[k - 1], zs[k] - zs[k - 1]);
+      }
+      const len = arc[SAMPLES];
+      for (let i = 0; i <= this.nu; i++) {
+        const u = (i / this.nu) * 2 - 1;
+        const au = Math.abs(u);
+        const o = j * stride + i;
+        if (len <= 1e-12) {
+          this.sectionX[o] = hw * u;
+          this.sectionZ[o] = 0;
+          continue;
+        }
+        const target = au * len;
+        let k = 0;
+        while (k < SAMPLES - 1 && arc[k + 1] < target) k++;
+        const seg = arc[k + 1] - arc[k];
+        const f = seg > 1e-12 ? (target - arc[k]) / seg : 0;
+        const x = xs[k] + (xs[k + 1] - xs[k]) * f;
+        const z = zs[k] + (zs[k + 1] - zs[k]) * f;
+        this.sectionX[o] = u < 0 ? -x : x;
+        this.sectionZ[o] = z;
+      }
+    }
   }
 
   /**
@@ -378,16 +438,11 @@ export class UrinalSurface {
     }
   }
 
-  /** Base surface point before rib displacement. */
-  private basePoint(u: number, vIndex: number): Vec3 {
-    const pts = this.profile.points;
-    const pr = pts[vIndex];
-    const v = vIndex / this.nv;
-    const hw = this.halfWidthAt(v);
-    const wrap = this.wrapAt(v);
-    const p = Math.max(1.2, this.params.wrapExponent);
-    const au = Math.abs(u);
-    return v3(hw * u, pr.y, pr.z + wrap * Math.pow(au, p));
+  /** Base surface point before rib displacement, at a grid index. */
+  private basePoint(i: number, j: number): Vec3 {
+    const pr = this.profile.points[j];
+    const o = j * (this.nu + 1) + i;
+    return v3(this.sectionX[o], pr.y, pr.z + this.sectionZ[o]);
   }
 
   /**
@@ -395,16 +450,15 @@ export class UrinalSurface {
    * Used only to orient the rib displacement; the final normals are taken
    * from the displaced geometry.
    */
-  private baseNormal(u: number, vIndex: number): Vec3 {
-    const du = 2 / this.nu;
-    const u0 = Math.max(-1, u - du);
-    const u1 = Math.min(1, u + du);
+  private baseNormal(i: number, vIndex: number): Vec3 {
+    const i0 = Math.max(0, i - 1);
+    const i1 = Math.min(this.nu, i + 1);
     const j0 = Math.max(0, vIndex - 1);
     const j1 = Math.min(this.nv, vIndex + 1);
-    const a = this.basePoint(u0, vIndex);
-    const b = this.basePoint(u1, vIndex);
-    const c = this.basePoint(u, j0);
-    const d = this.basePoint(u, j1);
+    const a = this.basePoint(i0, vIndex);
+    const b = this.basePoint(i1, vIndex);
+    const c = this.basePoint(i, j0);
+    const d = this.basePoint(i, j1);
     const eu = { x: b.x - a.x, y: b.y - a.y, z: b.z - a.z };
     const ev = { x: d.x - c.x, y: d.y - c.y, z: d.z - c.z };
     let nx = ev.y * eu.z - ev.z * eu.y;
@@ -429,14 +483,13 @@ export class UrinalSurface {
     const arc = this.profile.arclength;
     for (let j = 0; j <= this.nv; j++) {
       for (let i = 0; i <= this.nu; i++) {
-        const u = (i / this.nu) * 2 - 1;
-        const base = this.basePoint(u, j);
+        const base = this.basePoint(i, j);
         const disp = this.displacementAt(base.x, arc[j]);
         let px = base.x;
         let py = base.y;
         let pz = base.z;
         if (disp !== 0) {
-          const n = this.baseNormal(u, j);
+          const n = this.baseNormal(i, j);
           px += n.x * disp;
           py += n.y * disp;
           pz += n.z * disp;

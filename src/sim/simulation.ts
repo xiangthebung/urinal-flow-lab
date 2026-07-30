@@ -7,8 +7,10 @@ import {
 } from '../core/fluid';
 import { Rng } from '../core/rng';
 import { Vec3, v3 } from '../core/vec3';
+import { MeshCollider } from '../geometry/collider';
+import { ShellMesh, ShellParams, buildShell } from '../geometry/shell';
 import { SurfaceParams, UrinalSurface, defaultSurfaceParams } from '../geometry/surface';
-import { CaptureScene, UserPosture, defaultPosture } from './capture';
+import { CaptureScene, CaptureZone, UserPosture, defaultPosture } from './capture';
 import { FilmParams, FilmSolver, defaultFilmParams } from './film';
 import { ImpactModelParams, ImpactResolver, defaultImpactParams } from './impact';
 import {
@@ -49,6 +51,15 @@ export const enum SimPhase {
 
 export interface SimConfig {
   surface: SurfaceParams;
+  /**
+   * Exterior casting. Overrides only; the rest comes from defaultShellParams().
+   *
+   * It lives in the simulation config rather than the renderer because the casting
+   * is solid: droplets collide with it, and where its faces are decides how much
+   * liquid ends up on the outside of the fixture. Building it in the view layer was
+   * the reason splash flew straight through the ceramic for so long.
+   */
+  casting: Partial<ShellParams>;
   stream: StreamParams;
   film: FilmParams;
   impact: ImpactModelParams;
@@ -76,6 +87,7 @@ export interface SimConfig {
 export function defaultConfig(): SimConfig {
   return {
     surface: defaultSurfaceParams(),
+    casting: {},
     stream: defaultStreamParams(),
     film: defaultFilmParams(),
     impact: defaultImpactParams(),
@@ -115,6 +127,9 @@ export interface RunReport {
 export class Simulation {
   config: SimConfig;
   surface!: UrinalSurface;
+  /** Exterior casting. Rendered, and collided against. */
+  casting!: ShellMesh;
+  private castingCollider!: MeshCollider;
   film!: FilmSolver;
   particles!: ParticleSystem;
   emitter!: StreamEmitter;
@@ -205,6 +220,8 @@ export class Simulation {
   rebuild(): void {
     const c = this.config;
     this.surface = this.buildSurface();
+    this.casting = buildShell(this.surface, c.casting);
+    this.castingCollider = new MeshCollider(this.casting.positions, this.casting.indices);
     this.rng = new Rng(c.seed);
     this.film = new FilmSolver(this.surface, c.fluid, c.wall, c.film);
     this.particles = new ParticleSystem(c.particleCapacity);
@@ -328,6 +345,7 @@ export class Simulation {
       dt,
       this.config.fluid,
       this.surface,
+      this.castingCollider,
       this.capture,
       this.stepResult,
       null
@@ -343,9 +361,21 @@ export class Simulation {
       this.metrics.recordImpact(ev.hit.cell, ev.volume, ang, splashed);
     }
 
-    // 4. Record what landed on the floor or the user.
+    // 4. Record what landed on the floor, the user, or the outside of the
+    //    fixture. The casting is ceramic and splashes: a droplet reaching it
+    //    throws a corona by the same physics as one hitting the interior, and
+    //    only the remainder is booked as landing there. Treating the exterior as
+    //    a perfect absorber was the largest single error in the model -- aimed
+    //    low enough to have to clear the front rim, the stream hits the casting,
+    //    and an entire void could vanish reporting zero splashback.
     for (const cap of this.stepResult.captures) {
-      this.metrics.recordCapture(cap.zone, cap.to, cap.volume, cap.generation);
+      let landed = cap.volume;
+      if (cap.zone === CaptureZone.FixtureExterior && cap.normal) {
+        landed = this.impact.resolveExterior(cap, this.particles).depositVolume;
+      }
+      if (landed > 0) {
+        this.metrics.recordCapture(cap.zone, cap.to, landed, cap.generation);
+      }
       this.particles.kill(cap.index);
     }
 

@@ -1,17 +1,17 @@
 import { CRITICAL_IMPINGEMENT_ANGLE, GRAVITY } from '../core/constants';
 import { FLUID_PRESETS, WALL_MATERIALS, capillaryLength, ohnesorge } from '../core/fluid';
-import { clamp, degToRad, radToDeg, v3 } from '../core/vec3';
+import { clamp, radToDeg, v3 } from '../core/vec3';
 import { PRESETS, getPreset } from '../geometry/presets';
-import { BackWallMode, SpiralBranch } from '../geometry/profile';
-import { RibMode } from '../geometry/surface';
 import { ColorScale, sample, toCss } from '../render/colormap';
 import { DropletColorMode } from '../render/dropletView';
 import { FieldInfo, FieldMode } from '../render/fixtureView';
 import { CameraPreset, SceneView } from '../render/sceneView';
 import { ZONE_NAMES } from '../sim/capture';
 import { RunReport, SimPhase, Simulation, defaultConfig } from '../sim/simulation';
+import { LabProbe } from './automation';
 import { BarList, Chart } from './charts';
 import { Effect, Panel } from './controls';
+import { drawFixtureThumbnail } from './thumbnail';
 
 /**
  * The application: panels, viewport, live readouts, and the analysis runner.
@@ -39,8 +39,13 @@ const VIEW_TABS: Array<{ mode: FieldMode; label: string }> = [
 ];
 
 export class App {
-  private sim: Simulation;
-  private view: SceneView;
+  // Public because the offline screenshot harness drives them. See
+  // src/ui/automation.ts for the reasoning: without a way to render the real
+  // WebGL viewport headlessly there is no way to verify that a change to the
+  // geometry actually looks right in the product, and reviewing a fixture mesh
+  // in isolation is not the same claim.
+  readonly sim: Simulation;
+  readonly view: SceneView;
   private left!: Panel;
   private right!: Panel;
   private transport!: Panel;
@@ -71,6 +76,7 @@ export class App {
   private playBtn!: HTMLButtonElement;
   private tabEls: HTMLButtonElement[] = [];
 
+  private showShell = true;
   private showZones = true;
   private showUser = true;
   private showHeatmaps = true;
@@ -79,7 +85,8 @@ export class App {
 
   constructor() {
     const cfg = defaultConfig();
-    cfg.surface = getPreset(this.presetId).params;
+    cfg.surface = { ...getPreset(this.presetId).params };
+    cfg.casting = { ...(getPreset(this.presetId).shell ?? {}) };
     // Interactive resolution is lower than the analysis resolution. Playback at
     // anything near real time needs a thousand physics steps a second, and the
     // film solver cost scales with the cell count; the full-resolution grid is
@@ -91,7 +98,7 @@ export class App {
 
     const canvas = document.getElementById('gl') as HTMLCanvasElement;
     this.view = new SceneView(canvas, cfg.particleCapacity);
-    this.view.setGeometry(this.sim.surface, this.sim.capture);
+    this.view.setGeometry(this.sim.surface, this.sim.casting, this.sim.capture);
     this.view.applyCameraPreset(CameraPreset.ThreeQuarter, this.sim.surface, this.sim.capture);
 
     this.legendEl = document.getElementById('legend')!;
@@ -129,7 +136,7 @@ export class App {
     switch (effect) {
       case 'rebuild':
         this.sim.rebuild();
-        this.view.setGeometry(this.sim.surface, this.sim.capture);
+        this.view.setGeometry(this.sim.surface, this.sim.casting, this.sim.capture);
         this.sim.restart();
         this.report = null;
         this.refreshGeometryDependent();
@@ -158,14 +165,30 @@ export class App {
     this.right.refresh();
   }
 
+  /**
+   * Redraw the aim trajectory for the conditions in force right now.
+   *
+   * It used to be drawn once, for the exit speed at peak flow, and then left alone
+   * for the whole run. Exit speed varies by more than a factor of two across a void
+   * -- 1.5 m/s at t = 0.9 s against 3.1 m/s at the peak on the default flow curve --
+   * so for most of the run the dashed line sat a long way from the droplets actually
+   * on screen. Both were right; the picture said the trajectory model was broken.
+   * Before flow starts there is no current speed to use, so the peak is the honest
+   * choice there.
+   */
+  private updateStreamPath(): void {
+    const flow = this.sim.emitter.flow;
+    const t =
+      this.sim.phase === SimPhase.Voiding && this.sim.time > 0
+        ? Math.min(this.sim.time, flow.duration)
+        : flow.peakFraction * flow.duration;
+    this.view.updateStreamPath(this.sim.emitter, this.sim.surface, t);
+  }
+
   private refreshGeometryDependent(): void {
     this.nextSampleAt = 0;
     this.updateFixtureField();
-    this.view.updateStreamPath(
-      this.sim.emitter,
-      this.sim.surface,
-      this.sim.emitter.flow.peakFraction * this.sim.emitter.flow.duration
-    );
+    this.updateStreamPath();
     this.applyViewToggles();
     this.updateLegend();
     this.updateGeometryNotes();
@@ -178,6 +201,57 @@ export class App {
     this.view.setHeatmapsVisible(this.showHeatmaps);
     this.view.setStreamPathVisible(this.showStreamPath);
     this.view.fixture.setWireframeVisible(this.showWireframe);
+    this.view.fixture.setShellVisible(this.showShell);
+  }
+
+  /** Scene furniture, so a shot or an inspection can isolate one thing. */
+  setOverlays(o: {
+    zones?: boolean;
+    heatmaps?: boolean;
+    streamPath?: boolean;
+    wireframe?: boolean;
+    shell?: boolean;
+  }): void {
+    if (o.zones !== undefined) {
+      this.showZones = o.zones;
+      this.showUser = o.zones;
+    }
+    if (o.heatmaps !== undefined) this.showHeatmaps = o.heatmaps;
+    if (o.streamPath !== undefined) this.showStreamPath = o.streamPath;
+    if (o.wireframe !== undefined) this.showWireframe = o.wireframe;
+    if (o.shell !== undefined) this.showShell = o.shell;
+    this.applyViewToggles();
+  }
+
+  /**
+   * Measurements a screenshot cannot assert on.
+   *
+   * The interior and casting extents are reported side by side on purpose. The
+   * whole family of clipping faults on this project came from the two being
+   * different and only the interior being consulted, so having both in one place
+   * makes the discrepancy something that can be checked rather than noticed.
+   */
+  probe(): LabProbe {
+    const ib = this.sim.surface.bounds();
+    const cb = this.view.castingBounds;
+    const e = this.sim.emitter.position;
+    return {
+      model: this.presetId,
+      time: this.sim.time,
+      phase: this.sim.phase,
+      droplets: this.sim.particles.count,
+      emitter: [e.x, e.y, e.z],
+      interior: [ib.min.x, ib.min.y, ib.min.z, ib.max.x, ib.max.y, ib.max.z],
+      casting: cb
+        ? [cb.min.x, cb.min.y, cb.min.z, cb.max.x, cb.max.y, cb.max.z]
+        : null,
+      interiorFrontZ: ib.max.z,
+      castingFrontZ: cb ? cb.max.z : null,
+      captureFrontZ: this.sim.capture.fixtureFrontZ,
+      floorY: this.sim.surface.floorY,
+      degenerateCells: this.sim.surface.degenerateCells,
+      selfIntersects: this.sim.surface.profile.info.selfIntersects,
+    };
   }
 
   private resize(): void {
@@ -196,32 +270,19 @@ export class App {
 
   private buildTopbar(): void {
     const slot = document.getElementById('preset-slot')!;
-    const sel = document.createElement('select');
-    for (const p of PRESETS) {
-      const o = document.createElement('option');
-      o.value = p.id;
-      o.textContent = p.name;
-      sel.append(o);
-    }
-    sel.value = this.presetId;
+    const label = document.createElement('span');
+    label.className = 'topbar-model';
     const desc = document.createElement('span');
     desc.className = 'hint';
     desc.style.flex = '1';
     desc.style.minWidth = '0';
-    const paintDesc = () => {
-      desc.textContent = getPreset(this.presetId).summary;
+    this.paintTopbarModel = () => {
+      const p = getPreset(this.presetId);
+      label.textContent = p.name;
+      desc.textContent = p.summary;
     };
-    sel.addEventListener('change', () => {
-      this.presetId = sel.value;
-      // Fresh copy each time: presets are shared objects and the panels write
-      // straight into the live params, so handing out the original would let one
-      // session's edits leak into every later load of that preset.
-      this.sim.config.surface = { ...getPreset(this.presetId).params };
-      paintDesc();
-      this.apply('rebuild');
-    });
-    paintDesc();
-    slot.append(sel, desc);
+    this.paintTopbarModel();
+    slot.append(label, desc);
 
     const actions = document.getElementById('topbar-actions')!;
     const analyse = document.createElement('button');
@@ -230,6 +291,131 @@ export class App {
     analyse.addEventListener('click', () => this.runAnalysis());
     actions.append(analyse);
   }
+
+  private paintTopbarModel: () => void = () => {};
+
+  /**
+   * Load a fixture.
+   *
+   * A fresh copy of the parameters each time, because the presets are shared
+   * objects: handing out the original would let anything that writes into the live
+   * config leak into every later load of that model.
+   */
+  selectPreset(id: string): void {
+    if (id === this.presetId) return;
+    this.presetId = id;
+    this.sim.config.surface = { ...getPreset(id).params };
+    this.sim.config.casting = { ...(getPreset(id).shell ?? {}) };
+    this.paintTopbarModel();
+    this.paintModelCards();
+    this.apply('rebuild');
+  }
+
+  // =======================================================================
+  // Fixture picker
+  // =======================================================================
+
+  /**
+   * The fixture library, as a grid of cards.
+   *
+   * This replaced about forty sliders that between them defined the bowl: rim
+   * height, bowl depth, three widths, two section exponents, wall mode and tilt and
+   * run, throat, sump depth and gradient, drain position and radius, lip height and
+   * curl, hood, rib pattern and amplitude and wavelength. They were expressive but
+   * they were the wrong interface for the question the tool answers -- nobody
+   * evaluating splashback wants to author a bowl from thirty numbers, and almost
+   * every combination of them is not a fixture anyone would make. Six real
+   * fixtures, each shown as the shape it actually is, get to a comparison faster and
+   * the comparison means more.
+   *
+   * The stream, the user's posture, the fluid and the model coefficients are all
+   * still adjustable. Those are the experiment, not the fixture.
+   */
+  private buildModelPicker(parent: Panel): void {
+    const grid = document.createElement('div');
+    grid.className = 'model-grid';
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const CW = 128;
+    const CH = 96;
+
+    for (const p of PRESETS) {
+      const card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'model-card';
+      card.dataset.id = p.id;
+      card.title = `${p.name} — ${p.summary}`;
+      card.setAttribute('aria-pressed', String(p.id === this.presetId));
+
+      const canvas = document.createElement('canvas');
+      canvas.className = 'model-thumb';
+      canvas.width = Math.round(CW * dpr);
+      canvas.height = Math.round(CH * dpr);
+      canvas.style.width = `${CW}px`;
+      canvas.style.height = `${CH}px`;
+      canvas.setAttribute('role', 'img');
+      canvas.setAttribute('aria-label', `${p.name}, three-quarter view`);
+
+      const name = document.createElement('span');
+      name.className = 'model-name';
+      name.textContent = p.name;
+      const dims = document.createElement('span');
+      dims.className = 'model-dims';
+      dims.textContent = '…';
+
+      card.append(canvas, name, dims);
+      card.addEventListener('click', () => this.selectPreset(p.id));
+      grid.append(card);
+      this.modelCards.push({ id: p.id, el: card, canvas, dims });
+    }
+    parent.raw(grid);
+
+    const blurb = document.createElement('p');
+    blurb.className = 'hint model-blurb';
+    const expect = document.createElement('p');
+    expect.className = 'hint model-expect';
+    parent.raw(blurb);
+    parent.raw(expect);
+    this.paintModelCards = () => {
+      const p = getPreset(this.presetId);
+      for (const c of this.modelCards) {
+        const on = c.id === this.presetId;
+        c.el.classList.toggle('active', on);
+        c.el.setAttribute('aria-pressed', String(on));
+      }
+      blurb.textContent = p.summary;
+      expect.textContent = p.expectation;
+    };
+    this.paintModelCards();
+
+    // Painted one per idle slice. Six castings is a few hundred milliseconds of
+    // geometry, and doing it inline delays the first frame of the actual
+    // simulation for pictures that nobody is looking at yet.
+    let next = 0;
+    const paintNext = () => {
+      if (next >= this.modelCards.length) return;
+      const card = this.modelCards[next++];
+      const preset = getPreset(card.id);
+      try {
+        const res = drawFixtureThumbnail(card.canvas, preset.params, preset.shell);
+        card.dims.textContent = res
+          ? `${res.dims.w} × ${res.dims.d} × ${res.dims.h} mm`
+          : '';
+      } catch {
+        card.dims.textContent = '';
+      }
+      schedule();
+    };
+    const schedule = () => window.setTimeout(paintNext, 0);
+    schedule();
+  }
+
+  private modelCards: Array<{
+    id: string;
+    el: HTMLButtonElement;
+    canvas: HTMLCanvasElement;
+    dims: HTMLSpanElement;
+  }> = [];
+  private paintModelCards: () => void = () => {};
 
   private buildViewTabs(): void {
     const bar = document.getElementById('view-tabs')!;
@@ -266,236 +452,17 @@ export class App {
     host.append(this.left.root);
     const c = this.sim.config;
 
-    // ---- Envelope --------------------------------------------------------
-    const env = this.left.section('Bowl envelope');
-    env.slider({
-      label: 'Rim height above datum',
-      min: 0.2,
-      max: 0.6,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.rimHeight,
-      set: (v) => (c.surface.rimHeight = v),
-      effect: 'rebuild',
+    // ---- Fixture ---------------------------------------------------------
+    const fix = this.left.section('Fixture', {
+      hint: 'Six models spanning the design space. Pick one to load its geometry.',
     });
-    env.slider({
-      label: 'Bowl depth',
-      min: 0.15,
-      max: 0.5,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.bowlDepth,
-      set: (v) => (c.surface.bowlDepth = v),
-      effect: 'rebuild',
-    });
-    env.slider({
-      label: 'Rim height above floor',
-      min: 0.35,
-      max: 0.8,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.rimAboveFloor,
-      set: (v) => (c.surface.rimAboveFloor = v),
-      effect: 'rebuild',
-      hint: 'Mounting height. 430 mm is the accessible limit.',
-    });
-    env.slider({
-      label: 'Width at rim',
-      min: 0.18,
-      max: 0.55,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.widthRim,
-      set: (v) => (c.surface.widthRim = v),
-      effect: 'rebuild',
-    });
-    env.slider({
-      label: 'Width at sump',
-      min: 0.04,
-      max: 0.45,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.widthSump,
-      set: (v) => (c.surface.widthSump = v),
-      effect: 'rebuild',
-      hint: 'Narrowing toward the outlet raises film speed and clears the sump faster.',
-    });
-    env.slider({
-      label: 'Side wall reach',
-      min: 0,
-      max: 0.4,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.wrapDepth,
-      set: (v) => (c.surface.wrapDepth = v),
-      effect: 'rebuild',
-      hint:
-        'How far the side edges stand forward. Near the bowl depth the section ' +
-        'closes into a U and splash can only leave through the front.',
-    });
-    env.slider({
-      label: 'Section fullness',
-      min: 1.5,
-      max: 6,
-      step: 0.1,
-      decimals: 1,
-      get: () => c.surface.wrapExponent,
-      set: (v) => (c.surface.wrapExponent = v),
-      effect: 'rebuild',
-      hint: 'Low is a rounded U, high keeps the middle flat with sharp side walls.',
-    });
+    this.buildModelPicker(fix);
 
-    // ---- Back wall -------------------------------------------------------
-    const bw = this.left.section('Back wall — the impact surface', {
-      hint:
-        'The one surface that decides splashback. What matters is the angle the ' +
-        'stream makes with it, not how it looks.',
-    });
-    bw.select<BackWallMode>({
-      label: 'Wall type',
-      options: [
-        { value: 'planar', label: 'Planar (flat)' },
-        { value: 'concave', label: 'Concave arc' },
-        { value: 'constantAngle', label: 'Constant impingement angle' },
-      ],
-      get: () => c.surface.backWallMode,
-      set: (v) => (c.surface.backWallMode = v),
-      effect: 'rebuild',
-      hint:
-        'Constant-angle solves for the wall that meets the arriving stream at a ' +
-        'fixed angle everywhere — a logarithmic spiral, corrected for gravity.',
-    });
-    bw.slider({
-      label: 'Planar tilt from vertical',
-      min: -0.3,
-      max: 0.5,
-      step: 0.005,
-      display: 180 / Math.PI,
-      unit: '°',
-      decimals: 1,
-      get: () => c.surface.backWallTilt,
-      set: (v) => (c.surface.backWallTilt = v),
-      effect: 'rebuild',
-    });
-    bw.slider({
-      label: 'Concave run at base',
-      min: 0,
-      max: 0.12,
-      step: 0.002,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.backWallRun,
-      set: (v) => (c.surface.backWallRun = v),
-      effect: 'rebuild',
-      hint: 'Stated as a run, not a radius, so it can never exceed the depth budget.',
-    });
-    bw.slider({
-      label: 'Target impingement angle',
-      min: degToRad(8),
-      max: degToRad(60),
-      step: degToRad(0.5),
-      display: 180 / Math.PI,
-      unit: '°',
-      decimals: 1,
-      get: () => c.surface.targetImpingementAngle,
-      set: (v) => (c.surface.targetImpingementAngle = v),
-      effect: 'rebuild',
-      hint: 'Below about 30° splashback collapses. Leave margin: aim and flow rate move it.',
-    });
-    bw.select<SpiralBranch>({
-      label: 'Constant-angle branch',
-      options: [
-        { value: 'tall', label: 'Tall (slim, drains well)' },
-        { value: 'scoop', label: 'Scoop (horn, opens forward)' },
-      ],
-      get: () => c.surface.spiralBranch,
-      set: (v) => (c.surface.spiralBranch = v),
-      effect: 'rebuild',
-      hint: 'Two wall orientations satisfy the same angle. Tall drains better.',
-    });
-
-    // ---- Sump and drain --------------------------------------------------
-    const sump = this.left.section('Sump & drain', {
-      hint: 'Decides whether liquid leaves or sits there.',
-    });
-    sump.slider({
-      label: 'Throat handover height',
-      min: 0.01,
-      max: 0.16,
-      step: 0.002,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.throatHeight,
-      set: (v) => (c.surface.throatHeight = v),
-      effect: 'rebuild',
-      hint:
-        'Where the back wall hands over to the fillet. Keep it below where the ' +
-        'stream lands, or the fillet takes the impact and the wall shape is wasted.',
-    });
-    sump.slider({
-      label: 'Sump depth',
-      min: 0,
-      max: 0.08,
-      step: 0.002,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.sumpDepth,
-      set: (v) => (c.surface.sumpDepth = v),
-      effect: 'rebuild',
-    });
-    sump.slider({
-      label: 'Sump floor gradient',
-      min: 0,
-      max: 0.35,
-      step: 0.005,
-      display: 180 / Math.PI,
-      unit: '°',
-      decimals: 1,
-      get: () => c.surface.sumpSlope,
-      set: (v) => (c.surface.sumpSlope = v),
-      effect: 'rebuild',
-      hint: 'A level sump has nothing driving the residual film anywhere.',
-    });
-    sump.slider({
-      label: 'Drain position from wall',
-      min: 0.02,
-      max: 0.3,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.drainZ,
-      set: (v) => (c.surface.drainZ = v),
-      effect: 'rebuild',
-    });
-    sump.slider({
-      label: 'Drain radius',
-      min: 0.005,
-      max: 0.06,
-      step: 0.001,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.drainRadius,
-      set: (v) => (c.surface.drainRadius = v),
-      effect: 'rebuild',
-    });
-    sump.slider({
+    // ---- Outlet ----------------------------------------------------------
+    // Not part of the fixture's shape: it is the condition the outlet is in, which
+    // a designer has no control over once the thing is installed.
+    const outlet = this.left.section('Outlet condition', { collapsed: true });
+    outlet.slider({
       label: 'Drain discharge coefficient',
       min: 0.02,
       max: 0.9,
@@ -505,91 +472,6 @@ export class App {
       set: (v) => (c.film.drainCoefficient = v),
       effect: 'restart',
       hint: 'Drop it to model a strainer or a partly blocked outlet.',
-    });
-
-    // ---- Rim and lip -----------------------------------------------------
-    const lip = this.left.section('Rim, lip & hood', { collapsed: true });
-    lip.slider({
-      label: 'Front lip height',
-      min: 0.05,
-      max: 0.5,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.frontLipHeight,
-      set: (v) => (c.surface.frontLipHeight = v),
-      effect: 'rebuild',
-    });
-    lip.slider({
-      label: 'Lip inward curl',
-      min: 0,
-      max: 0.07,
-      step: 0.002,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.frontLipInturn,
-      set: (v) => (c.surface.frontLipInturn = v),
-      effect: 'rebuild',
-    });
-    lip.slider({
-      label: 'Top hood overhang',
-      min: 0,
-      max: 0.14,
-      step: 0.005,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.hoodDepth,
-      set: (v) => (c.surface.hoodDepth = v),
-      effect: 'rebuild',
-      hint:
-        'Intercepts droplets that would clear the rim. It does not reduce splash, ' +
-        'it relocates it — and the underside then drips.',
-    });
-
-    // ---- Surface texture -------------------------------------------------
-    const rib = this.left.section('Surface texture', { collapsed: true });
-    rib.select<RibMode>({
-      label: 'Pattern',
-      options: [
-        { value: 'none', label: 'Smooth' },
-        { value: 'vertical', label: 'Vertical ribs / grooves' },
-        { value: 'horizontal', label: 'Horizontal ribs' },
-        { value: 'chevron', label: 'Chevron' },
-        { value: 'dimple', label: 'Dimpled' },
-      ],
-      get: () => c.surface.ribMode,
-      set: (v) => (c.surface.ribMode = v),
-      effect: 'rebuild',
-      hint:
-        'Vertical grooves channel the film and clear faster. Horizontal ribs act ' +
-        'as weirs and pin liquid in bands.',
-    });
-    rib.slider({
-      label: 'Amplitude (negative cuts grooves)',
-      min: -0.006,
-      max: 0.006,
-      step: 0.0002,
-      display: 1000,
-      unit: 'mm',
-      decimals: 2,
-      get: () => c.surface.ribAmplitude,
-      set: (v) => (c.surface.ribAmplitude = v),
-      effect: 'rebuild',
-    });
-    rib.slider({
-      label: 'Wavelength',
-      min: 0.006,
-      max: 0.08,
-      step: 0.002,
-      display: 1000,
-      unit: 'mm',
-      decimals: 0,
-      get: () => c.surface.ribWavelength,
-      set: (v) => (c.surface.ribWavelength = v),
-      effect: 'rebuild',
     });
 
     // ---- Stream and user -------------------------------------------------
@@ -1354,7 +1236,7 @@ export class App {
     cfg.resolutionU = Math.max(savedU, 72);
     cfg.resolutionV = Math.max(savedV, 132);
     this.sim.rebuild();
-    this.view.setGeometry(this.sim.surface, this.sim.capture);
+    this.view.setGeometry(this.sim.surface, this.sim.casting, this.sim.capture);
     this.sim.restart();
 
     const total = this.sim.totalDuration;
@@ -1527,6 +1409,7 @@ export class App {
     if (now - this.lastHeavyUpdate > 80) {
       this.lastHeavyUpdate = now;
       this.updateFixtureField();
+      this.updateStreamPath();
       this.view.updateHeatmaps(this.sim.metrics.floorMap, this.sim.metrics.bodyMap);
       this.updateCharts();
     }
@@ -1542,6 +1425,73 @@ export class App {
     this.view.render();
     requestAnimationFrame(this.frame);
   };
+
+  // =======================================================================
+  // Deterministic control, for the offline screenshot harness
+  // =======================================================================
+
+  /** Which fixture is loaded. */
+  get modelId(): string {
+    return this.presetId;
+  }
+
+  setPlaying(v: boolean): void {
+    this.running = v;
+    if (this.playBtn) this.playBtn.textContent = v ? '❚❚ Pause' : '▶ Play';
+  }
+
+  /**
+   * Step the simulation to a given simulated time and redraw.
+   *
+   * The frame loop advances by wall-clock budget so that playback degrades
+   * gracefully on expensive geometry. That is right for interactive use and
+   * useless for a screenshot: the same command would capture a different instant
+   * on every run and on every machine. This advances by simulated time instead,
+   * so a shot at t = 0.8 s is the same picture every time.
+   */
+  advanceTo(seconds: number): void {
+    this.setPlaying(false);
+    if (this.sim.phase === SimPhase.Idle) this.sim.restart();
+    while (this.sim.time < seconds && !this.sim.isFinished()) {
+      this.sim.step();
+      if (this.sim.time >= this.nextSampleAt) {
+        this.sim.sample();
+        this.nextSampleAt = this.sim.time + 0.05;
+      }
+    }
+    this.refreshViews();
+  }
+
+  /** Force every throttled overlay to catch up, then draw one frame. */
+  refreshViews(): void {
+    this.view.updateLiquid(
+      this.sim.particles,
+      this.sim.emitter.position,
+      this.sim.emitter.diameterAt(this.sim.time)
+    );
+    this.updateFixtureField();
+    this.updateStreamPath();
+    this.view.updateHeatmaps(this.sim.metrics.floorMap, this.sim.metrics.bodyMap);
+    this.updateCharts();
+    this.updateHud();
+    this.updateTransport();
+    this.updateZoneBars();
+    this.updateScore();
+    this.left.refresh();
+    this.right.refresh();
+    this.view.render();
+  }
+
+  setFieldMode(mode: FieldMode): void {
+    this.view.fixture.mode = mode;
+    this.updateFixtureField();
+    this.updateLegend();
+    this.paintTabs();
+  }
+
+  setCameraPreset(preset: CameraPreset): void {
+    this.view.applyCameraPreset(preset, this.sim.surface, this.sim.capture);
+  }
 
   private updateFixtureField(): void {
     this.view.fixture.update(

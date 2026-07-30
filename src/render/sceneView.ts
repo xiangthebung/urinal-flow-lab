@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GRAVITY } from '../core/constants';
+import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
 import { CaptureScene } from '../sim/capture';
 import { Heatmap } from '../sim/metrics';
@@ -39,6 +40,7 @@ export class SceneView {
   readonly droplets: DropletView;
   readonly stream = new StreamView();
 
+  private shell: ShellMesh | null = null;
   private roomGroup = new THREE.Group();
   private userGroup = new THREE.Group();
   private zoneGroup = new THREE.Group();
@@ -101,8 +103,18 @@ export class SceneView {
   // -----------------------------------------------------------------------
 
   /** Rebuild everything tied to the geometry. */
-  setGeometry(surface: UrinalSurface, capture: CaptureScene): void {
+  /**
+   * Rebuild everything tied to the geometry.
+   *
+   * The casting is handed in rather than built here. It used to be built in this
+   * method, on the grounds that it was purely decorative -- which is exactly how
+   * droplets came to pass straight through it. It is solid, the simulation owns it,
+   * and the view draws the same one the solver collides against.
+   */
+  setGeometry(surface: UrinalSurface, casting: ShellMesh | null, capture: CaptureScene): void {
     this.fixture.setSurface(surface);
+    this.shell = casting;
+    this.fixture.setShell(casting);
     this.buildRoom(surface, capture);
     this.buildUser(surface, capture);
     this.buildZones(surface, capture);
@@ -115,6 +127,16 @@ export class SceneView {
       (b.min.z + b.max.z) * 0.5
     );
     this.controls.target.copy(this.target);
+  }
+
+  /** Bounds of the exterior casting, or null before any geometry is set. */
+  get castingBounds(): { min: Vec3; max: Vec3 } | null {
+    return this.shell ? { min: this.shell.min, max: this.shell.max } : null;
+  }
+
+  /** Back face of the casting, so the mounting wall can sit behind it. */
+  private get fixtureBackZ(): number {
+    return this.shell ? this.shell.min.z : 0;
   }
 
   private clear(g: THREE.Group): void {
@@ -147,12 +169,14 @@ export class SceneView {
     grid.position.set(0, surface.floorY + 0.001, capture.fixtureFrontZ + 0.6);
     this.roomGroup.add(grid);
 
-    // Mounting wall behind the fixture.
+    // Mounting wall behind the fixture. Placed off the back of the casting, not
+    // the interior: the ceramic continues behind the bowl, so measuring from the
+    // interior would bury the back of the fixture in the wall.
     const wall = new THREE.Mesh(
       new THREE.PlaneGeometry(3, 2.6),
       new THREE.MeshStandardMaterial({ color: 0x323d4a, roughness: 0.9 })
     );
-    wall.position.set(0, surface.floorY + 1.3, b.min.z - 0.005);
+    wall.position.set(0, surface.floorY + 1.3, Math.min(b.min.z, this.fixtureBackZ) - 0.004);
     this.roomGroup.add(wall);
   }
 
@@ -403,20 +427,50 @@ export class SceneView {
     this.aimMarker.visible = v && this.aimMarker.visible;
   }
 
+  /**
+   * Distance at which a sphere of the given radius fills the frame.
+   *
+   * Solved from the camera's own field of view and aspect rather than scaled off
+   * the fixture's height by a constant. The constant was 1.9 times the taller of
+   * height and width, which happens to frame a 400 mm bowl in a 4:3 viewport and
+   * nothing else: it ignored depth entirely, so it cropped every model once the
+   * casting was added, and it would crop any imported fixture with unfamiliar
+   * proportions. Fitting the bounding sphere is correct for all of them.
+   */
+  private fitDistance(radius: number, fill = 0.62): number {
+    const vFov = (this.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
+    const half = Math.max(0.05, Math.min(vFov, hFov) / 2);
+    return radius / Math.sin(half) / Math.max(0.1, fill);
+  }
+
   applyCameraPreset(preset: CameraPreset, surface: UrinalSurface, capture: CaptureScene): void {
+    // Framed on everything the fixture occupies, casting included. Using the
+    // interior alone put the ceramic outside the frame on every model.
     const b = surface.bounds();
-    const cy = (b.min.y + b.max.y) * 0.5;
-    const cz = (b.min.z + b.max.z) * 0.5;
-    const span = Math.max(b.max.y - b.min.y, b.max.x - b.min.x) * 1.9;
+    const cb = this.castingBounds;
+    const min = cb
+      ? { x: Math.min(b.min.x, cb.min.x), y: Math.min(b.min.y, cb.min.y), z: Math.min(b.min.z, cb.min.z) }
+      : b.min;
+    const max = cb
+      ? { x: Math.max(b.max.x, cb.max.x), y: Math.max(b.max.y, cb.max.y), z: Math.max(b.max.z, cb.max.z) }
+      : b.max;
+    const cy = (min.y + max.y) * 0.5;
+    const cz = (min.z + max.z) * 0.5;
+    const radius =
+      0.5 * Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z);
+    const d = this.fitDistance(radius);
+
+    this.target.set(0, cy, cz);
     switch (preset) {
       case CameraPreset.Front:
-        this.camera.position.set(0, cy, cz + span);
+        this.camera.position.set(0, cy, cz + d);
         break;
       case CameraPreset.Side:
-        this.camera.position.set(span, cy, cz);
+        this.camera.position.set(d, cy, cz);
         break;
       case CameraPreset.Top:
-        this.camera.position.set(0.001, b.max.y + span * 0.9, cz);
+        this.camera.position.set(0.001, cy + d, cz);
         break;
       case CameraPreset.UserEye:
         // Roughly where the user's eyes are: the view that decides whether a
@@ -428,9 +482,18 @@ export class SceneView {
         );
         break;
       case CameraPreset.ThreeQuarter:
-      default:
-        this.camera.position.set(span * 0.62, cy + span * 0.42, cz + span * 0.78);
+      default: {
+        // A unit direction, then pushed out to the fitted distance, so the angle
+        // is fixed and only the distance responds to the fixture's size.
+        const dir = [0.62, 0.42, 0.78];
+        const m = Math.hypot(dir[0], dir[1], dir[2]);
+        this.camera.position.set(
+          (dir[0] / m) * d,
+          cy + (dir[1] / m) * d,
+          cz + (dir[2] / m) * d
+        );
         break;
+      }
     }
     this.controls.target.set(0, cy, cz);
     this.controls.update();

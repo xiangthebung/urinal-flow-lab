@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { CRITICAL_IMPINGEMENT_ANGLE } from '../core/constants';
+import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
 import { FilmSolver } from '../sim/film';
 import { Metrics } from '../sim/metrics';
@@ -62,6 +63,9 @@ export class FixtureView {
   private wire!: THREE.LineSegments;
   private surface!: UrinalSurface;
   private drainRing!: THREE.Line;
+  /** The exterior casting. Cosmetic, and never carries a data overlay. */
+  private shellMesh: THREE.Mesh | null = null;
+  private shellMaterial: THREE.MeshStandardMaterial;
 
   // Per-vertex channels.
   private field!: Float32Array;
@@ -244,6 +248,38 @@ export class FixtureView {
       side: THREE.DoubleSide,
       transparent: false,
     });
+
+    // Plain glazed porcelain. Deliberately a standard material rather than the
+    // shader above: the outside of the fixture is never a data surface, and giving
+    // it the film and field machinery would invite reading a colour off it.
+    this.shellMaterial = new THREE.MeshStandardMaterial({
+      color: 0xe7eaf0,
+      roughness: 0.22,
+      metalness: 0.02,
+      side: THREE.DoubleSide,
+    });
+  }
+
+  /** Attach the exterior casting. */
+  setShell(shell: ShellMesh | null): void {
+    if (this.shellMesh) {
+      this.group.remove(this.shellMesh);
+      this.shellMesh.geometry.dispose();
+      this.shellMesh = null;
+    }
+    if (!shell) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(shell.positions.slice(), 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(shell.normals.slice(), 3));
+    g.setIndex(new THREE.BufferAttribute(shell.indices.slice(), 1));
+    g.computeBoundingSphere();
+    this.shellMesh = new THREE.Mesh(g, this.shellMaterial);
+    this.shellMesh.frustumCulled = false;
+    this.group.add(this.shellMesh);
+  }
+
+  setShellVisible(v: boolean): void {
+    if (this.shellMesh) this.shellMesh.visible = v;
   }
 
   setSurface(surface: UrinalSurface): void {

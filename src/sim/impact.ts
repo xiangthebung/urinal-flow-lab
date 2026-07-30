@@ -9,7 +9,7 @@ import { WallMaterial } from '../core/fluid';
 import { Rng } from '../core/rng';
 import { Vec3, clamp, smoothstep, v3 } from '../core/vec3';
 import { UrinalSurface } from '../geometry/surface';
-import { ImpactEvent, ParticleSystem } from './particles';
+import { CaptureEvent, ImpactEvent, ParticleSystem } from './particles';
 
 /**
  * What happens when liquid meets the wall.
@@ -141,7 +141,68 @@ export interface ImpactTotals {
   splashEvents: number;
   /** Volume lost to the particle buffer being full, m^3. */
   droppedVolume: number;
+  /** Impacts resolved against the outside of the casting rather than the interior. */
+  exteriorEvents: number;
+  /** Of `splashedVolume`, how much was thrown off the casting exterior, m^3. */
+  exteriorSplashedVolume: number;
 }
+
+/**
+ * Everything the corona model needs, independent of what was struck.
+ *
+ * Extracted so the interior loft and the solid casting share one implementation.
+ * They are the same material meeting the same liquid, and the only reason the
+ * exterior was ever treated differently is that the film solver's grid stops at
+ * the interior -- which is a statement about where liquid can be *stored*, not
+ * about whether it splashes.
+ */
+interface SplashSite {
+  /** Where the impact happened, world space. */
+  point: Vec3;
+  /** Outward surface normal at the impact. */
+  n: Vec3;
+  /** Tangential component of the arriving velocity, m/s. */
+  vt: Vec3;
+  vTanMag: number;
+  vNormal: number;
+  speed: number;
+  /** Parent droplet diameter, m. */
+  diameter: number;
+  /** Parent droplet volume, m^3. */
+  parentVolume: number;
+  generation: number;
+  /** Volume to be ejected, m^3. */
+  splashVolume: number;
+  /** Impingement angle from the surface, radians. */
+  alpha: number;
+  /** Reference axis for the azimuth when the impact is dead-on normal. */
+  fallbackAxis: Vec3;
+}
+
+interface SecondaryResult {
+  spawned: number;
+  /** Volume the particle buffer refused, which the caller must place, m^3. */
+  droppedVolume: number;
+}
+
+export interface ExteriorSplashResult {
+  /** Volume thrown back off the casting as live droplets, m^3. */
+  splashVolume: number;
+  /** Volume left clinging to the outside of the fixture, m^3. */
+  depositVolume: number;
+  secondaryCount: number;
+}
+
+const emptyTotals = (): ImpactTotals => ({
+  depositedVolume: 0,
+  splashedVolume: 0,
+  reboundedVolume: 0,
+  events: 0,
+  splashEvents: 0,
+  droppedVolume: 0,
+  exteriorEvents: 0,
+  exteriorSplashedVolume: 0,
+});
 
 /**
  * Resolves impacts against the wall, feeding the film and spawning secondaries.
@@ -154,14 +215,7 @@ export class ImpactResolver {
 
   /** Last event's diagnostics, for UI inspection. */
   last: ImpactDiagnostics | null = null;
-  totals: ImpactTotals = {
-    depositedVolume: 0,
-    splashedVolume: 0,
-    reboundedVolume: 0,
-    events: 0,
-    splashEvents: 0,
-    droppedVolume: 0,
-  };
+  totals: ImpactTotals = emptyTotals();
 
   constructor(
     params: ImpactModelParams,
@@ -176,14 +230,7 @@ export class ImpactResolver {
   }
 
   resetTotals(): void {
-    this.totals = {
-      depositedVolume: 0,
-      splashedVolume: 0,
-      reboundedVolume: 0,
-      events: 0,
-      splashEvents: 0,
-      droppedVolume: 0,
-    };
+    this.totals = emptyTotals();
   }
 
   /**
@@ -385,22 +432,33 @@ export class ImpactResolver {
     // -- Secondaries --------------------------------------------------------
     let secondaryCount = 0;
     if (splashVolume > 0) {
-      secondaryCount = this.emitSecondaries(
-        ev,
-        surface,
-        particles,
-        film,
-        cell,
-        n,
-        { x: vtX, y: vtY, z: vtZ },
-        vTanMag,
-        vNormal,
-        speed,
-        d,
-        splashVolume,
-        alpha
+      const o2 = cell * 3;
+      const res = this.emitSecondaries(
+        {
+          point: ev.hit.point,
+          n,
+          vt: v3(vtX, vtY, vtZ),
+          vTanMag,
+          vNormal,
+          speed,
+          diameter: d,
+          parentVolume: ev.volume,
+          generation: ev.generation,
+          splashVolume,
+          alpha,
+          fallbackAxis: v3(
+            surface.cellTangentU[o2],
+            surface.cellTangentU[o2 + 1],
+            surface.cellTangentU[o2 + 2]
+          ),
+        },
+        particles
       );
-      this.totals.splashedVolume += splashVolume;
+      secondaryCount = res.spawned;
+      // Whatever the buffer refused joins the film, so the balance still closes.
+      if (res.droppedVolume > 0) film.deposit(cell, res.droppedVolume, 0, 0);
+      this.totals.splashedVolume += splashVolume - res.droppedVolume;
+      this.totals.depositedVolume += res.droppedVolume;
       this.totals.splashEvents++;
     }
 
@@ -482,21 +540,21 @@ export class ImpactResolver {
    * the improvement from a shallower wall is so much larger than the change in
    * angle alone suggests.
    */
-  private emitSecondaries(
-    ev: ImpactEvent,
-    surface: UrinalSurface,
-    particles: ParticleSystem,
-    film: FilmSink,
-    cell: number,
-    n: Vec3,
-    vt: Vec3,
-    vTanMag: number,
-    vNormal: number,
-    speed: number,
-    d: number,
-    splashVolume: number,
-    alpha: number
-  ): number {
+  private emitSecondaries(site: SplashSite, particles: ParticleSystem): SecondaryResult {
+    const {
+      point,
+      n,
+      vt,
+      vTanMag,
+      vNormal,
+      speed,
+      diameter: d,
+      parentVolume,
+      generation,
+      splashVolume,
+      alpha,
+      fallbackAxis,
+    } = site;
     const p = this.params;
     const f = this.fluid;
 
@@ -512,9 +570,9 @@ export class ImpactResolver {
     const volEach = splashVolume / count;
 
     // Downstream tangential unit vector. For a dead-on normal impact there is no
-    // downstream direction, so the cell's own u tangent stands in as an
-    // arbitrary but consistent reference axis; the corona is axisymmetric in that
-    // case anyway, because the azimuthal concentration collapses to uniform at
+    // downstream direction, so the caller's reference axis stands in as an
+    // arbitrary but consistent one; the corona is axisymmetric in that case
+    // anyway, because the azimuthal concentration collapses to uniform at
     // alpha = 90 deg.
     let tx: number;
     let ty: number;
@@ -524,10 +582,9 @@ export class ImpactResolver {
       ty = vt.y / vTanMag;
       tz = vt.z / vTanMag;
     } else {
-      const o = cell * 3;
-      tx = surface.cellTangentU[o];
-      ty = surface.cellTangentU[o + 1];
-      tz = surface.cellTangentU[o + 2];
+      tx = fallbackAxis.x;
+      ty = fallbackAxis.y;
+      tz = fallbackAxis.z;
     }
 
     // Elevation of the ejecta above the surface, and azimuthal concentration.
@@ -592,7 +649,7 @@ export class ImpactResolver {
     // the incoming kinetic energy. Anything over budget is scaled back. Without
     // this the model can manufacture splashback out of nothing, and the
     // manufactured amount grows exactly where the design is worst.
-    const keIn = 0.5 * f.density * ev.volume * speed * speed;
+    const keIn = 0.5 * f.density * parentVolume * speed * speed;
     const surfaceCost = f.surfaceTension * Math.max(0, childArea - parentArea);
     const budget = Math.max(0, keIn - surfaceCost);
     let scale = 1;
@@ -601,16 +658,13 @@ export class ImpactResolver {
     }
 
     const off = 0.5 * medianD + 2e-4;
-    const origin = v3(
-      ev.hit.point.x + n.x * off,
-      ev.hit.point.y + n.y * off,
-      ev.hit.point.z + n.z * off
-    );
+    const origin = v3(point.x + n.x * off, point.y + n.y * off, point.z + n.z * off);
     // Tangential momentum the ejecta carry along with them.
     const ktx = vt.x * 0.35;
     const kty = vt.y * 0.35;
     const ktz = vt.z * 0.35;
 
+    let dropped = 0;
     for (const dr of dirs) {
       const sp = dr.sp * scale;
       const idx = particles.spawnDroplet(
@@ -618,17 +672,120 @@ export class ImpactResolver {
         v3(dr.x * sp + ktx, dr.y * sp + kty, dr.z * sp + ktz),
         dr.dd,
         volEach,
-        ev.generation + 1
+        generation + 1
       );
       if (idx < 0) {
-        // Buffer full: the liquid still exists, so it joins the film rather
-        // than disappearing and quietly breaking the volume balance.
-        film.deposit(cell, volEach, 0, 0);
+        // Buffer full. The liquid still exists, so it is handed back to the
+        // caller to put somewhere real rather than disappearing and quietly
+        // breaking the volume balance.
+        dropped += volEach;
         this.totals.droppedVolume += volEach;
       } else {
         spawned++;
       }
     }
-    return spawned;
+    return { spawned, droppedVolume: dropped };
   }
+
+  /**
+   * Resolve a droplet striking the *outside* of the casting.
+   *
+   * This exists because the exterior used to be a perfect absorber, and that was
+   * the single largest error in the model. A droplet reaching the casting was
+   * booked straight into `CaptureZone.FixtureExterior` and killed: no splash, no
+   * secondaries, nothing. For most aim points that is a rounding error, but the
+   * stream itself hits the casting whenever it is aimed low enough to have to
+   * clear the front rim, and then the absorber swallows the void whole. Measured
+   * on the default bowl at aim v = 0.55: 118.6 mL of a 120 mL void booked to the
+   * exterior, producing zero impacts, an empty film and zero splashback. The tool
+   * reported a *perfect* result for the one aim that in reality throws liquid
+   * straight back at the user off the front of the fixture.
+   *
+   * The casting is glazed ceramic exactly like the interior, so it splashes by the
+   * same physics and reuses the same threshold and the same corona model. Two
+   * things differ, both because the film solver's grid stops at the interior:
+   *
+   *  - There is no film thickness here, so the dry branch of the threshold is
+   *    used. Dry glaze splashes at a *higher* velocity than a thinly wetted one,
+   *    so this under-predicts rather than flatters.
+   *  - Liquid that does not leave has nowhere to be stored as film, so it is
+   *    reported as landing on the exterior -- which is what it does; it clings to
+   *    the outside of the fixture and runs down it.
+   *
+   * Volume closure is preserved: the split is exhaustive, the ejected part becomes
+   * live particles and the rest is returned for the caller to book to the zone.
+   */
+  resolveExterior(cap: CaptureEvent, particles: ParticleSystem): ExteriorSplashResult {
+    const none: ExteriorSplashResult = {
+      splashVolume: 0,
+      depositVolume: cap.volume,
+      secondaryCount: 0,
+    };
+    const n = cap.normal;
+    if (!n) return none;
+
+    const vDotN = cap.velocity.x * n.x + cap.velocity.y * n.y + cap.velocity.z * n.z;
+    const vNormal = Math.max(0, -vDotN);
+    const vtX = cap.velocity.x - vDotN * n.x;
+    const vtY = cap.velocity.y - vDotN * n.y;
+    const vtZ = cap.velocity.z - vDotN * n.z;
+    const vTanMag = Math.hypot(vtX, vtY, vtZ);
+    const speed = Math.hypot(cap.velocity.x, cap.velocity.y, cap.velocity.z);
+    const alpha = Math.atan2(vNormal, Math.max(1e-9, vTanMag));
+    const d = Math.max(1e-6, cap.diameter);
+
+    // Dry branch: no film is tracked outside the interior.
+    let ratio = this.thresholdRatio(vNormal, d, 0).ratio;
+    if (cap.coherent) ratio *= this.params.jetSplashAttenuation;
+
+    let splashFraction = 0;
+    if (ratio > 1) {
+      splashFraction =
+        this.params.maxSplashFraction *
+        (1 - Math.exp(-this.params.splashGrowthRate * (ratio - 1)));
+    }
+    if (cap.generation >= this.params.maxGeneration) splashFraction = 0;
+    if (splashFraction <= 0) return none;
+
+    const splashVolume = cap.volume * splashFraction;
+    const res = this.emitSecondaries(
+      {
+        point: cap.to,
+        n,
+        vt: v3(vtX, vtY, vtZ),
+        vTanMag,
+        vNormal,
+        speed,
+        diameter: d,
+        parentVolume: cap.volume,
+        generation: cap.generation,
+        splashVolume,
+        alpha,
+        fallbackAxis: perpendicularTo(n),
+      },
+      particles
+    );
+
+    this.totals.splashedVolume += splashVolume;
+    this.totals.splashEvents++;
+    this.totals.exteriorEvents++;
+    this.totals.exteriorSplashedVolume += splashVolume - res.droppedVolume;
+
+    return {
+      splashVolume: splashVolume - res.droppedVolume,
+      depositVolume: cap.volume - splashVolume + res.droppedVolume,
+      secondaryCount: res.spawned,
+    };
+  }
+}
+
+/** Any unit vector perpendicular to `n`, chosen to avoid a degenerate cross. */
+function perpendicularTo(n: Vec3): Vec3 {
+  const ax = Math.abs(n.x) < 0.9 ? 1 : 0;
+  const ay = Math.abs(n.x) < 0.9 ? 0 : 1;
+  const cx = n.y * 0 - n.z * ay;
+  const cy = n.z * ax - n.x * 0;
+  const cz = n.x * ay - n.y * ax;
+  const m = Math.hypot(cx, cy, cz) || 1;
+  return v3(cx / m, cy / m, cz / m);
 }

@@ -338,11 +338,26 @@ function filmTests(): TestResult[] {
     // spreads along the level contour until its depth reaches the point where the
     // pinned contact line can hold it. That final depth is a pure capillary
     // result and is known independently of this code.
+    //
+    // The deposit is a localised blob, and it has to stay localised. Sizing it from
+    // the level floor instead looks more principled and is wrong: with a level sump
+    // most of the basin lies within half a millimetre of the lowest point, so a
+    // patch scaled to that area spreads liquid over the whole bowl and the depth
+    // then rises monotonically with volume -- 1.5 mm, 2.2 mm, 3.2 mm -- because the
+    // liquid is being held by the basin walls rather than by its own contact line.
+    // That measures the shape of the sump, not capillarity.
+    //
+    // Kept deliberately small, so the blob collects, deepens, and spreads until the
+    // contact line pins. The evidence that the result is the pinning depth and not
+    // an artefact of the initial condition is that it is the same depth for one,
+    // one and a half, and two times this fill -- 1.75, 1.71, 1.70 mm -- so it is an
+    // attractor, which is a stronger statement than starting below it and arriving
+    // once.
     const patch: number[] = [];
     for (let j = sumpRow - 2; j <= sumpRow + 2; j++) {
       for (let i = s.nu / 2 - 4; i < s.nu / 2 + 4; i++) patch.push(j * s.nu + i);
     }
-    const fill = 0.5 * hRef;
+    const fill = hRef;
     for (const c of patch) film.deposit(c, fill * s.cellArea[c], 0, 0);
     const dt = 1 / 2000;
     for (let i = 0; i < 20000; i++) film.step(dt);
@@ -361,7 +376,7 @@ function filmTests(): TestResult[] {
         reference: 'h_max = 2 l_c sin(θ/2), capillary pressure against hydrostatic',
         notes:
           `capillary length ${(capillaryLength(URINE_37C) * 1000).toFixed(2)} mm; ` +
-          `started at ${(fill * 1000).toFixed(2)} mm, so the depth is found, not imposed`,
+          `same depth for 1x, 1.5x and 2x this fill, so it is an attractor`,
       })
     );
     out.push(

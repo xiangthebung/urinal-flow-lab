@@ -1,7 +1,9 @@
 import { AIR_DENSITY, AIR_VISCOSITY, GRAVITY } from '../core/constants';
 import { FluidProperties, dragCoefficient } from '../core/fluid';
 import { Vec3, v3 } from '../core/vec3';
+import { SolidCollider } from '../geometry/collider';
 import { SurfaceHit, UrinalSurface } from '../geometry/surface';
+import { CaptureZone } from './capture';
 import { EmittedParcel } from './stream';
 
 /**
@@ -61,6 +63,16 @@ export interface CaptureEvent {
   coherent: boolean;
   /** Which capture zone absorbed it. */
   zone: number;
+  /**
+   * Surface normal where it landed, for solid captures only.
+   *
+   * Present when the capture was a real surface -- currently the casting
+   * exterior -- and absent for the abstract zone rectangles. It is here because
+   * the outside of the fixture is ceramic and splashes; without a normal the
+   * impact model has no frame to throw a corona in, and the exterior was
+   * therefore a perfect absorber that could swallow an entire void.
+   */
+  normal?: Vec3;
 }
 
 /**
@@ -249,6 +261,7 @@ export class ParticleSystem {
     dt: number,
     fluid: FluidProperties,
     surface: UrinalSurface,
+    exterior: SolidCollider | null,
     capture: CaptureTester | null,
     out: ParticleStepResult,
     onBreakup: ((i: number) => void) | null
@@ -333,6 +346,38 @@ export class ParticleSystem {
         // Direction is passed unnormalised with maxT = 1, so t comes back as a
         // fraction of the step.
         const hit = surface.raycast(from, dir, 1);
+
+        // The outside of the casting, tested only as far as the interior hit so the
+        // nearer of the two wins. Without this the ceramic is intangible and splash
+        // leaving the bowl flies straight through the body of the fixture. It is not
+        // an impact: the film solver has no cell for the outside of the casting, and
+        // liquid landing there is already an accounted outcome -- it soils the
+        // fixture exterior and runs down the outside.
+        if (exterior) {
+          const solid = exterior.raycastSolid(from, dir, hit ? hit.t : 1);
+          if (solid) {
+            out.captures.push({
+              index: i,
+              from: v3(from.x, from.y, from.z),
+              to: v3(
+                from.x + dir.x * solid.t,
+                from.y + dir.y * solid.t,
+                from.z + dir.z * solid.t
+              ),
+              velocity: v3(vxi, vyi, vzi),
+              volume: this.volume[i],
+              diameter: d,
+              generation: this.generation[i],
+              coherent,
+              zone: CaptureZone.FixtureExterior,
+              // Copied, not aliased: MeshCollider returns a shared scratch vector
+              // and there may be many captures in one step.
+              normal: v3(solid.normal.x, solid.normal.y, solid.normal.z),
+            });
+            continue;
+          }
+        }
+
         if (hit) {
           out.impacts.push({
             index: i,

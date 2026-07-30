@@ -383,6 +383,20 @@ export interface ProfileParams {
   frontLipHeight: number;
   /** Radius of the inward curl at the front lip, m. 0 disables it. */
   frontLipInturn: number;
+  /**
+   * Where the sump floor ends and the front rise begins, as a fraction of the bowl
+   * depth.
+   *
+   * This decides the single most recognisable line on the fixture. It used to be
+   * pinned at the bowl depth less the lip curl less 20 mm, which puts the foot of
+   * the rise almost directly under the lip and makes the front wall of the bowl
+   * vertical -- so the casting is a slab of constant depth from the floor to the
+   * lip, and the fixture reads as a rounded box however the outside is built. Real
+   * sanitaryware sweeps the front down and back, leaving the base far shallower than
+   * the rim, and that undercut is most of the silhouette. Around 0.5 gives it; 1.0
+   * reproduces the old vertical front.
+   */
+  sumpFrontFraction: number;
   /** Forward overhang of the top hood, m. 0 disables it. */
   hoodDepth: number;
 }
@@ -421,11 +435,14 @@ export function buildProfile(pIn: ProfileParams): Profile {
     'frontLipHeight'
   );
 
-  // Front rise foot: leave room for the lip curl and a little wall.
+  // Foot of the front rise. Stated as a fraction of the depth so the front can
+  // lean back and give the fixture an undercut; the clamp only keeps it clear of
+  // the drain behind it and the lip curl in front of it.
+  const frontFrac = clamp(p.sumpFrontFraction, 0.25, 1.0, 'sumpFrontFraction');
   const zSumpFront = clamp(
-    p.bowlDepth - Math.max(0.02, p.frontLipInturn) - 0.02,
+    p.bowlDepth * frontFrac,
     0.05,
-    p.bowlDepth - 0.02,
+    p.bowlDepth - Math.max(0.02, p.frontLipInturn) - 0.005,
     'front rise position'
   );
   // Drain must sit behind the front rise foot and ahead of the back wall.
@@ -692,6 +709,7 @@ export function defaultProfileParams(): ProfileParams {
     drainZ: 0.10,
     frontLipHeight: 0.30,
     frontLipInturn: 0.022,
+    sumpFrontFraction: 0.55,
     hoodDepth: 0,
   };
 }
