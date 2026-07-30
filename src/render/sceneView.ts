@@ -1,11 +1,10 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { GRAVITY } from '../core/constants';
 import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
 import { CaptureScene } from '../sim/capture';
 import { Heatmap } from '../sim/metrics';
-import { StreamEmitter } from '../sim/stream';
+import { AimTrace } from '../sim/simulation';
 import { ColorScale, sample, toCss } from './colormap';
 import { DropletView } from './dropletView';
 import { FixtureView } from './fixtureView';
@@ -132,6 +131,22 @@ export class SceneView {
   /** Bounds of the exterior casting, or null before any geometry is set. */
   get castingBounds(): { min: Vec3; max: Vec3 } | null {
     return this.shell ? { min: this.shell.min, max: this.shell.max } : null;
+  }
+
+  /**
+   * World-space ray through a point on the canvas, in normalised device
+   * coordinates. Used to turn a click into an aim target.
+   *
+   * Returned as origin plus a direction already scaled to the far plane, because
+   * every consumer is `raycast(origin, dir, 1)`, which wants the whole segment.
+   */
+  rayThrough(ndcX: number, ndcY: number): { origin: Vec3; dir: Vec3 } {
+    const near = new THREE.Vector3(ndcX, ndcY, -1).unproject(this.camera);
+    const far = new THREE.Vector3(ndcX, ndcY, 1).unproject(this.camera);
+    return {
+      origin: { x: near.x, y: near.y, z: near.z },
+      dir: { x: far.x - near.x, y: far.y - near.y, z: far.z - near.z },
+    };
   }
 
   /** Back face of the casting, so the mounting wall can sit behind it. */
@@ -364,47 +379,26 @@ export class SceneView {
    * the least intuitive relationship to it. A few degrees of elevation moves the
    * landing point far enough to change the local wall angle by tens of degrees.
    */
-  updateStreamPath(emitter: StreamEmitter, surface: UrinalSurface, tSample: number): void {
+  updateStreamPath(trace: AimTrace): void {
     if (this.streamLine) {
       this.streamGroup.remove(this.streamLine);
       this.streamLine.geometry.dispose();
       this.streamLine = null;
     }
-    const speed = emitter.speedAt(tSample);
-    if (speed <= 1e-4) {
+    if (trace.points.length < 2) {
       this.aimMarker.visible = false;
       return;
     }
-    const dir = emitter.aimDirection();
-    const pts: THREE.Vector3[] = [];
-    const o = emitter.position;
-    const dt = 0.004;
-    let prev = new THREE.Vector3(o.x, o.y, o.z);
-    pts.push(prev.clone());
-    let hitPoint: THREE.Vector3 | null = null;
-    for (let i = 1; i <= 200; i++) {
-      const t = i * dt;
-      const p = new THREE.Vector3(
-        o.x + dir.x * speed * t,
-        o.y + dir.y * speed * t - 0.5 * GRAVITY * t * t,
-        o.z + dir.z * speed * t
-      );
-      const seg = { x: p.x - prev.x, y: p.y - prev.y, z: p.z - prev.z };
-      const hit = surface.raycast(prev, seg, 1);
-      if (hit) {
-        hitPoint = new THREE.Vector3(hit.point.x, hit.point.y, hit.point.z);
-        pts.push(hitPoint.clone());
-        break;
-      }
-      pts.push(p.clone());
-      prev = p;
-      if (p.y < surface.floorY) break;
-    }
+
+    const pts = trace.points.map((p) => new THREE.Vector3(p.x, p.y, p.z));
     const g = new THREE.BufferGeometry().setFromPoints(pts);
+    // Amber when the ceramic stops the stream before it reaches the wetted
+    // interior, so a blocked aim reads as a warning rather than as a normal one.
+    const blocked = trace.blocked;
     this.streamLine = new THREE.Line(
       g,
       new THREE.LineDashedMaterial({
-        color: 0x35e0ff,
+        color: blocked ? 0xffa03c : 0x35e0ff,
         dashSize: 0.014,
         gapSize: 0.01,
         transparent: true,
@@ -414,8 +408,11 @@ export class SceneView {
     this.streamLine.computeLineDistances();
     this.streamGroup.add(this.streamLine);
 
-    if (hitPoint) {
-      this.aimMarker.position.copy(hitPoint);
+    if (trace.point) {
+      this.aimMarker.position.set(trace.point.x, trace.point.y, trace.point.z);
+      (this.aimMarker.material as THREE.MeshBasicMaterial).color.setHex(
+        blocked ? 0xffa03c : 0x35e0ff
+      );
       this.aimMarker.visible = true;
     } else {
       this.aimMarker.visible = false;

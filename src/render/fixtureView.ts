@@ -55,6 +55,9 @@ export interface FieldInfo {
 
 const SENTINEL = -1e9;
 
+/** Per-vertex scatter channels: field, film, relief xyz, speed, edge. */
+const ACCUM_CHANNELS = 7;
+
 export class FixtureView {
   readonly group = new THREE.Group();
   private geometry!: THREE.BufferGeometry;
@@ -72,6 +75,8 @@ export class FixtureView {
   private film!: Float32Array;
   private relief!: Float32Array;
   private speed!: Float32Array;
+  /** Contact-line strength: 1 where a wet cell abuts a much drier one. */
+  private edge!: Float32Array;
   // Scatter scratch.
   private accum!: Float64Array;
   private counts!: Uint16Array;
@@ -101,6 +106,7 @@ export class FixtureView {
         uLiquid: { value: 1 },
         uRelief: { value: 12 },
         uTime: { value: 0 },
+        uWetOnset: { value: 50e-6 },
         uShadowColor: { value: new THREE.Color(0.34, 0.35, 0.38) },
         uBase: { value: new THREE.Color(0.895, 0.905, 0.925) },
         uLiquidTint: { value: new THREE.Color(0.86, 0.84, 0.55) },
@@ -112,10 +118,12 @@ export class FixtureView {
         attribute float aFilm;
         attribute vec3 aRelief;
         attribute float aSpeed;
+        attribute float aEdge;
         varying float vField;
         varying float vFilm;
         varying vec3 vRelief;
         varying float vSpeed;
+        varying float vEdge;
         varying vec3 vNormal;
         varying vec3 vView;
         varying vec3 vLocal;
@@ -124,6 +132,7 @@ export class FixtureView {
           vFilm = aFilm;
           vRelief = aRelief;
           vSpeed = aSpeed;
+          vEdge = aEdge;
           vLocal = position;
           vNormal = normalize(normalMatrix * normal);
           vec4 mv = modelViewMatrix * vec4(position, 1.0);
@@ -142,6 +151,7 @@ export class FixtureView {
         uniform float uLiquid;
         uniform float uRelief;
         uniform float uTime;
+        uniform float uWetOnset;
         uniform vec3 uShadowColor;
         uniform vec3 uBase;
         uniform vec3 uLiquidTint;
@@ -151,6 +161,7 @@ export class FixtureView {
         varying float vFilm;
         varying vec3 vRelief;
         varying float vSpeed;
+        varying float vEdge;
         varying vec3 vNormal;
         varying vec3 vView;
         varying vec3 vLocal;
@@ -164,9 +175,18 @@ export class FixtureView {
           vec3 nDry = n;
 
           // ---- liquid ------------------------------------------------------
-          // Wetness saturates by ~30 um: past that the glaze is simply wet and
-          // more thickness changes the tint, not the gloss.
-          float wet = smoothstep(3.0e-6, 3.0e-5, vFilm) * uLiquid;
+          // Liquid on glaze has a contact line, not a gradient, and the old
+          // mapping had no way to show one. It saturated at 30 um -- below the
+          // retention thickness, the layer that is always left behind -- so any
+          // cell the liquid had ever touched read as fully wet. The whole basin
+          // came out uniformly damp with a soft edge, which is what a porous
+          // surface looks like. Ceramic does not do that: it carries a bounded
+          // patch with a bright edge and dry glaze beyond it.
+          //
+          // Referenced to the retention thickness so the appearance follows the
+          // physics rather than a constant that happened to look acceptable on one
+          // fixture.
+          float wet = smoothstep(uWetOnset * 0.25, uWetOnset * 0.9, vFilm) * uLiquid;
           // Depth tint saturates around 0.4 mm, so sump pooling reads distinctly
           // from a damp wall.
           float deep = (1.0 - exp(-vFilm / 4.0e-4)) * uLiquid;
@@ -184,15 +204,26 @@ export class FixtureView {
             float s = rlen * uRelief;
             float maxTilt = 0.70;
             nWet = normalize(n + rdir * (s / (1.0 + s / maxTilt)));
-            // Fast film carries capillary waves far shorter than a grid cell.
-            // Added here as an explicitly visual stand-in for that unresolved
-            // scale; it perturbs shading only and feeds back into nothing.
-            float agitate = clamp(vSpeed * 3.0, 0.0, 1.0);
-            if (agitate > 0.01) {
-              float p = vLocal.y * 420.0 + vLocal.x * 260.0 - uTime * 7.0;
-              float q = vLocal.y * 260.0 - vLocal.z * 380.0 - uTime * 4.3;
-              vec3 jitter = vec3(sin(p) + 0.6 * sin(q * 1.7), cos(q), sin(q));
-              nWet = normalize(nWet + jitter * (0.05 * agitate));
+            // Capillary waves on fast film, at a scale the grid cannot resolve.
+            //
+            // This used to be isotropic sin/cos noise in three axes at a few
+            // hundred cycles per metre, and it was the single biggest reason the
+            // liquid read as a stain soaking into a porous surface: it put
+            // high-frequency mottle over the whole wetted region, in every
+            // direction at once, which is what a rough absorbent surface looks
+            // like and the opposite of what a sheet of liquid running over glaze
+            // looks like. Injecting wall-jet momentum made it worse, because the
+            // amplitude follows film speed and the film is now genuinely fast.
+            //
+            // Real ripples on a running film are transverse: stretched across the
+            // flow and travelling with it. So the perturbation is applied along
+            // the surface gradient direction only, which is the flow direction to
+            // within the accuracy of a shading trick, and at a much lower
+            // amplitude.
+            float agitate = clamp(vSpeed * 1.6, 0.0, 1.0);
+            if (agitate > 0.01 && rlen > 1.0e-9) {
+              float phase = dot(vLocal, rdir) * 900.0 - uTime * 9.0;
+              nWet = normalize(nWet + rdir * (sin(phase) * 0.018 * agitate));
             }
           }
           vec3 nUse = normalize(mix(nDry, nWet, wet));
@@ -234,13 +265,28 @@ export class FixtureView {
           }
 
           // Wet glaze darkens, the way any wet surface does, and deeper liquid
-          // takes on its own colour.
-          albedo *= (1.0 - 0.30 * wet);
-          albedo = mix(albedo, albedo * uLiquidTint, 0.55 * deep);
+          // takes on its own colour. The darkening is the main cue that separates
+          // wetted from dry at a glance, so it is worth more than the 30% it used
+          // to get -- at that strength, with mottle over the top, the boundary of
+          // the patch was invisible and the whole basin read as uniformly damp.
+          albedo *= (1.0 - 0.42 * wet);
+          // Tint from a tenth of a millimetre rather than only in a deep pool, so
+          // a running film reads as liquid rather than as dark ceramic.
+          float tint = max(0.55 * deep, 0.30 * wet * smoothstep(0.0, 1.2e-4, vFilm));
+          albedo = mix(albedo, albedo * uLiquidTint, tint);
 
           vec3 col = albedo * diffuse + vec3(spec) + albedo * rim * 0.22;
           // Grazing reflection off the liquid surface.
           col += vec3(0.10, 0.13, 0.16) * rim * wet;
+
+          // Meniscus at the contact line. The free surface turns through a large
+          // angle in the last fraction of a millimetre at the edge of a patch, so
+          // it gathers a bright line -- and that line is most of what tells the eye
+          // it is looking at liquid resting on a surface rather than at a stain in
+          // one. vEdge is built on the solver's own grid, from a wet cell having a
+          // much drier neighbour, so it marks the real boundary of the wetted
+          // region at any resolution.
+          col += vec3(0.42, 0.47, 0.52) * vEdge * (0.45 + 0.55 * wet);
 
           gl_FragColor = vec4(col, 1.0);
         }
@@ -305,14 +351,16 @@ export class FixtureView {
     this.film = new Float32Array(nVert);
     this.relief = new Float32Array(nVert * 3);
     this.speed = new Float32Array(nVert);
+    this.edge = new Float32Array(nVert);
     this.geometry.setAttribute('aField', new THREE.BufferAttribute(this.field, 1));
     this.geometry.setAttribute('aFilm', new THREE.BufferAttribute(this.film, 1));
     this.geometry.setAttribute('aRelief', new THREE.BufferAttribute(this.relief, 3));
     this.geometry.setAttribute('aSpeed', new THREE.BufferAttribute(this.speed, 1));
+    this.geometry.setAttribute('aEdge', new THREE.BufferAttribute(this.edge, 1));
     this.geometry.setIndex(new THREE.BufferAttribute(surface.indices.slice(), 1));
     this.geometry.computeBoundingSphere();
 
-    this.accum = new Float64Array(nVert * 6);
+    this.accum = new Float64Array(nVert * ACCUM_CHANNELS);
     this.counts = new Uint16Array(nVert);
     this.cellScratch = new Float64Array(nCell);
 
@@ -402,7 +450,10 @@ export class FixtureView {
     this.accum.fill(0);
     this.counts.fill(0);
 
-    // Channel layout per vertex: field, film, reliefX, reliefY, reliefZ, speed.
+    // Channel layout per vertex: field, film, reliefX, reliefY, reliefZ, speed,
+    // edge.
+    const wetOnset = Math.max(1e-9, this.material.uniforms.uWetOnset.value as number);
+    const wetFloor = 0.25 * wetOnset;
     for (let j = 0; j < s.nv; j++) {
       for (let i = 0; i < s.nu; i++) {
         const c = j * s.nu + i;
@@ -433,6 +484,25 @@ export class FixtureView {
         const h = this.filmH[c];
         const sp = this.filmSpeed(c);
 
+        // Contact line: this cell holds enough liquid to read as wet while a
+        // neighbour holds far less. Computed on the solver's grid from the four
+        // face neighbours rather than from a thickness gradient, because a
+        // gradient threshold has to be retuned for every grid resolution and this
+        // does not -- the drop across one cell at a pinned contact line is the
+        // whole film thickness however large the cell is.
+        let edge = 0;
+        if (h > wetFloor) {
+          const nbMin = Math.min(
+            this.filmH[j * s.nu + iL],
+            this.filmH[j * s.nu + iR],
+            this.filmH[jD * s.nu + i],
+            this.filmH[jU * s.nu + i]
+          );
+          edge = Math.max(0, Math.min(1, 1 - nbMin / h));
+          // Only the outer boundary, not the gentle taper inside a settled pool.
+          edge = edge * edge;
+        }
+
         const vs = [
           j * stride + i,
           j * stride + i + 1,
@@ -440,7 +510,7 @@ export class FixtureView {
           (j + 1) * stride + i + 1,
         ];
         for (const vi of vs) {
-          const b = vi * 6;
+          const b = vi * ACCUM_CHANNELS;
           if (fieldOk) {
             this.accum[b] += fv;
             this.counts[vi]++;
@@ -450,6 +520,7 @@ export class FixtureView {
           this.accum[b + 3] += ry;
           this.accum[b + 4] += rz;
           this.accum[b + 5] += sp;
+          this.accum[b + 6] += edge;
         }
       }
     }
@@ -459,7 +530,7 @@ export class FixtureView {
     // data field uses its own count because invalid cells were skipped.
     const stride2 = s.nu + 1;
     for (let vi = 0; vi < nVert; vi++) {
-      const b = vi * 6;
+      const b = vi * ACCUM_CHANNELS;
       const i = vi % stride2;
       const j = (vi - i) / stride2;
       const nu = i > 0 && i < s.nu ? 2 : 1;
@@ -471,12 +542,14 @@ export class FixtureView {
       this.relief[vi * 3 + 1] = this.accum[b + 3] / touch;
       this.relief[vi * 3 + 2] = this.accum[b + 4] / touch;
       this.speed[vi] = this.accum[b + 5] / touch;
+      this.edge[vi] = this.accum[b + 6] / touch;
     }
 
     (this.geometry.getAttribute('aField') as THREE.BufferAttribute).needsUpdate = true;
     (this.geometry.getAttribute('aFilm') as THREE.BufferAttribute).needsUpdate = true;
     (this.geometry.getAttribute('aRelief') as THREE.BufferAttribute).needsUpdate = true;
     (this.geometry.getAttribute('aSpeed') as THREE.BufferAttribute).needsUpdate = true;
+    (this.geometry.getAttribute('aEdge') as THREE.BufferAttribute).needsUpdate = true;
   }
 
   private filmH!: Float64Array;
@@ -500,6 +573,10 @@ export class FixtureView {
 
     this.material.uniforms.uTime.value = time;
     this.material.uniforms.uRelief.value = this.reliefGain;
+    // Tied to the solver's own retention thickness, so if that is changed the
+    // point at which the glaze starts to look wet moves with it instead of the
+    // appearance quietly disagreeing with the physics.
+    this.material.uniforms.uWetOnset.value = Math.max(5e-6, film.params.retentionThickness);
     // Dry mode is for reading geometry, so the liquid is switched off entirely.
     const liquid = this.mode === FieldMode.Dry ? 0 : this.liquidStrength;
     this.material.uniforms.uLiquid.value = liquid;

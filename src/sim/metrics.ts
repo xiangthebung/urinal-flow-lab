@@ -1,5 +1,6 @@
 import { CRITICAL_IMPINGEMENT_ANGLE, FILM_DRY_THICKNESS } from '../core/constants';
 import { Vec3, clamp, radToDeg, v3 } from '../core/vec3';
+import { SolidCollider } from '../geometry/collider';
 import { UrinalSurface } from '../geometry/surface';
 import { CaptureZone, ZONE_NAMES } from './capture';
 import { FilmSolver } from './film';
@@ -38,6 +39,49 @@ const emptyTally = (): ZoneTally => ({
   count: 0,
   splashVolume: 0,
   directVolume: 0,
+});
+
+/**
+ * How strong the stream was when liquid arrived.
+ *
+ * Splitting the result this way turned out to be necessary rather than
+ * decorative. A void is not one experiment: the stream rises, holds near peak for
+ * most of the volume, then decays to a dribble. A fast stream reaches the back
+ * wall at the angle the wall was designed for; a decaying one on the same aim
+ * falls short, and on a deep fixture "short" means the front rim of the fixture
+ * itself, which throws liquid straight back at the user.
+ *
+ * Aggregating the two hides the mechanism completely, and the aggregate can even
+ * inverse-rank two designs depending on stand-off. Reporting them separately is
+ * what lets a designer see that a deep bowl buys a better wall and pays for it in
+ * the tail.
+ */
+export const enum FlowPhase {
+  /** Flow at or above half of peak. Most of the volume. */
+  Sustained = 0,
+  /** The rise and the decay, where the stream is slow and falls short. */
+  Weak = 1,
+  Count = 2,
+}
+
+export const FLOW_PHASE_NAMES = ['sustained flow', 'weak flow (rise & tail)'];
+
+export interface PhaseTally {
+  /** Volume voided during this phase, m^3. */
+  emitted: number;
+  /** Volume landing on the user during this phase, m^3. */
+  userVolume: number;
+  /** Droplets landing on the user during this phase. */
+  userDroplets: number;
+  /** Volume striking the outside of the fixture during this phase, m^3. */
+  exteriorVolume: number;
+}
+
+const emptyPhase = (): PhaseTally => ({
+  emitted: 0,
+  userVolume: 0,
+  userDroplets: 0,
+  exteriorVolume: 0,
 });
 
 export interface TimeSample {
@@ -123,6 +167,21 @@ export interface SplashbackReport {
   /** Volume that escaped the fixture entirely, m^3. */
   escapedVolume: number;
   perZone: ZoneTally[];
+  /** Splashback split by stream strength. See FlowPhase. */
+  perPhase: PhaseTally[];
+  /**
+   * Microlitres on the user per litre voided, counting only the sustained-flow
+   * part of the void.
+   *
+   * This is the figure that isolates the wall: during sustained flow the stream
+   * reaches the surface the design governs, so the number reflects the shape.
+   * The all-in figure additionally contains the tail, where the stream falls
+   * short onto the fixture's own rim, and that is dominated by how deep the
+   * fixture is rather than by the wall's angle.
+   */
+  sustainedMicrolitresPerLitre: number;
+  /** The same, for the weak rise and decay. */
+  weakMicrolitresPerLitre: number;
 }
 
 export interface DrainageReport {
@@ -192,6 +251,18 @@ export class Metrics {
   readonly surface: UrinalSurface;
   perZone: ZoneTally[] = [];
   samples: TimeSample[] = [];
+  /** Splashback split by how strong the stream was. See FlowPhase. */
+  perPhase: PhaseTally[] = [];
+  /**
+   * Which phase the stream is in right now, set by the simulation each step.
+   *
+   * Captures are attributed by the moment they land rather than the moment they
+   * were emitted. Splash transit is a few tens of milliseconds against a void of
+   * fifteen-odd seconds, so the two agree except at the phase boundary, and
+   * tagging every particle with its birth phase would cost a byte per particle to
+   * move that boundary by one frame.
+   */
+  currentPhase: FlowPhase = FlowPhase.Weak;
 
   /** Deposition on the floor, plan view. */
   floorMap: Heatmap;
@@ -202,6 +273,19 @@ export class Metrics {
   impactVolume: Float64Array;
   impactAngleSum: Float64Array;
   impactSplashed: Float64Array;
+  /**
+   * The same, restricted to droplets straight from the stream.
+   *
+   * Kept separately because the combined figure does not answer the question it
+   * appears to. "Where the stream landed" was reported over every impact of every
+   * generation, and secondary droplets re-impacting are not a small correction:
+   * measured on the default bowl, 117 mL of primary arrivals at 46 deg against
+   * 84 mL of secondary arrivals at 59 deg. Nearly half the weight of a statistic
+   * about the stream came from liquid that had already bounced, which both dilutes
+   * the aim signal and drags the angle upward.
+   */
+  primaryVolume: Float64Array;
+  primaryAngleSum: Float64Array;
 
   /** Volume that left the domain without being captured, m^3. */
   escapedVolume = 0;
@@ -233,18 +317,25 @@ export class Metrics {
     this.impactVolume = new Float64Array(n);
     this.impactAngleSum = new Float64Array(n);
     this.impactSplashed = new Float64Array(n);
+    this.primaryVolume = new Float64Array(n);
+    this.primaryAngleSum = new Float64Array(n);
     this.reset();
   }
 
   reset(): void {
     this.perZone = [];
     for (let i = 0; i < CaptureZone.Count; i++) this.perZone.push(emptyTally());
+    this.perPhase = [];
+    for (let i = 0; i < FlowPhase.Count; i++) this.perPhase.push(emptyPhase());
+    this.currentPhase = FlowPhase.Weak;
     this.samples = [];
     this.floorMap.reset();
     this.bodyMap.reset();
     this.impactVolume.fill(0);
     this.impactAngleSum.fill(0);
     this.impactSplashed.fill(0);
+    this.primaryVolume.fill(0);
+    this.primaryAngleSum.fill(0);
     this.escapedVolume = 0;
     this.emittedVolume = 0;
     this.peakFilmVolume = 0;
@@ -268,6 +359,20 @@ export class Metrics {
     if (generation > 0) z.splashVolume += volume;
     else z.directVolume += volume;
 
+    const ph = this.perPhase[this.currentPhase];
+    if (ph) {
+      if (
+        zone === CaptureZone.Shoe ||
+        zone === CaptureZone.Shin ||
+        zone === CaptureZone.Thigh
+      ) {
+        ph.userVolume += volume;
+        ph.userDroplets++;
+      } else if (zone === CaptureZone.FixtureExterior) {
+        ph.exteriorVolume += volume;
+      }
+    }
+
     if (
       zone === CaptureZone.FloorNear ||
       zone === CaptureZone.FloorFar ||
@@ -280,10 +385,20 @@ export class Metrics {
     }
   }
 
-  recordImpact(cell: number, volume: number, angle: number, splashed: number): void {
+  recordImpact(
+    cell: number,
+    volume: number,
+    angle: number,
+    splashed: number,
+    generation = 0
+  ): void {
     this.impactVolume[cell] += volume;
     this.impactAngleSum[cell] += angle * volume;
     this.impactSplashed[cell] += splashed;
+    if (generation === 0) {
+      this.primaryVolume[cell] += volume;
+      this.primaryAngleSum[cell] += angle * volume;
+    }
   }
 
   sample(s: TimeSample, film: FilmSolver): void {
@@ -319,11 +434,16 @@ export class Metrics {
     const userSplash = shoe.splashVolume + shin.splashVolume + thigh.splashVolume;
     const userDirect = shoe.directVolume + shin.directVolume + thigh.directVolume;
     const litres = Math.max(1e-12, this.emittedVolume) * 1000;
+    const perL = (p: PhaseTally): number =>
+      p.emitted > 1e-12 ? (p.userVolume * 1e9) / (p.emitted * 1000) : 0;
     return {
       userVolume,
       userSplashVolume: userSplash,
       userDirectVolume: userDirect,
       floorNearVolume: this.perZone[CaptureZone.FloorNear].volume,
+      perPhase: this.perPhase,
+      sustainedMicrolitresPerLitre: perL(this.perPhase[FlowPhase.Sustained]),
+      weakMicrolitresPerLitre: perL(this.perPhase[FlowPhase.Weak]),
       // Microlitres per litre voided: normalises out how much was voided so two
       // runs with different volumes can be compared directly.
       userMicrolitresPerLitre: (userVolume * 1e9) / litres,
@@ -388,17 +508,35 @@ export class Metrics {
     splashCentroidV: number;
     /** Share of splashed volume from the worst 10% of impacted cells. */
     hotspotShare: number;
+    /** Volume arriving straight from the stream, m^3. */
+    primaryVolume: number;
+    /** Volume-weighted mean angle of stream arrivals only, radians. */
+    primaryMeanAngle: number;
+    /** Fraction of stream arrivals steeper than the criterion. */
+    primaryFractionOverCritical: number;
+    /** Volume arriving as re-impacting splash, m^3. */
+    secondaryVolume: number;
   } {
     let volSum = 0;
     let angVolSum = 0;
     let overVol = 0;
     let splashSum = 0;
     let splashVSum = 0;
+    let pVolSum = 0;
+    let pAngVolSum = 0;
+    let pOverVol = 0;
     const nu = this.surface.nu;
     const nv = this.surface.nv;
     const pairs: Array<{ a: number; v: number }> = [];
 
     for (let c = 0; c < this.impactVolume.length; c++) {
+      const pv = this.primaryVolume[c];
+      if (pv > 0) {
+        const pAng = this.primaryAngleSum[c] / pv;
+        pVolSum += pv;
+        pAngVolSum += this.primaryAngleSum[c];
+        if (pAng > CRITICAL_IMPINGEMENT_ANGLE) pOverVol += pv;
+      }
       const vol = this.impactVolume[c];
       if (vol <= 0) continue;
       const ang = this.impactAngleSum[c] / vol;
@@ -438,6 +576,10 @@ export class Metrics {
       fractionOverCritical: volSum > 0 ? overVol / volSum : 0,
       splashCentroidV: splashSum > 0 ? splashVSum / splashSum : 0,
       hotspotShare: splashSum > 0 ? top / splashSum : 0,
+      primaryVolume: pVolSum,
+      primaryMeanAngle: pVolSum > 0 ? pAngVolSum / pVolSum : 0,
+      primaryFractionOverCritical: pVolSum > 0 ? pOverVol / pVolSum : 0,
+      secondaryVolume: Math.max(0, volSum - pVolSum),
     };
   }
 
@@ -513,7 +655,21 @@ export function computeImpingementMap(
   emitter: Vec3,
   speed: number,
   gravity: number,
-  criticalAngle = CRITICAL_IMPINGEMENT_ANGLE
+  criticalAngle = CRITICAL_IMPINGEMENT_ANGLE,
+  /**
+   * The solid casting, so cells it hides are excluded.
+   *
+   * Optional only so the map can still be computed before a casting exists.
+   * Passing it matters: the line-of-sight test used to consider the wetted
+   * interior alone, and the casting is thicker than the interior all round with a
+   * rim that stands proud of it. Measured over the fixture library, the casting
+   * hides 19-44% of interior cells from the exit point -- the deck under the rim,
+   * the back of the lip, the outer reaches of the side walls. Every one of those
+   * was being counted as reachable surface, so both the mean angle and the
+   * fraction over the criterion were averages taken partly over ceramic the
+   * stream cannot touch.
+   */
+  exterior?: SolidCollider | null
 ): ImpingementReport {
   const n = surface.nu * surface.nv;
   const angle = new Float64Array(n);
@@ -543,6 +699,15 @@ export function computeImpingementMap(
       angle[c] = Number.NaN;
       shadowed[c] = 1;
       continue;
+    }
+    if (exterior) {
+      // `back` is a unit direction, so the limit is a real distance here.
+      const solid = exterior.raycastSolid(start, back, reach * 0.98);
+      if (solid) {
+        angle[c] = Number.NaN;
+        shadowed[c] = 1;
+        continue;
+      }
     }
 
     const a = surface.impingementAngle(c, dir);

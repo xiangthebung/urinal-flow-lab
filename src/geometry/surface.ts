@@ -868,6 +868,23 @@ export class UrinalSurface {
     return cv * this.nu + cu;
   }
 
+  /**
+   * Parametric coordinates of a cell centre. The inverse of `cellFromUv`.
+   *
+   * Needed so a point picked in the viewport can be turned back into an aim
+   * target that survives a change of grid resolution or of fixture: (u, v) is
+   * resolution-independent and means the same thing on every model, where a cell
+   * index means nothing outside the grid that produced it.
+   */
+  uvOfCell(cell: number): { u: number; v: number } {
+    const cu = cell % this.nu;
+    const cv = (cell - cu) / this.nu;
+    return {
+      u: ((cu + 0.5) / this.nu) * 2 - 1,
+      v: (cv + 0.5) / this.nv,
+    };
+  }
+
   getCellNormal(cell: number, out: Vec3): Vec3 {
     out.x = this.cellNormal[cell * 3];
     out.y = this.cellNormal[cell * 3 + 1];

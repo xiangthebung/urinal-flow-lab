@@ -223,6 +223,107 @@ export class FilmSolver implements FilmSink {
     this.depositedVolume += volume;
   }
 
+  /**
+   * Deposit a jet impact as a spreading wall jet rather than as a point source.
+   *
+   * This is what makes an impact look like liquid hitting ceramic instead of ink
+   * hitting blotting paper, and it is a physics correction rather than a cosmetic
+   * one.
+   *
+   * `deposit` alone throws away the normal component of the arriving velocity. For
+   * a near-normal impact that is nearly all of the momentum: the liquid was
+   * handed to a single cell with almost no in-plane speed, so it sat there and
+   * oozed downhill under gravity, spreading only by hydrostatic diffusion. That
+   * is the wrong mechanism and it looks wrong -- a soaking stain with a soft edge.
+   *
+   * What really happens is a stagnation-point wall jet. The jet's normal momentum
+   * is turned by the wall into a radially outward sheet, and because the pressure
+   * returns to atmospheric just outside the stagnation region, inviscid Bernoulli
+   * puts the sheet's speed at very nearly the incoming jet speed. That fast thin
+   * sheet runs outward until it can no longer outrun gravity and surface tension,
+   * where it thickens abruptly. On an inclined wall the resulting boundary is not
+   * a circle: the sheet climbs a little way up, spreads sideways, and is swept
+   * down, so the thickened rim traces out a parabola-like curve open at the
+   * bottom, with the liquid draining from the open end. That is the shape you see
+   * in any video of a urinal in use, and it is a documented hydraulic jump on an
+   * incline (Edwards, Howison, Ockendon & Ockendon, "Hydraulic jumps on an
+   * incline", J. Fluid Mech. 2008 -- a thick outer rim "resembling a parabola").
+   *
+   * Nothing here draws a parabola. The rim falls out of the shallow-water solver
+   * once the sheet is given the right initial condition: radial momentum at jet
+   * speed, spread over the real footprint instead of one cell. The footprint
+   * matters too -- a 3 mm jet feeds a sheet tens of millimetres across, and
+   * injecting all of it into one 3 mm cell produces a spike the advection scheme
+   * then has to smear out, which is the soft edge again.
+   */
+  depositJet(
+    cell: number,
+    volume: number,
+    velU: number,
+    velV: number,
+    spreadSpeed: number,
+    footprintRadius: number
+  ): void {
+    const s = this.surface;
+    const du = Math.max(1e-6, s.cellDu[cell]);
+    const dv = Math.max(1e-6, s.cellDv[cell]);
+    // Footprint in cells, bounded: one ring is enough at coarse resolution and
+    // more than three would smear the impact over a region the jet never touches.
+    const ru = Math.min(3, Math.max(0, Math.round(footprintRadius / du)));
+    const rv = Math.min(3, Math.max(0, Math.round(footprintRadius / dv)));
+    if (ru === 0 && rv === 0) {
+      this.deposit(cell, volume, velU, velV);
+      return;
+    }
+
+    const i0 = cell % this.nu;
+    const j0 = (cell - i0) / this.nu;
+
+    // Weight by a cosine bell over the footprint, and normalise over whatever part
+    // of it is actually on the grid so the volume is exact at the edges too.
+    let wSum = 0;
+    for (let dj = -rv; dj <= rv; dj++) {
+      const j = j0 + dj;
+      if (j < 0 || j >= this.nv) continue;
+      for (let di = -ru; di <= ru; di++) {
+        const i = i0 + di;
+        if (i < 0 || i >= this.nu) continue;
+        const rn = Math.hypot(ru > 0 ? di / ru : 0, rv > 0 ? dj / rv : 0);
+        if (rn > 1) continue;
+        wSum += 0.5 * (1 + Math.cos(Math.PI * rn));
+      }
+    }
+    if (wSum <= 0) {
+      this.deposit(cell, volume, velU, velV);
+      return;
+    }
+
+    for (let dj = -rv; dj <= rv; dj++) {
+      const j = j0 + dj;
+      if (j < 0 || j >= this.nv) continue;
+      for (let di = -ru; di <= ru; di++) {
+        const i = i0 + di;
+        if (i < 0 || i >= this.nu) continue;
+        const nu2 = ru > 0 ? di / ru : 0;
+        const nv2 = rv > 0 ? dj / rv : 0;
+        const rn = Math.hypot(nu2, nv2);
+        if (rn > 1) continue;
+        const w = (0.5 * (1 + Math.cos(Math.PI * rn))) / wSum;
+
+        // Radially outward from the impact point, at the wall-jet speed, plus the
+        // tangential momentum the jet already had. At the very centre there is no
+        // radial direction, which is correct -- that is the stagnation point.
+        let su = 0;
+        let sv = 0;
+        if (rn > 1e-6) {
+          su = (nu2 / rn) * spreadSpeed;
+          sv = (nv2 / rn) * spreadSpeed;
+        }
+        this.deposit(this.idx(i, j), volume * w, velU + su, velV + sv);
+      }
+    }
+  }
+
   // -- Diagnostics ---------------------------------------------------------
 
   /** Total liquid held on the wall, m^3. */

@@ -36,8 +36,10 @@ export interface LabAutomation {
   /** Surface data overlay, or 'liquid' / 'dry' for the realistic views. */
   setFieldMode(mode: string): void;
   setCamera(preset: string): void;
-  /** Aim at a fraction along the sagittal profile. */
+  /** Aim at a fraction along the sagittal profile, on the centreline. */
   setAim(v: number): void;
+  /** Aim at a parametric point: u across the width (-1..1), v down the profile. */
+  setAimUv(u: number, v: number): void;
   /** Toggle scene furniture, so a shot can isolate the fixture. */
   setOverlays(opts: {
     zones?: boolean;
@@ -118,6 +120,7 @@ export function attachAutomation(app: App): void {
       app.sim.config.aimTargetV = v;
       app.apply('aim');
     },
+    setAimUv: (u, v) => app.setAimTarget(u, v),
     setOverlays: (o) => {
       app.setOverlays(o);
       app.refreshViews();

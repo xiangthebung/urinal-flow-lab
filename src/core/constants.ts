@@ -48,6 +48,21 @@ export const WET_SPLASH_K_FILM = 5880;
 export const WET_SPLASH_K_FILM_EXP = 1.44;
 
 /**
+ * Largest dimensionless film thickness the Cossali fit is used at.
+ *
+ * Their experiments cover delta = h/d up to order one. The correlation is
+ * monotonically increasing in delta with no upper bound, so extrapolating it into
+ * a standing pool claims that deeper liquid is ever harder to splash -- at
+ * delta = 2 the critical K is already 18000, i.e. effectively unsplashable. The
+ * real physics changes character instead: past roughly one diameter the impact
+ * makes a cavity and a Worthington jet rather than a crown on a film, and the
+ * threshold flattens. Clamping delta here keeps the correlation inside the range
+ * it was fitted over rather than having it quietly assert that a jet plunging
+ * into the sump cannot throw anything back.
+ */
+export const WET_SPLASH_K_FILM_MAX_DELTA = 1.0;
+
+/**
  * Critical impingement angle, radians (30 degrees).
  *
  * Thurairajah, Wilson et al., "Splash-free urinals for global

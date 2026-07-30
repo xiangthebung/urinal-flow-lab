@@ -1,4 +1,4 @@
-import { GRAVITY } from '../core/constants';
+import { CRITICAL_IMPINGEMENT_ANGLE, GRAVITY } from '../core/constants';
 import {
   FluidProperties,
   URINE_37C,
@@ -6,7 +6,7 @@ import {
   WallMaterial,
 } from '../core/fluid';
 import { Rng } from '../core/rng';
-import { Vec3, v3 } from '../core/vec3';
+import { Vec3, clamp, v3 } from '../core/vec3';
 import { MeshCollider } from '../geometry/collider';
 import { ShellMesh, ShellParams, buildShell } from '../geometry/shell';
 import { SurfaceParams, UrinalSurface, defaultSurfaceParams } from '../geometry/surface';
@@ -15,6 +15,7 @@ import { FilmParams, FilmSolver, defaultFilmParams } from './film';
 import { ImpactModelParams, ImpactResolver, defaultImpactParams } from './impact';
 import {
   DrainageReport,
+  FlowPhase,
   ImpingementReport,
   Metrics,
   ScoreBreakdown,
@@ -74,10 +75,18 @@ export interface SimConfig {
   /** How long to keep simulating after flow stops, s. */
   drainTime: number;
   /**
-   * If set, aim at this profile fraction on the centreline instead of using the
-   * raw elevation and azimuth. 0 is the top of the back wall, 0.5 the sump.
+   * If set, aim at this profile fraction instead of using the raw elevation and
+   * azimuth. 0 is the top of the back wall, 0.5 the sump.
    */
   aimTargetV: number | null;
+  /**
+   * Where across the width to aim, -1 to 1. 0 is the centreline.
+   *
+   * Separate from `aimTargetV` and not nullable, because there is always a
+   * sensible answer for it and defaulting to the centreline reproduces the old
+   * behaviour exactly.
+   */
+  aimTargetU: number;
   /** Seed, so a comparison between two designs is a controlled experiment. */
   seed: number;
   /** Particle buffer size. */
@@ -105,9 +114,26 @@ export function defaultConfig(): SimConfig {
     // between aiming at v=0.14 and v=0.36 on the same fixture. Aim is the single
     // most sensitive input in the whole model.
     aimTargetV: 0.18,
+    aimTargetU: 0,
     seed: 12345,
     particleCapacity: 200000,
   };
+}
+
+/** Result of flying the current aim at the fixture. */
+export interface AimTrace {
+  /** The traced path, ending at the contact point. For drawing. */
+  points: Vec3[];
+  /** Where it first met the fixture, or null if it met nothing. */
+  point: Vec3 | null;
+  /** Interior cell struck, or -1 if it did not reach the interior. */
+  cell: number;
+  /** Impingement angle at that cell, radians. 0 when no interior cell. */
+  angle: number;
+  /** True if the solid casting stopped it before it reached the wetted interior. */
+  blocked: boolean;
+  /** True if it reached the wetted interior. */
+  reached: boolean;
 }
 
 export interface RunReport {
@@ -129,7 +155,14 @@ export class Simulation {
   surface!: UrinalSurface;
   /** Exterior casting. Rendered, and collided against. */
   casting!: ShellMesh;
-  private castingCollider!: MeshCollider;
+  /**
+   * Public because anything that asks "where does the stream go" has to consult
+   * it. The aim trajectory drawn in the viewport used to raycast the interior
+   * alone, so it was drawn straight through the solid casting and the aim marker
+   * showed liquid reaching the sump when the real stream was being stopped dead
+   * by the front rim.
+   */
+  castingCollider!: MeshCollider;
   film!: FilmSolver;
   particles!: ParticleSystem;
   emitter!: StreamEmitter;
@@ -275,10 +308,20 @@ export class Simulation {
    * sump of a deep one, and the sump is a much steeper target.
    */
   aimAtProfileFraction(v: number): boolean {
-    const nv = this.surface.nv;
-    const nu = this.surface.nu;
-    const j = Math.min(nv - 1, Math.max(0, Math.round(v * (nv - 1))));
-    const cell = j * nu + Math.floor(nu / 2);
+    return this.aimAtSurfaceUv(this.config.aimTargetU, v);
+  }
+
+  /**
+   * Point the stream at a parametric point on the wetted surface.
+   *
+   * Two coordinates rather than one because aim is genuinely two-dimensional and
+   * pretending otherwise removed the more interesting half of it. `v` walks down
+   * the sagittal profile and `u` across the width, so an off-centre aim -- which
+   * is what most people actually do, and which decides whether splash leaves past
+   * the side of the fixture rather than into it -- can be set and measured.
+   */
+  aimAtSurfaceUv(u: number, v: number): boolean {
+    const cell = this.surface.cellFromUv(clamp(u, -1, 1), clamp(v, 0, 1));
     const target = this.surface.getCellPos(cell, v3());
     const ok = this.emitter.aimAt(target, GRAVITY);
     if (ok) {
@@ -289,6 +332,77 @@ export class Simulation {
     return ok;
   }
 
+  /**
+   * Fly the current aim ballistically and report the first thing it actually
+   * hits -- casting included.
+   *
+   * One method, used by the viewport trajectory, the aim marker and the aim
+   * sweep, because all three previously traced against the interior loft alone.
+   * The casting is 10-15 mm thicker than the interior all round and its rim
+   * stands proud of it, so an aim that clears the interior lip by millimetres is
+   * stopped dead by the ceramic. Tracing only the interior drew a confident
+   * dashed line to a point the liquid could never reach, and on a deep fixture
+   * that is not a cosmetic error: the stream really does clip the rim, and the
+   * whole void is then thrown off the front of the fixture.
+   *
+   * `points` is returned so the caller can draw exactly the path that was
+   * tested, rather than recomputing it and risking a different answer.
+   */
+  traceAim(t?: number, maxSteps = 260, dt = 0.004): AimTrace {
+    const tSample =
+      t ?? this.emitter.flow.peakFraction * this.emitter.flow.duration;
+    const speed = this.emitter.speedAt(tSample);
+    const points: Vec3[] = [];
+    const o = this.emitter.position;
+    points.push(v3(o.x, o.y, o.z));
+    if (speed <= 1e-4) {
+      return { points, point: null, cell: -1, angle: 0, blocked: false, reached: false };
+    }
+    const dir = this.emitter.aimDirection();
+    let prev = v3(o.x, o.y, o.z);
+
+    for (let i = 1; i <= maxSteps; i++) {
+      const tt = i * dt;
+      const p = v3(
+        o.x + dir.x * speed * tt,
+        o.y + dir.y * speed * tt - 0.5 * GRAVITY * tt * tt,
+        o.z + dir.z * speed * tt
+      );
+      const seg = v3(p.x - prev.x, p.y - prev.y, p.z - prev.z);
+
+      const inner = this.surface.raycast(prev, seg, 1);
+      // Only as far as the interior hit, so the nearer of the two wins. This is
+      // the same ordering the particle sweep uses, which is what makes the drawn
+      // trajectory agree with where liquid actually goes.
+      const solid = this.castingCollider.raycastSolid(prev, seg, inner ? inner.t : 1);
+
+      if (solid && (!inner || solid.t < inner.t)) {
+        const hp = v3(
+          prev.x + seg.x * solid.t,
+          prev.y + seg.y * solid.t,
+          prev.z + seg.z * solid.t
+        );
+        points.push(hp);
+        return { points, point: hp, cell: -1, angle: 0, blocked: true, reached: false };
+      }
+      if (inner) {
+        points.push(v3(inner.point.x, inner.point.y, inner.point.z));
+        return {
+          points,
+          point: v3(inner.point.x, inner.point.y, inner.point.z),
+          cell: inner.cell,
+          angle: this.surface.impingementAngle(inner.cell, seg),
+          blocked: false,
+          reached: true,
+        };
+      }
+      points.push(p);
+      prev = p;
+      if (p.y < this.surface.floorY) break;
+    }
+    return { points, point: null, cell: -1, angle: 0, blocked: false, reached: false };
+  }
+
   /** Recompute the design-time impingement map for the current aim. */
   refreshImpingement(): void {
     const peakT = this.emitter.flow.peakFraction * this.emitter.flow.duration;
@@ -297,7 +411,9 @@ export class Simulation {
       this.surface,
       this.emitter.position,
       speed,
-      GRAVITY
+      GRAVITY,
+      CRITICAL_IMPINGEMENT_ANGLE,
+      this.castingCollider
     );
   }
 
@@ -328,11 +444,17 @@ export class Simulation {
     if (this.phase === SimPhase.Idle) this.phase = SimPhase.Voiding;
     if (this.phase === SimPhase.Finished) return;
 
-    // 1. Emit.
+    // 1. Emit. The phase is set first so that everything recorded this step --
+    //    emitted volume and anything landing -- is attributed to the stream
+    //    strength actually in force.
+    const rateNow = this.emitter.flow.rateAt(this.time);
+    this.metrics.currentPhase =
+      rateNow >= 0.5 * this.emitter.flow.peakFlowRate ? FlowPhase.Sustained : FlowPhase.Weak;
     if (this.phase === SimPhase.Voiding) {
       this.emitter.step(this.time, dt, (p) => {
         this.particles.spawnFromEmitter(p);
         this.metrics.emittedVolume += p.volume;
+        this.metrics.perPhase[this.metrics.currentPhase].emitted += p.volume;
       });
       if (this.time >= this.emitter.flow.duration) {
         this.phase = SimPhase.Draining;
@@ -358,7 +480,7 @@ export class Simulation {
       this.impact.resolve(ev, this.surface, this.particles, this.film);
       const splashed = this.impact.totals.splashedVolume - before;
       const ang = this.impact.last ? this.impact.last.impingementAngle : 0;
-      this.metrics.recordImpact(ev.hit.cell, ev.volume, ang, splashed);
+      this.metrics.recordImpact(ev.hit.cell, ev.volume, ang, splashed, ev.generation);
     }
 
     // 4. Record what landed on the floor, the user, or the outside of the

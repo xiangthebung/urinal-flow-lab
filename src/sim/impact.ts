@@ -3,6 +3,7 @@ import {
   WET_SPLASH_K_BASE,
   WET_SPLASH_K_FILM,
   WET_SPLASH_K_FILM_EXP,
+  WET_SPLASH_K_FILM_MAX_DELTA,
 } from '../core/constants';
 import { FluidProperties, ohnesorge, reynolds, weber } from '../core/fluid';
 import { WallMaterial } from '../core/fluid';
@@ -86,6 +87,27 @@ export interface ImpactModelParams {
   enableRebound: boolean;
   /** Cap on secondary droplets per event, to bound cost. */
   maxSecondaries: number;
+  /**
+   * Fraction of the arriving normal velocity that becomes outward sheet speed.
+   *
+   * Inviscid Bernoulli gives 1.0 for a stagnation-point wall jet, since the
+   * pressure returns to ambient just outside the stagnation region. Held slightly
+   * below that for the boundary layer the sheet grows against the wall, which is
+   * the one loss the shallow-water solver cannot represent at the moment of
+   * impact.
+   */
+  wallJetEfficiency: number;
+  /**
+   * Radius of the deposition footprint for a coherent jet, in jet diameters.
+   *
+   * A jet does not wet a patch its own width. The attached lamella spreads out to
+   * where it can no longer outrun gravity and surface tension, which for a
+   * millimetric jet at a few metres per second is a couple of centimetres. Putting
+   * the whole arrival into one cell instead makes a spike that the advection scheme
+   * has to smear away, and a smeared spike is exactly the soft soaked-in edge that
+   * a glazed surface never shows.
+   */
+  jetFootprintRatio: number;
 }
 
 export function defaultImpactParams(): ImpactModelParams {
@@ -99,6 +121,8 @@ export function defaultImpactParams(): ImpactModelParams {
     secondarySizeSpread: 1.35,
     enableRebound: true,
     maxSecondaries: 10,
+    wallJetEfficiency: 0.85,
+    jetFootprintRatio: 4.0,
   };
 }
 
@@ -109,6 +133,18 @@ export interface FilmSink {
    * own (u, v) tangent frame.
    */
   deposit(cell: number, volume: number, velU: number, velV: number): void;
+  /**
+   * Add liquid as a stagnation-point wall jet: spread over a footprint, carrying
+   * radially outward momentum as well as the incoming tangential momentum.
+   */
+  depositJet(
+    cell: number,
+    volume: number,
+    velU: number,
+    velV: number,
+    spreadSpeed: number,
+    footprintRadius: number
+  ): void;
   /** Current film thickness at a cell, m. */
   thicknessAt(cell: number): number;
 }
@@ -300,10 +336,21 @@ export class ImpactResolver {
     const dryRatio = dryK / Math.max(1e-9, dryCrit);
 
     // Wetted branch.
+    //
+    // Cossali's correlation was fitted for films thinner than about one droplet
+    // diameter, and its threshold rises without bound in delta. Extrapolated into
+    // the sump it says a deep pool is progressively harder to splash and
+    // eventually impossible -- at delta = 2 the critical K is already 18000 -- which
+    // is the opposite of what a plunging jet does. Beyond delta ~ 1 the mechanism
+    // is no longer crown formation on a thin film but cavity collapse and a
+    // Worthington jet, and the threshold stops climbing. Holding delta at the edge
+    // of the fitted range keeps the correlation inside its evidence instead of
+    // silently promising that standing liquid cannot splash.
+    const deltaFit = Math.min(Math.max(0, delta), WET_SPLASH_K_FILM_MAX_DELTA);
     const wetK = weN * Math.pow(Math.max(1e-12, oh), -0.4);
     const wetCrit =
       WET_SPLASH_K_BASE +
-      WET_SPLASH_K_FILM * Math.pow(Math.max(0, delta), WET_SPLASH_K_FILM_EXP);
+      WET_SPLASH_K_FILM * Math.pow(deltaFit, WET_SPLASH_K_FILM_EXP);
     const wetRatio = wetK / Math.max(1e-9, wetCrit);
 
     // Blend: fully dry below delta = 0.005, fully wetted above 0.05.
@@ -426,7 +473,20 @@ export class ImpactResolver {
     const o = cell * 3;
     const velU = (vtX * tu[o] + vtY * tu[o + 1] + vtZ * tu[o + 2]) * kt;
     const velV = (vtX * tv[o] + vtY * tv[o + 1] + vtZ * tv[o + 2]) * kt;
-    if (depositVolume > 0) film.deposit(cell, depositVolume, velU, velV);
+    if (depositVolume > 0) {
+      // The normal component does not vanish on contact -- it is turned into a
+      // radially spreading sheet. Outside the stagnation region the pressure has
+      // relaxed to ambient, so inviscid Bernoulli puts the sheet at essentially
+      // the arriving normal speed. Feeding that in is what produces the attached
+      // lamella and the thick parabolic rim around a jet impact; discarding it,
+      // as this did, left the liquid to seep outward under hydrostatic pressure
+      // alone and the wall read as absorbent rather than glazed.
+      const spread = vNormal * this.params.wallJetEfficiency;
+      // A jet spreads over far more than its own width; a single droplet barely
+      // more than its own. Scaled by the coherence of what arrived.
+      const footprint = d * (ev.coherent ? this.params.jetFootprintRatio : 0.75);
+      film.depositJet(cell, depositVolume, velU, velV, spread, footprint);
+    }
     this.totals.depositedVolume += depositVolume;
 
     // -- Secondaries --------------------------------------------------------
