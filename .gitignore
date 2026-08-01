@@ -7,3 +7,14 @@ dist/
 # Offline render output from tools/shoot.mts and tools/preview.mts
 tools/shots/
 tools/out.png
+
+# Everything written for an assistant rather than for the project: the running
+# notes in ai/NOTES.md, the standing instructions in ai/README.md, and whatever
+# throwaway probes a session leaves behind. None of it is reviewed, none of it
+# should be, and it carries absolute paths and dates from whichever machine it was
+# written on.
+#
+# Durable knowledge about the simulation does NOT go here. It goes in
+# .kiro/steering/project-knowledge.md, which is tracked, or in a comment beside the
+# code.
+ai/
