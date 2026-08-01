@@ -87,3 +87,41 @@ export class MeshCollider implements SolidCollider {
     return { t: hit.t, normal: this.scratch };
   }
 }
+
+/**
+ * Several colliders tested as one, nearest hit winning.
+ *
+ * Exists so the metalwork is as solid as the ceramic. The particle sweep takes a
+ * single exterior collider, and the alternative -- merging the casting and the
+ * fittings into one mesh before building a BVH -- would rebuild the whole
+ * acceleration structure whenever either changed and would lose the ability to
+ * ask which of the two was struck.
+ *
+ * The normal is copied into this object's own scratch rather than passed through.
+ * `MeshCollider` returns a reference to its own reusable vector, so holding the
+ * winner's normal while testing the next part would hand back whatever the last
+ * part happened to write.
+ */
+export class CompositeCollider implements SolidCollider {
+  private readonly parts: SolidCollider[];
+  private readonly scratch = v3();
+
+  constructor(parts: Array<SolidCollider | null | undefined>) {
+    this.parts = parts.filter((p): p is SolidCollider => !!p);
+  }
+
+  raycastSolid(origin: Vec3, dir: Vec3, maxT: number): SolidHit | null {
+    let bestT = maxT;
+    let found = false;
+    for (const part of this.parts) {
+      const hit = part.raycastSolid(origin, dir, bestT);
+      if (!hit || hit.t > bestT) continue;
+      bestT = hit.t;
+      this.scratch.x = hit.normal.x;
+      this.scratch.y = hit.normal.y;
+      this.scratch.z = hit.normal.z;
+      found = true;
+    }
+    return found ? { t: bestT, normal: this.scratch } : null;
+  }
+}

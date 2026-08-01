@@ -929,6 +929,149 @@ function endToEndTests(): TestResult[] {
       })
     );
   }
+  // ---- Peeing on the fixture rather than into it -------------------------
+  // The outside of a urinal is hard glazed ceramic and chrome, standing closer to
+  // the user than any of the wetted interior, so hitting it has to be markedly
+  // worse than hitting the bowl. Guarded because every part of this was once
+  // silently wrong: the casting absorbed liquid without splashing, the metalwork
+  // did not exist, and droplets thrown clear of the room vanished unaccounted.
+  {
+    const base = () => {
+      const c = defaultConfig();
+      const p = getPreset('classic-bowl');
+      c.surface = { ...p.params };
+      c.casting = { ...(p.shell ?? {}) };
+      c.fittings = { ...(p.fittings ?? {}) };
+      c.stream.voidVolume = 150e-6;
+      c.drainTime = 1;
+      c.resolutionU = 48;
+      c.resolutionV = 96;
+      c.particleCapacity = 140000;
+      c.seed = 4242;
+      return c;
+    };
+
+    // Aimed properly into the bowl, at the fixture's own default aim.
+    const cIn = base();
+    cIn.aimTargetV = getPreset('classic-bowl').defaultAimV ?? 0.18;
+    const inBowl = new Simulation(cIn);
+    const inTrace = inBowl.traceAim();
+    const inRep = inBowl.run();
+
+    // Aimed at the fixture. The elevation is found from the geometry rather than
+    // hardcoded, and that matters: this check previously pinned -30 deg for "in the
+    // bowl" and 0 deg for "on the fixture", which meant what it said on a 526 mm
+    // body but not on the 640 mm one with a 375 mm front rise -- -30 deg then clips
+    // the front rim on the way in, so both cases became partly rim strikes and the
+    // ratio collapsed from 7.2x to 1.5x with no change to the physics at all. A test
+    // that encodes a dimension it does not own will break every time the geometry
+    // moves, and will look like a physics regression when it does.
+    // Found by walking the aim target down the profile, not by scanning elevation in
+    // degrees. Both were tried and only one of them is a property of the fixture.
+    //
+    // Scanning elevation and taking the highest blocked angle worked while the
+    // casting had a 50 mm collar standing proud of it at the lip height, because that
+    // collar caught a level stream. It was an artefact of the pedestal stopping at one
+    // height all the way round, and removing it removed the thing the scan was
+    // hitting: on the corrected casting there is no elevation between +20 and -20 deg
+    // that lands on the ceramic at all. Above -14 deg the stream strikes the
+    // flushometer standing over the rim -- a 32 mm tube, which most of the flow goes
+    // past, so it reads 3x rather than the 30x+ a strike on the broad front gives --
+    // and below it the stream simply enters the bowl. To reach the front face of the
+    // pedestal from the emitter needs about -70 deg, which nobody stands like.
+    //
+    // `aimTargetV` is a fraction of the profile, so it means the same thing on a
+    // 340 mm trough and a 950 mm stall, and the elevation is then solved
+    // ballistically -- which is also how the application aims. Walking it forward
+    // finds the first target the casting itself gets in the way of, which is the front
+    // rim, which is the case being claimed.
+    const cOn = base();
+    const castingTop = new Simulation(cOn).casting.max.y;
+    let onV = Number.NaN;
+    for (let v = 0.45; v <= 0.86; v += 0.05) {
+      const probe = base();
+      probe.aimTargetV = v;
+      const tr = new Simulation(probe).traceAim();
+      if (tr.blocked && tr.point !== null && tr.point.y <= castingTop) {
+        onV = v;
+        break;
+      }
+    }
+    cOn.aimTargetV = onV;
+    const onFixture = new Simulation(cOn);
+    const onTrace = onFixture.traceAim();
+    const onRep = onFixture.run();
+
+    const ratio =
+      onRep.splash.userMicrolitresPerLitre /
+      Math.max(1, inRep.splash.userMicrolitresPerLitre);
+
+    out.push(
+      check({
+        name: 'Peeing on the fixture is far worse than peeing into it',
+        group: 'End to end',
+        expected: 'at least 3× more on the user when the stream is aimed at the casing',
+        actual:
+          `into the bowl at v=${cIn.aimTargetV} ` +
+          `(${radToDeg(inTrace.angle).toFixed(0)}° on the interior) ` +
+          `${inRep.splash.userMicrolitresPerLitre.toFixed(0)} µL/L vs ` +
+          `on the casting at v=${onV.toFixed(2)}, ` +
+          `${onTrace.point ? (onTrace.point.y * 1000).toFixed(0) : '?'} mm above the datum ` +
+          `(${onTrace.blocked ? 'blocked by solid' : 'NOT BLOCKED'}) ` +
+          `${onRep.splash.userMicrolitresPerLitre.toFixed(0)} µL/L (${ratio.toFixed(1)}×)`,
+        errValue: Number.isFinite(onV) && onTrace.blocked && ratio >= 3 ? 0 : 1,
+        tolValue: 0.5,
+        reference:
+          'The casting and the metalwork are solid and splash by the same threshold as ' +
+          'the interior; neither has a film, so both use the dry branch',
+        notes:
+          'How far onto the fixture matters: on the oval bowl a stream that merely grazes ' +
+          'the rim at -8° reads 1.3× the in-bowl figure, while -2°, +4°, +10° and +16° ' +
+          'read 1.9×, 2.6×, 3.6× and 4.9×. The scan takes the highest elevation blocked ' +
+          'by the CASTING, which is unambiguously on the fixture rather than marginally ' +
+          'over its lip and is not satisfied by clipping the flush valve above it',
+      })
+    );
+    out.push(
+      check({
+        name: 'The metalwork is solid, not scenery',
+        group: 'End to end',
+        expected: 'a level stream strikes the flush valve above the casting',
+        actual: (() => {
+          const f = onFixture.fittings;
+          return (
+            `${f.indices.length / 3} triangles reaching y=${(f.max.y * 1000).toFixed(0)} mm; ` +
+            `aim ray ${onTrace.blocked ? 'blocked by solid' : 'not blocked'}, ` +
+            `${onFixture.impact.totals.exteriorEvents} exterior impacts`
+          );
+        })(),
+        errValue:
+          !onFixture.fittings.empty &&
+          onTrace.blocked &&
+          onFixture.impact.totals.exteriorEvents > 100
+            ? 0
+            : 1,
+        tolValue: 0.5,
+        reference:
+          'Geometry that can be seen but not hit deletes liquid, which is how the ' +
+          'casting came to be a perfect absorber',
+      })
+    );
+    out.push(
+      check({
+        name: 'Volume closes when splash is thrown clear of the room',
+        group: 'End to end',
+        expected: 'every drop accounted for with the stream aimed at the metalwork',
+        actual: `${(100 * onRep.volumeClosureError).toFixed(4)}% unaccounted`,
+        errValue: onRep.volumeClosureError,
+        tolValue: 1e-4,
+        reference: 'Conservation of mass, including liquid leaving the region of interest',
+        notes:
+          'escapedVolume was declared, reset and reported but never incremented, and was ' +
+          'missing from the closure sum; this case drifted to 0.0718% before the fix',
+      })
+    );
+  }
   return out;
 }
 

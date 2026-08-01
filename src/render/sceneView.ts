@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
+import { FittingsMesh } from '../geometry/fittings';
 import { CaptureScene } from '../sim/capture';
 import { Heatmap } from '../sim/metrics';
 import { AimTrace } from '../sim/simulation';
@@ -82,6 +84,21 @@ export class SceneView {
     fill.position.set(-1.4, 0.9, 1.4);
     this.scene.add(fill);
 
+    // An environment, because the metalwork is a metal.
+    //
+    // A physically based metal has no diffuse response at all -- everything you see
+    // on chrome is reflected surroundings -- so with directional lights and no
+    // environment the flushometer rendered as a black silhouette standing over a
+    // white fixture. It looked like a hole in the scene. Lowering its metalness
+    // would have fixed the symptom by making it not be metal; supplying something
+    // for it to reflect fixes the cause, and the glaze picks up a specular sheen
+    // from the same source, which is what glaze does.
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    const env = pmrem.fromScene(new RoomEnvironment(), 0.04);
+    this.scene.environment = env.texture;
+    this.scene.environmentIntensity = 0.55;
+    pmrem.dispose();
+
     this.scene.add(this.roomGroup);
     this.scene.add(this.userGroup);
     this.scene.add(this.zoneGroup);
@@ -110,10 +127,16 @@ export class SceneView {
    * droplets came to pass straight through it. It is solid, the simulation owns it,
    * and the view draws the same one the solver collides against.
    */
-  setGeometry(surface: UrinalSurface, casting: ShellMesh | null, capture: CaptureScene): void {
+  setGeometry(
+    surface: UrinalSurface,
+    casting: ShellMesh | null,
+    capture: CaptureScene,
+    fittings: FittingsMesh | null = null
+  ): void {
     this.fixture.setSurface(surface);
     this.shell = casting;
     this.fixture.setShell(casting);
+    this.fixture.setFittings(fittings);
     this.buildRoom(surface, capture);
     this.buildUser(surface, capture);
     this.buildZones(surface, capture);

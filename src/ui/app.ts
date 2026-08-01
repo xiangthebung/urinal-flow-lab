@@ -92,8 +92,11 @@ export class App {
 
   constructor() {
     const cfg = defaultConfig();
-    cfg.surface = { ...getPreset(this.presetId).params };
-    cfg.casting = { ...(getPreset(this.presetId).shell ?? {}) };
+    const p0 = getPreset(this.presetId);
+    cfg.surface = { ...p0.params };
+    cfg.casting = { ...(p0.shell ?? {}) };
+    cfg.fittings = { ...(p0.fittings ?? {}) };
+    if (p0.defaultAimV !== undefined) cfg.aimTargetV = p0.defaultAimV;
     // Interactive resolution is lower than the analysis resolution. Playback at
     // anything near real time needs a thousand physics steps a second, and the
     // film solver cost scales with the cell count; the full-resolution grid is
@@ -105,7 +108,12 @@ export class App {
 
     const canvas = document.getElementById('gl') as HTMLCanvasElement;
     this.view = new SceneView(canvas, cfg.particleCapacity);
-    this.view.setGeometry(this.sim.surface, this.sim.casting, this.sim.capture);
+    this.view.setGeometry(
+      this.sim.surface,
+      this.sim.casting,
+      this.sim.capture,
+      this.sim.fittings
+    );
     this.view.applyCameraPreset(CameraPreset.ThreeQuarter, this.sim.surface, this.sim.capture);
 
     this.legendEl = document.getElementById('legend')!;
@@ -118,6 +126,9 @@ export class App {
     this.buildRightPanel();
     this.buildTransport();
     this.buildAimPicking();
+    this.buildViewportBar();
+    this.buildHelp();
+    this.buildKeyboard();
 
     window.addEventListener('resize', () => this.resize());
     this.resize();
@@ -144,7 +155,12 @@ export class App {
     switch (effect) {
       case 'rebuild':
         this.sim.rebuild();
-        this.view.setGeometry(this.sim.surface, this.sim.casting, this.sim.capture);
+        this.view.setGeometry(
+      this.sim.surface,
+      this.sim.casting,
+      this.sim.capture,
+      this.sim.fittings
+    );
         this.sim.restart();
         this.report = null;
         this.refreshGeometryDependent();
@@ -243,43 +259,71 @@ export class App {
   private buildAimPicking(): void {
     const canvas = document.getElementById('gl') as HTMLCanvasElement;
 
-    const armed = (e: MouseEvent): boolean => this.aimMode || e.shiftKey;
+    // Click to aim, drag to orbit, told apart by whether the pointer moved.
+    //
+    // This replaced a mode: you had to arm "Aim by clicking", click the bowl, then
+    // remember to disarm it or it kept swallowing the orbit gesture. Aim is the most
+    // used control in the tool and it was three actions behind a latch. A plain
+    // click cannot be confused with an orbit as long as the two are separated by
+    // movement rather than by a mode, which is what every 3-D tool does.
+    //
+    // The threshold is in pixels and generous, because a click on a trackpad drifts
+    // a pixel or two and nobody means to orbit by 3 px.
+    const DRAG_PX = 5;
+    let downX = 0;
+    let downY = 0;
+    let moved = false;
+    let painting = false;
+
     const setCursor = () => {
-      canvas.style.cursor = this.aimMode ? 'crosshair' : '';
+      canvas.style.cursor = this.aimMode || this.shiftHeld ? 'crosshair' : '';
+      // Orbit stays live unless we are actively painting aim, so a drag always
+      // orbits and never has to be "given back".
       this.view.controls.enabled = !this.aimMode;
     };
     this.refreshAimCursor = setCursor;
 
-    let dragging = false;
     canvas.addEventListener('pointerdown', (e) => {
-      if (!armed(e) || e.button !== 0) return;
-      dragging = true;
-      this.view.controls.enabled = false;
-      this.pickAimAt(e.clientX, e.clientY);
-      e.preventDefault();
+      if (e.button !== 0) return;
+      downX = e.clientX;
+      downY = e.clientY;
+      moved = false;
+      // Sticky mode or Shift: paint aim continuously and suspend orbit for the
+      // duration of this gesture only.
+      if (this.aimMode || e.shiftKey) {
+        painting = true;
+        this.view.controls.enabled = false;
+        this.pickAimAt(e.clientX, e.clientY);
+        e.preventDefault();
+      }
     });
+
     canvas.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
-      this.pickAimAt(e.clientX, e.clientY);
+      if (Math.abs(e.clientX - downX) > DRAG_PX || Math.abs(e.clientY - downY) > DRAG_PX) {
+        moved = true;
+      }
+      if (painting) this.pickAimAt(e.clientX, e.clientY);
     });
-    const end = () => {
-      if (!dragging) return;
-      dragging = false;
-      this.view.controls.enabled = !this.aimMode;
+
+    const end = (e: PointerEvent) => {
+      if (painting) {
+        painting = false;
+        this.view.controls.enabled = !this.aimMode;
+        return;
+      }
+      // A click that did not turn into a drag is an aim.
+      if (e.button === 0 && !moved) this.pickAimAt(e.clientX, e.clientY);
     };
     canvas.addEventListener('pointerup', end);
-    canvas.addEventListener('pointerleave', end);
-    // Shift held with no aim mode should still show the crosshair, so the
-    // shortcut is discoverable rather than secret.
-    window.addEventListener('keydown', (e) => {
-      if (e.key === 'Shift' && !this.aimMode) canvas.style.cursor = 'crosshair';
-    });
-    window.addEventListener('keyup', (e) => {
-      if (e.key === 'Shift' && !this.aimMode) canvas.style.cursor = '';
+    canvas.addEventListener('pointercancel', () => {
+      painting = false;
+      this.view.controls.enabled = !this.aimMode;
     });
   }
 
+  /** Sticky aim mode. Optional now that a plain click aims. */
   private aimMode = false;
+  private shiftHeld = false;
   private refreshAimCursor: () => void = () => {};
 
   private refreshGeometryDependent(): void {
@@ -289,7 +333,55 @@ export class App {
     this.applyViewToggles();
     this.updateLegend();
     this.updateGeometryNotes();
+    this.scheduleAimSweep();
+  }
+
+  /**
+   * The aim sweep, deferred.
+   *
+   * It solves and ballistically traces thirteen aim points, and it was being run
+   * synchronously on every `apply('aim')` -- which is every tick of the aim sliders
+   * and every mouse-move while painting aim. That is the lag: the sweep costs far
+   * more than the frame it is holding up, and its result is a reference table nobody
+   * reads mid-drag. Coalescing to the end of the gesture keeps aiming responsive
+   * while the table still lands promptly once the pointer settles.
+   */
+  private aimSweepTimer = 0;
+
+  private scheduleAimSweep(): void {
+    if (this.aimSweepTimer) window.clearTimeout(this.aimSweepTimer);
+    this.aimSweepTimer = window.setTimeout(() => {
+      this.aimSweepTimer = 0;
+      this.runAimSweep();
+    }, 130);
+  }
+
+  /**
+   * Run any pending sweep now.
+   *
+   * Called from `refreshViews`, which is the path the screenshot harness and every
+   * scripted check drive, so automation never photographs a half-updated panel.
+   */
+  private flushAimSweep(): void {
+    if (!this.aimSweepTimer) return;
+    window.clearTimeout(this.aimSweepTimer);
+    this.aimSweepTimer = 0;
     this.runAimSweep();
+  }
+
+  /**
+   * Open a collapsed panel section.
+   *
+   * The report lives in a section that starts collapsed, so finishing an analysis
+   * left the one document a user actually wanted to read folded away at the bottom
+   * of the panel with no indication it had arrived.
+   */
+  private expandSection(inner: HTMLElement): void {
+    const wrap = inner.closest('.section');
+    if (!wrap) return;
+    wrap.classList.remove('collapsed');
+    const caret = wrap.querySelector('.caret');
+    if (caret) caret.textContent = '▾';
   }
 
   private applyViewToggles(): void {
@@ -401,8 +493,15 @@ export class App {
   selectPreset(id: string): void {
     if (id === this.presetId) return;
     this.presetId = id;
-    this.sim.config.surface = { ...getPreset(id).params };
-    this.sim.config.casting = { ...(getPreset(id).shell ?? {}) };
+    const p = getPreset(id);
+    // Copied, never aliased: presets are shared objects and the config is mutated
+    // by the controls.
+    this.sim.config.surface = { ...p.params };
+    this.sim.config.casting = { ...(p.shell ?? {}) };
+    this.sim.config.fittings = { ...(p.fittings ?? {}) };
+    // Aim belongs to the model. A profile fraction that lands mid-wall on a bowl
+    // lands in the throat of a stall, so each fixture carries its own default.
+    if (p.defaultAimV !== undefined) this.sim.config.aimTargetV = p.defaultAimV;
     this.paintTopbarModel();
     this.paintModelCards();
     this.apply('rebuild');
@@ -432,8 +531,13 @@ export class App {
     const grid = document.createElement('div');
     grid.className = 'model-grid';
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const CW = 128;
-    const CH = 96;
+    // Portrait, because the fixtures are. Every one of these is taller than it is
+    // wide -- a stall urinal is 2.7 times taller -- so a landscape card spends most
+    // of its area on empty background either side and shrinks the object to fit the
+    // short axis. The thumbnail is framed to the card, so the card's shape sets how
+    // big the fixture can be drawn.
+    const CW = 126;
+    const CH = 126;
 
     for (const p of PRESETS) {
       const card = document.createElement('button');
@@ -493,7 +597,12 @@ export class App {
       const card = this.modelCards[next++];
       const preset = getPreset(card.id);
       try {
-        const res = drawFixtureThumbnail(card.canvas, preset.params, preset.shell);
+        const res = drawFixtureThumbnail(
+          card.canvas,
+          preset.params,
+          preset.shell,
+          preset.fittings
+        );
         card.dims.textContent = res
           ? `${res.dims.w} × ${res.dims.d} × ${res.dims.h} mm`
           : '';
@@ -563,16 +672,23 @@ export class App {
     // splashback from 335 to over 16000 µL/L. Nothing else in the tool has that
     // authority, and nothing else was as hard to picture.
     const aim = this.left.section('Aim', {
-      hint: 'Click the bowl to aim. Hold Shift to aim without leaving the orbit tool.',
+      hint:
+        'Click the bowl to aim. Drag to orbit. Shift-drag paints aim, Shift plus the ' +
+        'arrow keys nudges it.',
     });
     const aimRow = aim.buttonRow();
-    this.aimBtn = aimRow.button('Aim by clicking', () => {
+    // Sticky mode is now a convenience rather than the way in: a plain click on the
+    // fixture aims, because a mode you have to arm and then remember to disarm is
+    // the wrong shape for the most-used control in the tool.
+    this.aimBtn = aimRow.button('Lock aim mode (A)', () => {
       this.aimMode = !this.aimMode;
       this.refreshAimCursor();
       this.paintAimButton();
-    }, 'primary');
+    });
     this.paintAimButton = () => {
-      this.aimBtn.textContent = this.aimMode ? '✓ Aiming — click the bowl' : 'Aim by clicking';
+      this.aimBtn.textContent = this.aimMode
+        ? '✓ Aim locked — click or drag'
+        : 'Lock aim mode (A)';
       this.aimBtn.classList.toggle('active', this.aimMode);
     };
     this.paintAimButton();
@@ -1248,6 +1364,9 @@ export class App {
     speedSel.value = '1';
     speedSel.addEventListener('change', () => (this.speed = Number(speedSel.value)));
     this.transport.raw(speedSel);
+    // Held so the [ and ] shortcuts can keep the visible value in step with the
+    // actual playback rate.
+    this.speedSel = speedSel;
 
     this.phasePill = document.createElement('span');
     this.phasePill.className = 'phase-pill';
@@ -1269,6 +1388,263 @@ export class App {
   }
 
   private timeLabel!: HTMLElement;
+  private speedSel: HTMLSelectElement | null = null;
+
+  /**
+   * Keyboard control.
+   *
+   * There was none at all, which for a tool whose main verb is "watch this run"
+   * meant the play button was a mouse trip to the bottom of the window every time.
+   * Space is the shortcut anyone would try first.
+   *
+   * Two details keep it from being a nuisance. Keys are ignored while focus is in a
+   * text field, a select or a slider, so the arrow keys still nudge whichever
+   * control the user is actually holding. And Space is swallowed rather than allowed
+   * to fall through, because the browser's default is to scroll the panel and to
+   * re-trigger whatever button was last clicked.
+   */
+  private buildKeyboard(): void {
+    const typing = (t: EventTarget | null): boolean => {
+      const el = t as HTMLElement | null;
+      if (!el || !el.tagName) return false;
+      const tag = el.tagName.toLowerCase();
+      return (
+        tag === 'input' ||
+        tag === 'select' ||
+        tag === 'textarea' ||
+        el.isContentEditable === true
+      );
+    };
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Shift') {
+        this.shiftHeld = true;
+        this.refreshAimCursor();
+      }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (typing(e.target)) return;
+
+      // Aim nudges. Shift makes the arrows an aim pad, which is the only precise
+      // way to explore aim without hunting with the mouse.
+      if (e.shiftKey) {
+        const c = this.sim.config;
+        const stepV = 0.02;
+        const stepU = 0.05;
+        switch (e.key) {
+          case 'ArrowUp':
+            this.setAimTarget(c.aimTargetU, (c.aimTargetV ?? 0.18) - stepV);
+            e.preventDefault();
+            return;
+          case 'ArrowDown':
+            this.setAimTarget(c.aimTargetU, (c.aimTargetV ?? 0.18) + stepV);
+            e.preventDefault();
+            return;
+          case 'ArrowLeft':
+            this.setAimTarget(c.aimTargetU - stepU, c.aimTargetV ?? 0.18);
+            e.preventDefault();
+            return;
+          case 'ArrowRight':
+            this.setAimTarget(c.aimTargetU + stepU, c.aimTargetV ?? 0.18);
+            e.preventDefault();
+            return;
+          default:
+            break;
+        }
+      }
+
+      switch (e.key) {
+        case ' ':
+          this.togglePlay();
+          e.preventDefault();
+          break;
+        case 'r':
+        case 'R':
+          this.sim.restart();
+          this.report = null;
+          this.refreshGeometryDependent();
+          this.refreshViews();
+          break;
+        case '.':
+        case 's':
+        case 'S':
+          this.stepBy(0.1);
+          break;
+        case ',':
+          this.stepBy(0.01);
+          break;
+        case 'a':
+        case 'A':
+          this.aimMode = !this.aimMode;
+          this.refreshAimCursor();
+          this.paintAimButton();
+          break;
+        case 'c':
+        case 'C':
+          this.cycleCamera();
+          break;
+        case '[':
+          this.nudgeSpeed(-1);
+          break;
+        case ']':
+          this.nudgeSpeed(1);
+          break;
+        case '?':
+        case '/':
+          this.toggleHelp();
+          e.preventDefault();
+          break;
+        case 'Escape':
+          if (this.aimMode) {
+            this.aimMode = false;
+            this.refreshAimCursor();
+            this.paintAimButton();
+          }
+          this.setHelpVisible(false);
+          break;
+        default: {
+          // 1-8 select a surface view.
+          const n = Number(e.key);
+          if (Number.isInteger(n) && n >= 1 && n <= VIEW_TABS.length) {
+            this.selectViewTab(n - 1);
+          }
+          break;
+        }
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.key === 'Shift') {
+        this.shiftHeld = false;
+        this.refreshAimCursor();
+      }
+    });
+  }
+
+  /**
+   * Camera buttons on the viewport rather than inside a collapsed panel section.
+   *
+   * They were under View, which is collapsed by default, so changing the camera was
+   * two clicks and a scroll for something you do constantly while judging a shape.
+   */
+  private buildViewportBar(): void {
+    const stage = document.getElementById('stage')!;
+    const bar = document.createElement('div');
+    bar.className = 'cam-bar';
+    const add = (label: string, preset: CameraPreset, index: number) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'cam-btn';
+      b.textContent = label;
+      b.title = `${label} view — press C to cycle`;
+      b.addEventListener('click', () => {
+        this.cameraIndex = index;
+        this.setCameraPreset(preset);
+      });
+      bar.append(b);
+    };
+    add('3/4', CameraPreset.ThreeQuarter, 0);
+    add('Front', CameraPreset.Front, 1);
+    add('Side', CameraPreset.Side, 2);
+    add('Top', CameraPreset.Top, 3);
+    add('Eye', CameraPreset.UserEye, 4);
+
+    const help = document.createElement('button');
+    help.type = 'button';
+    help.className = 'cam-btn help';
+    help.textContent = '?';
+    help.title = 'Keyboard shortcuts';
+    help.addEventListener('click', () => this.toggleHelp());
+    bar.append(help);
+
+    stage.append(bar);
+  }
+
+  /** Shortcut reference, so the keyboard layer is discoverable rather than secret. */
+  private buildHelp(): void {
+    const stage = document.getElementById('stage')!;
+    const box = document.createElement('div');
+    box.className = 'shortcuts hidden';
+    const rows: Array<[string, string]> = [
+      ['Space', 'play / pause'],
+      ['R', 'restart the run'],
+      ['S or .', 'step 0.1 s'],
+      [',', 'step 0.01 s'],
+      ['[  ]', 'slower / faster'],
+      ['1 – 8', 'surface view'],
+      ['C', 'cycle camera'],
+      ['click bowl', 'set aim'],
+      ['drag', 'orbit'],
+      ['Shift + drag', 'paint aim'],
+      ['Shift + arrows', 'nudge aim'],
+      ['A', 'sticky aim mode'],
+      ['Esc', 'cancel'],
+      ['?', 'this list'],
+    ];
+    const h = document.createElement('div');
+    h.className = 'shortcuts-title';
+    h.textContent = 'Shortcuts';
+    box.append(h);
+    for (const [k, v] of rows) {
+      const row = document.createElement('div');
+      row.className = 'shortcut-row';
+      const kk = document.createElement('kbd');
+      kk.textContent = k;
+      const vv = document.createElement('span');
+      vv.textContent = v;
+      row.append(kk, vv);
+      box.append(row);
+    }
+    stage.append(box);
+    this.helpEl = box;
+  }
+
+  private helpEl!: HTMLElement;
+
+  private toggleHelp(): void {
+    this.setHelpVisible(this.helpEl.classList.contains('hidden'));
+  }
+
+  private setHelpVisible(v: boolean): void {
+    this.helpEl.classList.toggle('hidden', !v);
+  }
+
+  private stepBy(seconds: number): void {
+    const target = this.sim.time + seconds;
+    while (this.sim.time < target && !this.sim.isFinished()) this.sim.step();
+    this.sim.sample();
+    if (this.sim.isFinished() && !this.report) this.finishRun();
+    this.refreshViews();
+  }
+
+  private nudgeSpeed(dir: number): void {
+    const steps = [0.1, 0.25, 0.5, 1, 2, 4];
+    let i = steps.indexOf(this.speed);
+    if (i < 0) i = 3;
+    i = Math.min(steps.length - 1, Math.max(0, i + dir));
+    this.speed = steps[i];
+    if (this.speedSel) this.speedSel.value = String(this.speed);
+  }
+
+  private cameraOrder: CameraPreset[] = [
+    CameraPreset.ThreeQuarter,
+    CameraPreset.Front,
+    CameraPreset.Side,
+    CameraPreset.Top,
+    CameraPreset.UserEye,
+  ];
+  private cameraIndex = 0;
+
+  private cycleCamera(): void {
+    this.cameraIndex = (this.cameraIndex + 1) % this.cameraOrder.length;
+    this.setCameraPreset(this.cameraOrder[this.cameraIndex]);
+  }
+
+  private selectViewTab(i: number): void {
+    const t = VIEW_TABS[i];
+    if (!t) return;
+    this.setFieldMode(t.mode);
+    this.paintTabs();
+  }
 
   private togglePlay(): void {
     if (this.sim.phase === SimPhase.Finished) {
@@ -1426,7 +1802,12 @@ export class App {
     cfg.resolutionU = Math.max(savedU, 72);
     cfg.resolutionV = Math.max(savedV, 132);
     this.sim.rebuild();
-    this.view.setGeometry(this.sim.surface, this.sim.casting, this.sim.capture);
+    this.view.setGeometry(
+      this.sim.surface,
+      this.sim.casting,
+      this.sim.capture,
+      this.sim.fittings
+    );
     this.sim.restart();
 
     const total = this.sim.totalDuration;
@@ -1461,6 +1842,8 @@ export class App {
     prog.classList.add('hidden');
     this.analysing = false;
     this.paintReport();
+    this.expandSection(this.reportEl);
+    this.reportEl.scrollIntoView({ block: 'nearest' });
     this.right.refresh();
     this.updateCharts();
   }
@@ -1849,11 +2232,13 @@ export class App {
     this.sim.sample();
     this.report = this.sim.report();
     this.paintReport();
+    this.expandSection(this.reportEl);
     this.right.refresh();
   }
 
   /** Force every throttled overlay to catch up, then draw one frame. */
   refreshViews(): void {
+    this.flushAimSweep();
     this.view.updateLiquid(
       this.sim.particles,
       this.sim.emitter.position,

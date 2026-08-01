@@ -186,10 +186,23 @@ export class CaptureScene implements CaptureTester {
     });
 
     // -- Fixture exterior --------------------------------------------------
-    // The outward-facing front of the fixture below the lip. Reached only by
-    // liquid that cleared the rim and came back down against it; anything
-    // heading out through the opening meets the inner front wall first, which is
-    // part of the fixture mesh and handled by the collision test.
+    // The outward-facing front of the fixture *below the front lip*, and that
+    // bound is load-bearing rather than a detail.
+    //
+    // It used to run to the top of the fixture, which contradicted this comment and
+    // silently destroyed the entire experiment on any tall model. The plane sits a
+    // few millimetres in front of the interior, so anything crossing it within its
+    // bounds is absorbed. On a wall-hung bowl the exit is above the rim -- 580 mm
+    // against a 400 mm rim -- so the stream passes over the plane and nothing
+    // notices. On the full-height stall the rim is at 950 mm and the exit at 710 mm,
+    // so the stream crossed the plane on its very first step: measured 149.6 mL of a
+    // 150 mL void booked to the fixture exterior, zero wall impacts, an empty film,
+    // and about ten live droplets at any moment. The stream simply vanished.
+    //
+    // Above the lip the front of a urinal is the opening, so there is nothing there
+    // to catch liquid; below it the front face is solid ceramic, which is the only
+    // part this plane was ever meant to represent. The casting collider handles the
+    // real ceramic in front of it, so this is now purely a backstop.
     this.rects.push({
       zone: CaptureZone.FixtureExterior,
       axis: 2,
@@ -197,7 +210,7 @@ export class CaptureScene implements CaptureTester {
       aMin: b.min.x - 0.02,
       aMax: b.max.x + 0.02,
       bMin: this.floorY,
-      bMax: b.max.y,
+      bMax: surface.lipY,
       dir: -1,
     });
   }

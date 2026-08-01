@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { CRITICAL_IMPINGEMENT_ANGLE } from '../core/constants';
+import { FittingsMesh } from '../geometry/fittings';
 import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
 import { FilmSolver } from '../sim/film';
@@ -69,6 +70,9 @@ export class FixtureView {
   /** The exterior casting. Cosmetic, and never carries a data overlay. */
   private shellMesh: THREE.Mesh | null = null;
   private shellMaterial: THREE.MeshStandardMaterial;
+  /** Flush valve, pipe and spud. Chrome, never a data surface. */
+  private fittingsMesh: THREE.Mesh | null = null;
+  private chromeMaterial: THREE.MeshStandardMaterial;
 
   // Per-vertex channels.
   private field!: Float32Array;
@@ -304,6 +308,45 @@ export class FixtureView {
       metalness: 0.02,
       side: THREE.DoubleSide,
     });
+
+    // Polished chrome. High metalness with low roughness is what separates the
+    // metalwork from the glaze at a glance, and the glaze is already the
+    // brightest thing in frame, so the chrome is kept slightly darker to read as
+    // metal rather than as more ceramic.
+    this.chromeMaterial = new THREE.MeshStandardMaterial({
+      color: 0xc9d2dc,
+      roughness: 0.14,
+      metalness: 0.92,
+      side: THREE.FrontSide,
+    });
+  }
+
+  /**
+   * Attach the metalwork.
+   *
+   * Chrome rather than the ceramic material, and a separate mesh, because it is a
+   * different object: it is never a data surface, and giving it the field shader
+   * would invite reading a value off a flush valve.
+   */
+  setFittings(fittings: FittingsMesh | null): void {
+    if (this.fittingsMesh) {
+      this.group.remove(this.fittingsMesh);
+      this.fittingsMesh.geometry.dispose();
+      this.fittingsMesh = null;
+    }
+    if (!fittings || fittings.empty) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(fittings.positions.slice(), 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(fittings.normals.slice(), 3));
+    g.setIndex(new THREE.BufferAttribute(fittings.indices.slice(), 1));
+    g.computeBoundingSphere();
+    this.fittingsMesh = new THREE.Mesh(g, this.chromeMaterial);
+    this.fittingsMesh.frustumCulled = false;
+    this.group.add(this.fittingsMesh);
+  }
+
+  setFittingsVisible(v: boolean): void {
+    if (this.fittingsMesh) this.fittingsMesh.visible = v;
   }
 
   /** Attach the exterior casting. */

@@ -427,19 +427,21 @@ export class ParticleSystem {
    * fixture may yet land on the user, and clipping it early would understate
    * splashback.
    */
-  cullOutside(min: Vec3, max: Vec3): number {
+  cullOutside(min: Vec3, max: Vec3): { count: number; volume: number } {
     let killed = 0;
+    let volume = 0;
     for (let i = 0; i < this.high; i++) {
       if ((this.flags[i] & PFlag.Alive) === 0) continue;
       const x = this.px[i];
       const y = this.py[i];
       const z = this.pz[i];
       if (x < min.x || x > max.x || y < min.y || y > max.y || z < min.z || z > max.z) {
+        volume += this.volume[i];
         this.kill(i);
         killed++;
       }
     }
-    return killed;
+    return { count: killed, volume };
   }
 }
 

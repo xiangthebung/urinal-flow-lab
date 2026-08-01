@@ -7,7 +7,12 @@ import {
 } from '../core/fluid';
 import { Rng } from '../core/rng';
 import { Vec3, clamp, v3 } from '../core/vec3';
-import { MeshCollider } from '../geometry/collider';
+import { CompositeCollider, MeshCollider, SolidCollider } from '../geometry/collider';
+import {
+  FittingsMesh,
+  FittingsParams,
+  buildFittings,
+} from '../geometry/fittings';
 import { ShellMesh, ShellParams, buildShell } from '../geometry/shell';
 import { SurfaceParams, UrinalSurface, defaultSurfaceParams } from '../geometry/surface';
 import { CaptureScene, CaptureZone, UserPosture, defaultPosture } from './capture';
@@ -61,6 +66,13 @@ export interface SimConfig {
    * the reason splash flew straight through the ceramic for so long.
    */
   casting: Partial<ShellParams>;
+  /**
+   * Flush valve, supply pipe and outlet spud. Overrides only.
+   *
+   * In the simulation config rather than the renderer for the same reason the
+   * casting is: they are solid and droplets collide with them.
+   */
+  fittings: Partial<FittingsParams>;
   stream: StreamParams;
   film: FilmParams;
   impact: ImpactModelParams;
@@ -97,6 +109,7 @@ export function defaultConfig(): SimConfig {
   return {
     surface: defaultSurfaceParams(),
     casting: {},
+    fittings: {},
     stream: defaultStreamParams(),
     film: defaultFilmParams(),
     impact: defaultImpactParams(),
@@ -155,6 +168,8 @@ export class Simulation {
   surface!: UrinalSurface;
   /** Exterior casting. Rendered, and collided against. */
   casting!: ShellMesh;
+  /** Flush valve, supply pipe and outlet spud. Rendered, and collided against. */
+  fittings!: FittingsMesh;
   /**
    * Public because anything that asks "where does the stream go" has to consult
    * it. The aim trajectory drawn in the viewport used to raycast the interior
@@ -162,7 +177,7 @@ export class Simulation {
    * showed liquid reaching the sump when the real stream was being stopped dead
    * by the front rim.
    */
-  castingCollider!: MeshCollider;
+  castingCollider!: SolidCollider;
   film!: FilmSolver;
   particles!: ParticleSystem;
   emitter!: StreamEmitter;
@@ -254,7 +269,17 @@ export class Simulation {
     const c = this.config;
     this.surface = this.buildSurface();
     this.casting = buildShell(this.surface, c.casting);
-    this.castingCollider = new MeshCollider(this.casting.positions, this.casting.indices);
+    this.fittings = buildFittings(this.surface, this.casting, c.fittings);
+    // The metalwork is solid. It stands above the bowl, closer to the user's aim
+    // than any of the ceramic, so a stream put high on the fixture hits the spud
+    // and the valve body -- and anything visible that cannot be hit silently
+    // deletes liquid, which is the fault that made the casting an absorber.
+    this.castingCollider = new CompositeCollider([
+      new MeshCollider(this.casting.positions, this.casting.indices),
+      this.fittings.empty
+        ? null
+        : new MeshCollider(this.fittings.positions, this.fittings.indices),
+    ]);
     this.rng = new Rng(c.seed);
     this.film = new FilmSolver(this.surface, c.fluid, c.wall, c.film);
     this.particles = new ParticleSystem(c.particleCapacity);
@@ -511,8 +536,13 @@ export class Simulation {
     }
 
     // 7. Retire anything that has left the region of interest.
+    // Recorded, not discarded. `escapedVolume` was declared, reset and reported
+    // but never actually incremented, and it was missing from the closure sum, so
+    // any droplet thrown clear of the region of interest vanished unaccounted.
+    // Invisible while splash stayed inside the bowl; aiming at the metalwork
+    // instead throws liquid high and wide and the balance drifted to 0.07%.
     const escaped = this.particles.cullOutside(this.bounds.min, this.bounds.max);
-    void escaped;
+    this.metrics.escapedVolume += escaped.volume;
 
     this.time += dt;
     if (this.time >= this.totalDuration) this.phase = SimPhase.Finished;
@@ -600,6 +630,10 @@ export class Simulation {
       // Liquid that has run off an edge but not yet gathered into a drip. Small,
       // but leaving it out would show up as a permanent closure deficit.
       this.film.pendingEdgeVolume() +
+      // Thrown clear of the region of interest. A real outcome rather than a loss:
+      // it left the room, and it has to be counted somewhere or the balance drifts
+      // exactly in the cases where splash is most violent.
+      this.metrics.escapedVolume +
       this.particles.overflowVolume;
     const emitted = this.metrics.emittedVolume;
     const closure = emitted > 0 ? Math.abs(accounted - emitted) / emitted : 0;

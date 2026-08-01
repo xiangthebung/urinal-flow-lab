@@ -717,3 +717,91 @@ input[type="checkbox"] {
     grid-template-columns: 268px 1fr 280px;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Viewport controls
+   ---------------------------------------------------------------------------
+   The camera buttons used to live inside the View panel section, which is
+   collapsed by default -- so changing the camera was open-section, scroll, click,
+   for something you do constantly while judging a shape. They belong on the thing
+   they control. */
+/* Right edge, vertically centred. The four corners of the stage are already taken:
+   view tabs top-left, the HUD top-right, the field legend bottom-left and the
+   warning note bottom-right. A horizontal bar along the bottom sat directly on top
+   of the note. */
+.cam-bar {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 5;
+}
+
+.cam-btn {
+  font: inherit;
+  font-size: 11px;
+  padding: 5px 9px;
+  color: #b8c6d6;
+  background: rgba(16, 22, 30, 0.82);
+  border: 1px solid #2b3745;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.cam-btn:hover {
+  color: #e6eef7;
+  border-color: #3d4c5e;
+  background: rgba(24, 32, 42, 0.92);
+}
+
+.cam-btn.help {
+  min-width: 26px;
+  font-weight: 600;
+}
+
+/* Shortcut reference. */
+.shortcuts {
+  position: absolute;
+  right: 62px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 6;
+  padding: 10px 12px;
+  background: rgba(13, 18, 24, 0.95);
+  border: 1px solid #2b3745;
+  border-radius: 7px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  min-width: 210px;
+}
+
+.shortcuts.hidden {
+  display: none;
+}
+
+.shortcuts-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #7f93a8;
+  margin-bottom: 7px;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: #c3d0de;
+}
+
+.shortcut-row kbd {
+  flex: 0 0 88px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: #9fd4e8;
+  text-align: right;
+}

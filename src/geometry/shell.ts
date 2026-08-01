@@ -104,11 +104,57 @@ export interface ShellMesh {
   /** Bounds of the exterior alone. */
   min: Vec3;
   max: Vec3;
+  /**
+   * Measurements of the fit, for `tools/fixture-lab.mts`.
+   *
+   * Both of these are here because the two things that have gone wrong with the
+   * casting are invisible in every other number the project reports, and one of
+   * them was mistaken for a shading bug for a long time. Neither costs anything to
+   * compute alongside the fit.
+   */
+  fit: {
+    /**
+     * Largest distance an interior vertex lies outside the fitted envelope, mm.
+     *
+     * Must be 0. Above 0 the bowl pokes through its own casting.
+     */
+    protrusion: number;
+    /**
+     * Amplitude of band-to-band *ripple* in the envelope radius, mm.
+     *
+     * The envelope is interpolated bilinearly, so a large second difference in
+     * height is a visible ring crease, and the solid body takes its shading normals
+     * from the same table, so the crease is lit as a facet.
+     *
+     * Measured as alternation rather than as the largest second difference,
+     * because the largest second difference is not a defect: a urinal has real
+     * creases in it -- the corner where a vertical wall meets the sump floor, the
+     * fast taper of the bottom cap -- and those are single-signed and belong there.
+     * A sampling artefact is the thing that changes sign every band or two, so this
+     * takes the smaller of each consecutive pair of opposite-signed second
+     * differences. Designed creases score near zero on that and ribbing does not.
+     * Under ~0.5 mm reads as smooth.
+     */
+    ribbing: number;
+    /** Height and direction of the worst ripple, mm above the datum and degrees. */
+    ribbingAt: { y: number; deg: number };
+  };
 }
 
-/** Height bands and angular bins of the fitted outer section. */
-const BANDS = 56;
-const ABINS = 33;
+/**
+ * Height bands and angular bins of the fitted outer section.
+ *
+ * These are a sampling rate, and they were both too low. The envelope is looked up
+ * by bilinear interpolation, so it is only C0 across a cell boundary and the
+ * casting carries a crease at every band and every bin. At 56 bands over a 640 mm
+ * fixture the creases are 11 mm apart, which is coarse enough to see: the pedestal
+ * came out ribbed like a radiator, and because the body's own normals are taken
+ * analytically from the same table the ribs were lit as real facets. Cost is
+ * O(BANDS x ABINS^2) once per rebuild, a few hundred thousand operations, so there
+ * was never a reason to be frugal here.
+ */
+const BANDS = 112;
+const ABINS = 49;
 
 const smoothstep = (edge0: number, edge1: number, x: number): number => {
   const t = Math.min(1, Math.max(0, (x - edge0) / Math.max(1e-9, edge1 - edge0)));
@@ -175,8 +221,9 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   const yBot = yMin - p.bottomExtension;
   const yTop = yMax;
   const ySpan = Math.max(1e-6, yTop - yBot);
-  const bandOf = (y: number) =>
-    Math.min(BANDS - 1, Math.max(0, Math.round(((y - yBot) / ySpan) * (BANDS - 1))));
+  /** Continuous band coordinate of a height. */
+  const bandCoord = (y: number) => ((y - yBot) / ySpan) * (BANDS - 1);
+  const clampBand = (b: number) => Math.min(BANDS - 1, Math.max(0, b));
 
   // The section of the casting is fitted as a *support function* in the plane
   // (x, z - zBack): for each height band and each direction, how far out the
@@ -205,14 +252,88 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   }
 
   const H = new Float64Array(BANDS * ABINS).fill(-Infinity);
-  for (let k = 0; k < nVert; k++) {
-    const bi = bandOf(s.vertices[k * 3 + 1]);
-    const dx = s.vertices[k * 3];
-    const dz = Math.max(0, s.vertices[k * 3 + 2] - zBack);
+  const raiseAt = (bi: number, dx: number, dz: number): void => {
     const row = bi * ABINS;
     for (let a = 0; a < ABINS; a++) {
       const h = dx * dirS[a] + dz * dirC[a];
       if (h > H[row + a]) H[row + a] = h;
+    }
+  };
+
+  // The interior is sampled by EDGE, not by vertex.
+  //
+  // Binning vertices into the band nearest their own height is the obvious way to
+  // do this and it is where the ribbing came from. Interior rows are uniform in
+  // arclength, not in height, so wherever the profile is steep -- the whole back
+  // wall -- consecutive rows are further apart in y than the bands are. Bands
+  // between two rows then receive nothing and get filled by copying a neighbour,
+  // while bands that happen to catch a row jump out to it. The result is a
+  // staircase whose period is the row spacing, and since the raw fit is used again
+  // below as a floor under the smoothed one, no amount of smoothing removes it: it
+  // is put straight back.
+  //
+  // Walking each grid edge and raising every band it crosses, at the height where
+  // it crosses, makes the fit a continuous function of y instead of a sampled one.
+  // Vertices are still raised into the two bands bracketing them, which is what
+  // guarantees containment: the envelope interpolates linearly in y between those
+  // two bands, so if both are at least as far out as the vertex then so is every
+  // height in between.
+  const sx = (k: number) => s.vertices[k * 3];
+  const sy = (k: number) => s.vertices[k * 3 + 1];
+  const sz = (k: number) => Math.max(0, s.vertices[k * 3 + 2] - zBack);
+
+  // Vertices are spread into both bracketing bands ONLY where their column turns
+  // back in height.
+  //
+  // Spreading every vertex is the obvious way to guarantee containment and it
+  // reintroduced the ribbing in a subtler form. A vertex three tenths of a band
+  // above a band line raises that band to its own reach, which is further out than
+  // the surface actually is there; the next vertex may sit almost on a band line and
+  // overshoot by nothing. So consecutive bands alternate between the true slice and
+  // an overshoot, and the alternation is a ripple of |dh/dy| x band spacing -- about
+  // 2 mm here, with a period of a few bands. That is precisely a fine rib.
+  //
+  // On a stretch where the column climbs monotonically the spread is redundant: the
+  // edges either side of the vertex cross every band it lies between, so the
+  // interpolated envelope already passes through it. It is only at a turning point
+  // -- the front lip tip, the top of the rim, the bottom of the sump -- that no edge
+  // reaches the extremum, and those are the few places it is needed. `fit.protrusion`
+  // is the check that this reasoning is right rather than merely plausible.
+  const turnsInY = (j: number, i: number): boolean => {
+    if (j === 0 || j === nv) return true;
+    const y = sy(j * stride + i);
+    const yUp = sy((j + 1) * stride + i);
+    const yDn = sy((j - 1) * stride + i);
+    return (y - yUp) * (y - yDn) >= 0;
+  };
+  for (let j = 0; j <= nv; j++) {
+    for (let i = 0; i <= nu; i++) {
+      if (!turnsInY(j, i)) continue;
+      const k = j * stride + i;
+      const tb = bandCoord(sy(k));
+      raiseAt(clampBand(Math.floor(tb)), sx(k), sz(k));
+      raiseAt(clampBand(Math.ceil(tb)), sx(k), sz(k));
+    }
+  }
+  const spanEdge = (k0: number, k1: number): void => {
+    const t0 = bandCoord(sy(k0));
+    const t1 = bandCoord(sy(k1));
+    const lo = Math.ceil(Math.min(t0, t1));
+    const hi = Math.floor(Math.max(t0, t1));
+    // `hi === lo` is an edge crossing exactly one band, which is the common case,
+    // not a degenerate one. Excluding it made this whole mechanism a near no-op.
+    if (hi < lo || Math.abs(t1 - t0) < 1e-12) return;
+    for (let b = clampBand(lo); b <= clampBand(hi); b++) {
+      const f = (b - t0) / (t1 - t0);
+      if (f <= 0 || f >= 1) continue;
+      raiseAt(b, sx(k0) + (sx(k1) - sx(k0)) * f, sz(k0) + (sz(k1) - sz(k0)) * f);
+    }
+  };
+  for (let j = 0; j <= nv; j++) {
+    for (let i = 0; i <= nu; i++) {
+      const k = j * stride + i;
+      if (j < nv) spanEdge(k, k + stride);
+      if (i < nu) spanEdge(k, k + 1);
     }
   }
 
@@ -236,9 +357,19 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
       H[(BANDS - 1) * ABINS + a] = H[(BANDS - 2) * ABINS + a];
     }
   }
+  // Rounded underside, as a parabola in (height, radius) meeting the lowest fitted
+  // section with zero slope, so there is no ring crease at the junction.
+  //
+  // The exponent is not a free choice. `sqrt(frac)`, which was here before, has an
+  // infinite slope at the tip and a hard corner at the junction -- both ends wrong.
+  // A smoothstep is C1 at both ends but its curvature peaks there instead, which is
+  // worse: this cap only gets ~9 of the height bands, so a kink costs about
+  // `6/9^2` of the section radius, around 10 mm. A parabola spreads its curvature
+  // evenly and is the flattest curve that can arrive tangent, at about 3 mm.
   for (let b = 0; b < firstOccupied; b++) {
     const frac = firstOccupied > 0 ? b / firstOccupied : 1;
-    const k = p.bottomTaper + (1 - p.bottomTaper) * Math.sqrt(frac);
+    const dome = 1 - (1 - frac) * (1 - frac);
+    const k = p.bottomTaper + (1 - p.bottomTaper) * dome;
     for (let a = 0; a < ABINS; a++) H[b * ABINS + a] = H[firstOccupied * ABINS + a] * k;
   }
 
@@ -279,6 +410,13 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
       }
     }
   }
+  // Floor under the smoothed fit, which is what keeps containment exact: the raw
+  // support function provably contains the interior, so staying above it does too.
+  //
+  // This was the mechanism that made the ribbing permanent, and it is worth being
+  // clear that it was never the fault -- it faithfully preserved a staircase that
+  // was already in `rawH`. Now that the fit is sampled per edge, `rawH` is smooth
+  // in y and the floor costs nothing.
   for (let i = 0; i < H.length; i++) {
     const floorH = rawH[i] + p.clearance * 0.5;
     if (H[i] < floorH) H[i] = floorH;
@@ -314,6 +452,28 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     );
   };
 
+  // Measured over the fitted bands only. Below `firstOccupied` the section is the
+  // designed bottom cap, a deliberately fast taper whose curvature would swamp the
+  // number this is for. See ShellMesh.fit.ribbing for why it looks for alternation.
+  let ribbing = 0;
+  let ribBand = 0;
+  let ribBin = 0;
+  const d2 = (b: number, a: number) =>
+    R[(b - 1) * ABINS + a] - 2 * R[b * ABINS + a] + R[(b + 1) * ABINS + a];
+  for (let a = 0; a < ABINS; a++) {
+    for (let b = Math.max(2, firstOccupied + 2); b < BANDS - 2; b++) {
+      const u = d2(b, a);
+      const w = d2(b + 1, a);
+      if (u * w >= 0) continue;
+      const amp = Math.min(Math.abs(u), Math.abs(w));
+      if (amp > ribbing) {
+        ribbing = amp;
+        ribBand = b;
+        ribBin = a;
+      }
+    }
+  }
+
   /**
    * Envelope field. Negative inside the casting, positive outside.
    *
@@ -331,6 +491,18 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     const r = Math.hypot(x, dz);
     return r / radiusAt(y, Math.atan2(x, dz)) - 1;
   };
+
+  // Containment, measured rather than asserted. See ShellMesh.fit.
+  let protrusion = 0;
+  for (let k = 0; k < nVert; k++) {
+    const x = s.vertices[k * 3];
+    const y = s.vertices[k * 3 + 1];
+    const dz = s.vertices[k * 3 + 2] - zBack;
+    if (dz < 0 || y < yBot || y > yTop) continue;
+    const r = Math.hypot(x, dz);
+    const over = r - radiusAt(y, Math.atan2(x, dz));
+    if (over > protrusion) protrusion = over;
+  }
 
   // -- Convexity of the interior, per vertex -------------------------------
   // Offsetting outward from a surface that bulges into the bowl walks toward the
@@ -399,7 +571,17 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     // thickness is kept, so the back stays flush and the rim reads as the chunky
     // rolled edge it is on a real bowl.
     const ramp = smoothstep(0, p.rimBandWidth, edgeDist[k]);
-    const backness = smoothstep(0.35, 0.85, Math.max(0, -oz));
+    // Facing backward is not the same as being at the back, and conflating the two
+    // put a pair of thin plates out of the sides of the fixture like carrying
+    // handles. The exemption exists so the ceramic behind the back wall stays thick
+    // enough to reach the mounting plane, which is a statement about *position*. The
+    // rim wraps forward to 275 mm at the sides on the default bowl, and those points
+    // still face backward and upward, so they were being granted the full 300 mm
+    // thickness cap 275 mm from the wall -- and the rim band, whose width is exactly
+    // this thickness, drew the result edge on.
+    const nearBack =
+      1 - smoothstep(p.backSetback, p.backSetback + 3 * p.wallThickness, z - zBack);
+    const backness = smoothstep(0.35, 0.85, Math.max(0, -oz)) * nearBack;
     const thinning = ramp + (1 - ramp) * backness;
     let t = p.rimThickness + (Math.max(tEnv, p.rimThickness) - p.rimThickness) * thinning;
 
@@ -536,10 +718,19 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // one remaining job is above the lip, where the pedestal has stopped and the back
   // panel and the rim around the opening still need a surface. That region is
   // convex enough to offset safely.
+  // BOTH rows must be above the cut, not either.
+  //
+  // With "either", the one row straddling the cut is emitted, and at the front that
+  // row is the front lip: the profile turns over there, so the row below the lip tip
+  // is already under the cut while the tip itself is above it. The result is a single
+  // ring of offset quads standing free around the lip with nothing joining it to the
+  // rest of the skin, which renders as a bright flap curling out of the front of the
+  // bowl. The lip does not lose its edge -- the rim band runs round the whole opening
+  // loop and is what draws the visible thickness there.
   const yCut = s.lipY - 0.004;
   const aboveCut = (j: number) => s.vertices[(j * stride + Math.floor(nu / 2)) * 3 + 1] > yCut;
   for (let j = 0; j < nv; j++) {
-    if (!aboveCut(j) && !aboveCut(j + 1)) continue;
+    if (!aboveCut(j) || !aboveCut(j + 1)) continue;
     for (let i = 0; i < nu; i++) {
       const a = j * stride + i;
       const b = a + 1;
@@ -671,12 +862,33 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     if (z > max.z) max.z = z;
   }
 
-  return { positions, normals, indices: new Uint32Array(idx), min, max };
+  return {
+    positions,
+    normals,
+    indices: new Uint32Array(idx),
+    min,
+    max,
+    fit: {
+      protrusion: protrusion * 1000,
+      ribbing: ribbing * 1000,
+      ribbingAt: {
+        y: (yBot + (ribBand / (BANDS - 1)) * ySpan) * 1000,
+        deg: -90 + (ribBin / (ABINS - 1)) * 180,
+      },
+    },
+  };
 }
 
-/** Angular (per side) and vertical resolution of the solid body. */
-const BODY_A = 34;
-const BODY_V = 56;
+/**
+ * Angular (per side) and vertical resolution of the solid body.
+ *
+ * Kept at or above the envelope table's own resolution. Sampling the body more
+ * coarsely than the table it reads from throws away detail that has already been
+ * paid for, and sampling it much finer only resolves the table's interpolation
+ * creases more sharply.
+ */
+const BODY_A = 44;
+const BODY_V = 96;
 
 /**
  * The solid lower body of the fixture.
@@ -687,16 +899,30 @@ const BODY_V = 56;
  * sanitaryware is a solid lump with a cavity in it, so the volume between the
  * front of the bowl and the mounting plane has to actually be filled.
  *
- * The fill only has to reach the front lip. Below the lip a horizontal slice
- * through a urinal is a closed ring of ceramic around the cavity, so the body is
- * a plain tube and needs no cutting; above the lip the front is open by
- * definition and the thin back panel and side wings the offset surface already
- * provides are the correct shape. The step at the lip where the full body gives
- * way to the wings is a real feature of the object, not an artefact.
+ * HOW HIGH THE FILL GOES, PER DIRECTION
+ *
+ * The top of the solid is not one height. It follows the boundary of the opening,
+ * angle by angle, which is the only definition that is right everywhere: the solid
+ * ceramic ends exactly where the cavity begins.
+ *
+ * Two simpler rules were tried and both produce a recognisable wrong object.
+ * Carrying the body to the rim height all round and cutting wings either side of
+ * the opening fills in everything around the bowl and reduces the opening to a
+ * slot, so the fixture reads as a rounded box. Stopping at the front lip height all
+ * round -- which is right at the front and nowhere else -- leaves a horizontal
+ * annulus at that height, and at the sides that annulus is over solid ceramic with
+ * no cavity beneath it to trim it against, so it comes out as a 50 mm plate
+ * standing proud of the fixture like a collar on a plant pot, with the thin back
+ * panel apparently balanced on top of it. That collar was the single most
+ * unconvincing thing about these renders.
+ *
+ * Following the loop gives the front lip height at the front, the side-edge height
+ * at the sides and the rim height where the rim wraps round, so the casting is one
+ * continuous mass from the floor to the rim with a bowl hollowed out of it.
  *
  * Sits a whisker outside the offset surface so the two cannot z-fight where they
  * touch, and the deck at the top is trimmed by raycasting the bowl, so it meets
- * the lip exactly however the interior is shaped.
+ * the opening exactly however the interior is shaped.
  */
 function buildBody(
   s: UrinalSurface,
@@ -733,24 +959,118 @@ function buildBody(
     if (y < yMin) yMin = y;
     if (y > yMax) yMax = y;
   }
-  // The solid pedestal stops at the front lip.
+  // -- Height of the top of the solid, per direction ------------------------
   //
-  // Below the lip a horizontal cut through a urinal is a closed ring of ceramic
-  // around the cavity, so that part is genuinely a solid body. Above it the front is
-  // open by definition, and all that remains is the back panel and a rim around the
-  // opening -- which the offset skin already provides at the right thickness.
-  // Carrying the solid body all the way to the rim instead, with wings either side
-  // of the opening, filled in everything around the bowl and reduced the opening to
-  // a slot: the fixture read as a rounded box. Stopping at the lip is both what a
-  // real casting does and what lets you see into the bowl.
-  const yTop = Math.min(yMax - 0.005, Math.max(yMin + 0.02, s.lipY));
-  const yOf = (l: number) => yBot + ((yTop - yBot) * l) / BODY_V;
+  // Test, per angle: stand on the outer wall at a height and look straight down. If
+  // the bowl is a long way below, the wall is out over the open mouth and ceramic
+  // there would pave it over. If there is nothing below at all, or the ceramic
+  // starts immediately, the wall is clear of the cavity and the casting can carry on
+  // up. Marching down from the rim and taking the first height that passes gives the
+  // front lip height at the front, and the rim height at the sides and back.
+  //
+  // Deriving this from the boundary loop instead is the obvious approach, and it is
+  // wrong in a way worth recording because the loop looks like exactly the right
+  // curve. The patch's u = +-1 boundary is not the rim of the opening: it is the
+  // profile swept out to the full half width, so it runs from the top of the back
+  // wall all the way DOWN through the sump and back up to the lip. On the default
+  // bowl it reaches y = -28 mm at 21 degrees off centre. Taking the lowest loop
+  // height per angle therefore pins the casting's top to the sump floor at that
+  // angle and the body collapses to a point there, which renders as a large
+  // triangular blade sticking out of the front of the fixture.
+  const NA = BODY_A * 2;
+  const angOf = (a: number) => -Math.PI / 2 + (a / NA) * Math.PI;
+  const yCeil = yMax - 0.005;
+  const yFloorTop = Math.min(yCeil, yMin + 0.02);
+  const topY = new Float64Array(NA + 1);
+  {
+    const probe = v3();
+    const down = v3(0, -1, 0);
+    // How close a hit still counts as "the ceramic starts here". Sized to the
+    // casting's own thickness: at the angles where the wall runs tangent to the
+    // bowl's plan outline the ray grazes it, and whether it registers a hit at all
+    // is then luck. Treating a graze as clear rather than as open mouth keeps the
+    // top edge from breaking up along exactly the tangent directions, which is where
+    // the silhouette is.
+    const near = p.wallThickness + p.clearance;
+    const dyStep = Math.max(0.004, (yCeil - yFloorTop) / 56);
+    for (let a = 0; a <= NA; a++) {
+      const t = angOf(a);
+      const st = Math.sin(t);
+      const ct = Math.cos(t);
+      let top = yFloorTop;
+      for (let y = yCeil; y >= yFloorTop; y -= dyStep) {
+        const r = rOf(y, t);
+        probe.x = r * st;
+        probe.y = y;
+        probe.z = zBack + r * ct;
+        const hit = s.raycast(probe, down, y - yBot);
+        if (hit === null || hit.t < near) {
+          top = y;
+          break;
+        }
+      }
+      topY[a] = Math.min(yCeil, Math.max(yFloorTop, top));
+    }
+    // Smoothed hard, because the transition matters more than the exact height.
+    // The raw test steps from the lip height to the rim height over one or two
+    // angular columns, and the strip that caps the wall then has to climb 115 mm in
+    // that span -- a wide, steeply twisted ribbon standing out of the front of the
+    // bowl, which is what it looked like. Spreading the climb over 20-odd degrees
+    // turns the same strip into the sloping top edge a real casting has.
+    const tmpT = new Float64Array(topY.length);
+    for (let pass = 0; pass < 24; pass++) {
+      tmpT.set(topY);
+      for (let a = 1; a < NA; a++) {
+        topY[a] = 0.25 * tmpT[a - 1] + 0.5 * tmpT[a] + 0.25 * tmpT[a + 1];
+      }
+    }
+
+    // Floor: the casting may not stop below a top edge of the interior that lies on
+    // its own outer wall.
+    //
+    // The v = 0 and v = 1 rows are the top of the back wall and the tip of the front
+    // lip, and unlike the u = +-1 side edges they really are top edges of the
+    // ceramic. Where one of them coincides with the outer wall, the casting has to
+    // reach it: a millimetre short and the glaze edge stands out of the casting as a
+    // thin bright fin, which is what the front lip was doing -- a curled flap
+    // apparently unattached to the bowl, easily mistaken for a hole in the mesh. The
+    // radius test is what makes this safe to apply: at theta = 0 the *rim* is only
+    // 14 mm from the axis while the wall there is 340 mm out, so flooring to every
+    // boundary point regardless of radius would drag the front of the casting up to
+    // the rim height and pave the mouth over.
+    const rowFloor = (j: number): void => {
+      for (let i = 0; i <= s.nu; i++) {
+        const k = (j * stride + i) * 3;
+        const dz = s.vertices[k + 2] - zBack;
+        if (dz <= 1e-6) continue;
+        const y = s.vertices[k + 1];
+        const th = Math.atan2(s.vertices[k], dz);
+        const a = Math.round(((th + Math.PI / 2) / Math.PI) * NA);
+        if (a < 0 || a > NA) continue;
+        const r = Math.hypot(s.vertices[k], dz);
+        if (r < rOf(y, th) - (p.wallThickness + p.clearance + 0.02)) continue;
+        if (y > topY[a]) topY[a] = Math.min(yCeil, y);
+      }
+    };
+    rowFloor(0);
+    rowFloor(s.nv);
+    // Re-smoothed lightly, so the floor does not put back a one-column spike.
+    for (let pass = 0; pass < 3; pass++) {
+      tmpT.set(topY);
+      for (let a = 1; a < NA; a++) {
+        topY[a] = Math.max(
+          topY[a],
+          0.25 * tmpT[a - 1] + 0.5 * tmpT[a] + 0.25 * tmpT[a + 1]
+        );
+      }
+    }
+  }
+  const yOf = (a: number, l: number) => yBot + ((topY[a] - yBot) * l) / BODY_V;
 
   // -- Outer wall, as a left and a right sheet ------------------------------
   const normalAt = (y: number, t: number): [number, number, number] => {
-    const dy = Math.max(1e-4, (yTop - yBot) / BODY_V);
-    const drdy =
-      (rOf(Math.min(yTop, y + dy), t) - rOf(Math.max(yBot, y - dy), t)) / (2 * dy);
+    const dy = 0.004;
+    const drdy = (rOf(y + dy, t) - rOf(Math.max(yBot, y - dy), t)) / (2 * dy);
     let nx = Math.sin(t);
     let nz = Math.cos(t);
     let ny = -drdy;
@@ -760,12 +1080,11 @@ function buildBody(
 
   {
     const rows: number[][] = [];
-    const NA = BODY_A * 2;
     for (let l = 0; l <= BODY_V; l++) {
-      const y = yOf(l);
       const row: number[] = [];
       for (let a = 0; a <= NA; a++) {
-        const t = -HALF + (a / NA) * Math.PI;
+        const t = angOf(a);
+        const y = yOf(a, l);
         const r = rOf(y, t);
         const n = normalAt(y, t);
         row.push(push(r * Math.sin(t), y, zBack + r * Math.cos(t), n[0], n[1], n[2]));
@@ -787,9 +1106,10 @@ function buildBody(
   const backL: number[] = [];
   const backR: number[] = [];
   for (let l = 0; l <= BODY_V; l++) {
-    const y = yOf(l);
-    backL.push(push(-Math.abs(rOf(y, -HALF)), y, zBack, 0, 0, -1));
-    backR.push(push(Math.abs(rOf(y, HALF)), y, zBack, 0, 0, -1));
+    const yl = yOf(0, l);
+    const yr = yOf(NA, l);
+    backL.push(push(-Math.abs(rOf(yl, -HALF)), yl, zBack, 0, 0, -1));
+    backR.push(push(Math.abs(rOf(yr, HALF)), yr, zBack, 0, 0, -1));
   }
   for (let l = 0; l < BODY_V; l++) {
     idx.push(backL[l], backR[l], backL[l + 1], backL[l + 1], backR[l], backR[l + 1]);
@@ -841,38 +1161,43 @@ function buildBody(
     idx.push(a0, a1, b0, a1, b1, b0);
   };
 
-  // Top of the pedestal: a horizontal ring at the lip, from the bowl outward to
-  // the wall, all the way round. Its inner edge is found by raycasting the bowl a
-  // few millimetres BELOW the lip, where the front wall of the bowl still exists.
-  // Probing above it looks equally reasonable and is catastrophic: above the lip the
-  // bowl is open, so the ray sails over the front wall and stops on the back wall
-  // instead, and the deck then paves the entire cavity into a flat shelf.
+  // Top of the solid: the strip of ceramic between the outer wall and the cavity,
+  // at each angle's own top height. Its inner edge is found by raycasting the bowl a
+  // few millimetres BELOW that height, where the wall of the bowl still exists.
+  // Probing above it looks equally reasonable and is catastrophic: above the opening
+  // boundary the bowl is open, so the ray sails over the near wall and stops on the
+  // far one instead, and the deck then paves the cavity into a flat shelf.
   {
-    const steps = BODY_A * 2;
     // Width limited. The raycast alone is too fragile to size this: at angles where
-    // the ray passes clear of the bowl's front wall it carries on and stops on the
-    // back wall instead, which asks for a deck a third of a metre wide, and mixing
-    // those in with the angles that do hit produced a scalloped plate lying across
-    // the opening. Physically this face is the rim of the front lip and is about as
+    // the ray passes clear of the near wall it carries on and stops on the far side
+    // instead, which asks for a deck a third of a metre wide, and mixing those in
+    // with the angles that do hit produced a scalloped plate lying across the
+    // opening. Physically this face is the top edge of the ceramic and is about as
     // wide as the ceramic is thick, so the raycast is only allowed to make it
     // narrower, never wider.
-    const maxDeck = p.wallThickness + p.clearance + 0.012;
+    //
+    // Sized to the rim, not to the wall. The cap is only a horizontal face where the
+    // top edge is level; where the edge is climbing it is a near-vertical strip, and
+    // a strip 52 mm wide climbing steeply is a flange sticking out of the fixture.
+    // The rim of a real casting is a few millimetres of glaze.
+    const maxDeck = p.rimThickness + p.clearance;
     const outs: number[] = [];
     const ins: number[] = [];
-    for (let a = 0; a <= steps; a++) {
-      const t = -HALF + (a / steps) * Math.PI;
-      const rOut = rOf(yTop, t);
-      const hit = cavityRadius(yTop, t, 0.004);
+    for (let a = 0; a <= NA; a++) {
+      const t = angOf(a);
+      const y = topY[a];
+      const rOut = rOf(y, t);
+      const hit = cavityRadius(y, t, 0.004);
       const rIn = Math.max(
         0,
         Math.max(rOut - maxDeck, hit === null ? 0 : Math.min(hit, rOut - 0.001))
       );
       const sx = Math.sin(t);
       const sz = Math.cos(t);
-      outs.push(push(rOut * sx, yTop, zBack + rOut * sz, 0, 1, 0));
-      ins.push(push(rIn * sx, yTop, zBack + rIn * sz, 0, 1, 0));
+      outs.push(push(rOut * sx, y, zBack + rOut * sz, 0, 1, 0));
+      ins.push(push(rIn * sx, y, zBack + rIn * sz, 0, 1, 0));
     }
-    for (let a = 0; a < steps; a++) quad(outs[a], outs[a + 1], ins[a], ins[a + 1]);
+    for (let a = 0; a < NA; a++) quad(outs[a], outs[a + 1], ins[a], ins[a + 1]);
   }
 
   return {

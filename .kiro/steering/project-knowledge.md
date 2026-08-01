@@ -14,9 +14,16 @@ because each item in them cost real time to find, and most of them look correct.
 |---|---|
 | `npm run dev` | Vite dev server |
 | `npm run build` | `tsc --noEmit && vite build` |
-| `npm run validate` | 43 physics checks against published references. ~85 s. **Authoritative.** |
+| `npm run validate` | 46 physics checks against published references. ~105 s. **Authoritative.** |
 | `npm run shoot` | Screenshot the **running app** headlessly. See below. |
 | `npm run render` | Offline render of the fixture **meshes only**. Fast, but not the product. |
+| `npx tsx tools/fixture-lab.mts <id> [--full] [--out x.png]` | **Shape a fixture.** Merges `tools/tuned/<id>.json` over a preset, prints the admissibility metrics, writes a 4-view PNG. `--full` runs all four grid resolutions. |
+| `npx tsx tools/thumbsheet.mts [--scale 3] [--out x.png]` | **Check the picker.** Contact sheet of all six thumbnails, rendered by calling `renderFixtureThumbnail` — the function the cards call — and composited on the panel's own background. Prints ink coverage and mean luminance per card. |
+
+`fixture-lab` is the right tool for geometry work: no browser, a second per iteration,
+and it prints the numbers that decide whether a shape is legal rather than only
+showing you a picture. It reads an override file so several people (or several
+subagents) can shape different fixtures without touching `presets.ts` or each other.
 
 `npm run shoot` needs `npx playwright install chromium` once (~88 MB).
 
@@ -38,7 +45,7 @@ splash flying straight through the fixture body.
 
 Rules:
 
-1. **`npm run validate` passing is not visual verification.** None of its 43 checks
+1. **`npm run validate` passing is not visual verification.** None of its 46 checks
    look at whether anything is coherent on screen.
 2. **`npm run render` is not visual verification either.** It shows meshes, not the app.
 3. To claim the product looks right, use `npm run shoot` and *look at the image*.
@@ -56,6 +63,16 @@ Rules:
 7. **Compare fixtures at the same aim, stand-off *and* seed.** All three move the
    headline figure a long way, and one of them silently reversing a comparison is how a
    previous headline claim survived being wrong (see Traps 14 and 16).
+8. **The picker's thumbnails are their own renderer, and it is not the viewport's.**
+   The cards go through `softRaster`, the viewport goes through WebGL shaders. A defect
+   in one is invisible in the other, and that asymmetry cost real time: the rasteriser
+   was inventing horizontal stripes on every fixture while the viewport looked fine, so
+   the stripes read as a geometry problem for a long while. `tools/thumbsheet.mts` calls
+   the picker's own function, so what it writes is what the cards show.
+9. **Diagnose a suspicious surface feature by hiding things, not by staring.**
+   `--overlays shell=0` leaves the interior alone, which is how the "bright flap curling
+   out of the bowl" was finally pinned on the casting's rim band rather than on the
+   loft. Four wrong hypotheses were tried first, each of which looked right.
 
 ---
 
@@ -67,7 +84,8 @@ geometry/   profile   sagittal 2-D section (ProfileParams, buildProfile)
             surface   UrinalSurface — THE WETTED INTERIOR, structured (u,v) loft
             wrap      side-edge stand-off along the profile
             shell     exterior casting (ShellParams, buildShell -> ShellMesh)
-            collider  SolidCollider / MeshCollider — makes any mesh collidable
+            fittings  flush valve, supply pipe, outlet spud — SOLID, collidable
+            collider  SolidCollider / MeshCollider / CompositeCollider
             presets   the 6-model fixture library
             bvh       ray/triangle acceleration
 sim/        simulation  owns surface + casting + castingCollider; SimConfig
@@ -75,8 +93,12 @@ sim/        simulation  owns surface + casting + castingCollider; SimConfig
 render/     sceneView, fixtureView, dropletView, streamView, colormap
             softRaster  software rasteriser shared by thumbnails and tools/preview
 ui/         app, controls, charts, thumbnail, automation
-validation/ suite (39 checks), runCli
-tools/      shoot.mts (headless app screenshots), preview.mts (offline meshes)
+validation/ suite (46 checks), runCli
+tools/      shoot.mts      headless screenshots of the running app
+            thumbsheet.mts contact sheet of the picker's own thumbnails
+            fixture-lab.mts shape bench: metrics + 4-view render, no browser
+            preview.mts    offline render of the meshes
+            png.mts        shared PNG encoder and blit
 ```
 
 ### Load-bearing contracts
@@ -95,6 +117,12 @@ tools/      shoot.mts (headless app screenshots), preview.mts (offline meshes)
   which throws a corona by the same threshold as the interior and books only the
   remainder to the zone. It used to be booked and killed outright, which was the single
   largest error in the model. See Trap 14.
+- **The metalwork is solid too.** `src/geometry/fittings.ts` builds the flushometer,
+  its supply pipe and the outlet spud, and `Simulation.castingCollider` is a
+  `CompositeCollider` over casting + fittings. They stand above the bowl, closer to
+  the user's aim than any ceramic, and a level stream hits the valve body. Anything
+  visible that cannot be hit silently deletes liquid — that is the fault that made
+  the casting an absorber, so do not demote them to scenery.
 - **Aim is two-dimensional and lives on `(u, v)` of the wetted surface.**
   `SimConfig.aimTargetV` walks down the profile, `aimTargetU` across the width.
   `Simulation.aimAtSurfaceUv(u, v)` solves the launch angles ballistically;
@@ -118,6 +146,35 @@ tools/      shoot.mts (headless app screenshots), preview.mts (offline meshes)
 `classic-bowl` · `flat-wall` (square slab, also the flat-wall splash control) ·
 `stall-urinal` · `trough` · `compact-waterless` · `nautilus-tall` (constant-angle).
 
+Four of them are now dimensioned against named real products, and the reference is
+recorded in the preset's comment so it can be checked rather than trusted:
+
+| preset | reference product | envelope W×D×H mm | nominal |
+|---|---|---|---|
+| `classic-bowl` | American Standard Washbrook 6501 wall-hung washout | 358×388×640 | 356×356×~650 |
+| `stall-urinal` | American Standard Stallbrook 6400 / Kohler Branham K-25039-T | 458×382×974 | 457×381×972 |
+| `trough` | Pland Bremen 1500 / Acorn 5-foot stainless | 1485×417×290 | 1200–1500 × 400–500 × 170–300 |
+| `compact-waterless` | Sloan WES-1000 waterfree | 362×497×681 | 365×498×679 |
+
+`flat-wall` is a deliberate control rather than a product, and `nautilus-tall` is
+generated, so neither is dimensioned to a catalogue.
+
+Two per-preset fields carry things that genuinely differ by model:
+
+- **`fittings?: Partial<FittingsParams>`** — `compact-waterless` sets
+  `flushValve: false`, because a waterless urinal has no water supply at all and the
+  absence of a flushometer *is* the product. The trough and the stall adjust
+  `pipeRise` for their height.
+- **`defaultAimV?: number`** — one global fraction cannot mean the same thing on a
+  290 mm trough and a 974 mm stall. At the old shared 0.18 the stall was struck at
+  **75°**, near normal incidence and the worst angle on the fixture, purely because
+  the same fraction lands somewhere else on a fixture three times the height. Measured
+  angle-vs-aim, the defaults are: classic-bowl 0.26 (55°), flat-wall 0.34 (33°),
+  stall 0.50 (42°), trough 0.22 (52°), compact 0.26 (63°), nautilus 0.18 (25°).
+  Two are worth knowing: the oval bowl is 55° *anywhere* from v = 0.10 to 0.38 — it is
+  a uniformly steep target, which is the mechanism its `expectation` text describes —
+  and the trough has so little wall that v = 0.30 already reads 80°.
+
 **`src/validation/suite.ts` hardcodes the ids `classic-bowl`, `flat-wall` and
 `nautilus-tall`.** Renaming or removing them breaks the suite. `flat-wall` must keep a
 *planar* back wall — the headline A/B claim depends on it meeting the stream near
@@ -129,6 +186,22 @@ convenience; see Trap 16.
 
 `UrinalPreset.shell?: Partial<ShellParams>` gives each model its own exterior
 character. That is the extension point for casting style.
+
+**Casting style, from matching the American Standard reference photographs.** The
+exterior is fitted as a support function over the interior (Trap 5, 6), so it
+starts out as the interior's convex hull and the parameters pull it away from that.
+Two of them decide whether the result looks like sanitaryware or like a cauldron:
+
+- `sectionSmoothing` relaxes the fitted plan section toward a circle. At the old
+  values of 5–7 the bowl came out a **round pod**, which is most of what "your
+  urinals look bad" was about. Real washout urinals are squarish in plan: use 0–3.
+- `bulge` adds mid-height fullness. Real fixtures are near-straight-sided; keep it
+  at or near 0. It was 0.014–0.02.
+- `bottomExtension` + `bottomTaper` make the nose below the bowl. A wall-hung bowl
+  wants a long narrow nose (0.10 / 0.17); a stall urinal is a straight column to
+  the floor, so it wants almost none (0.02 / 0.94).
+- `rimThickness` ~0.022–0.026 with `rimBandWidth` ~0.03 gives the chunky rolled rim
+  flange every real fixture has. It was 0.014, which read as a paper edge.
 
 ---
 
@@ -293,6 +366,62 @@ outer side walls. All of it was being counted as reachable, so the mean angle an
 fraction over the criterion were averages taken partly over ceramic the stream cannot
 touch. It now takes an optional `SolidCollider`.
 
+**25. The notch is `wrapDepth − drainZ`, and that makes it tunable without touching
+the wrap.** Discovered independently by three people shaping different fixtures, and
+it is the most useful geometry fact on this project. The `u = ±1` side edge of the
+opening bottoms out wherever the wrap fade has reached zero, which `wrap.ts` places
+about 15 mm of arclength short of the sump low point — so the lowest point of the
+opening's edge is the *profile's own depth at the drain*. Move the outlet forward and
+the edge has less to dive back to. Measured, by doing only that plus the
+`sumpFrontFraction` needed to unclamp it: classic-bowl 131–138 → 47–60 mm, stall
+91–105 → 34–48 mm, compact-waterless 149–154 → 48–57 mm. All at 0 flipped normals and
+0 degenerate cells, at every resolution. `drainZ` has a clamp ceiling of
+`bowlDepth × sumpFrontFraction − 30 mm`, so raising one without the other silently does
+nothing — that exact mistake cost a round trip here.
+
+**26. `openMouth` equals `bowlDepth` identically. It is not a defect metric.**
+`buildProfile` pins the rim centreline at `z = 0` for planar and concave back walls,
+and the far end of the boundary loop is the lip tip at `z ≈ bowlDepth`, so the loop
+must span the full depth. It reads 300/313/348/350/430 mm on the five non-generated
+presets — exactly their bowl depths. No parameter moves it, and *deepening* a fixture
+toward its real product dimension necessarily raises it. Do not treat a rising
+openMouth as a regression, and do not spend time tuning it. The only lever is
+`hoodDepth`, which throws the `v = 0` row forward — and that is a near-horizontal
+surface at the point where the wrap is at maximum, i.e. the Trap 3 cancellation
+mechanism with no fade protecting it. The notch (Trap 25) is the metric that actually
+measures the defect.
+
+**27. A test must not encode a dimension it does not own.** The "peeing on the fixture"
+check pinned −30° elevation for "in the bowl" and 0° for "on the fixture". Those meant
+what they said on a 526 mm body; on the reshaped 640 mm body with a 375 mm front rise,
+−30° clips the front rim on the way in, so both cases became partly rim strikes and the
+ratio collapsed from 7.2× to 1.5× **with no change to the physics at all**. It read as a
+physics regression and was a stale constant. It now finds the elevation by scanning for
+`traceAim().blocked` and asserts that it really is blocked, so it follows the geometry.
+Related: how far onto the fixture you aim matters a lot — grazing the rim at −8° reads
+1.3× the in-bowl figure, +16° reads 4.9×.
+
+**23. The contact line applies at the boundary of the patch, not just between
+cells.** `FilmSolver.substep` tested pinning only when the neighbour *existed and
+was dry*; at `u = ±1` there is no neighbour, so no test ran and any film with
+outward velocity poured over the rim however thin it was. Measured on the default
+bowl: **57 mL of a 300 mL void ran off the side edges — 17.8% of everything that
+landed** — and was released as tens of thousands of drips down the outside. On
+screen it read as a permanent waterfall fed by a trickle, which is what prompted
+"the fluid flow should be based on the amount". Applying `canAdvance` at the
+boundary halved it to 8.4%. The remaining 8.4% has not been chased; it is
+concentrated where the stream actually strikes, and may be legitimate.
+
+**24. Anything that removes liquid must be added to the closure sum.**
+`Metrics.escapedVolume` was declared, reset and *reported* — but never
+incremented, and it was missing from `Simulation.report()`'s `accounted` total. So
+every droplet thrown clear of the region of interest vanished unaccounted. Wholly
+invisible while splash stayed inside the bowl, which is why it survived: closure
+read 0.0000% for every ordinary case. Aim at the flush valve instead and splash
+leaves the box, and the balance drifted to 0.0718%. Fixed by having `cullOutside`
+return the volume it killed. There is a check for it; the lesson generalises — a
+field that is reported but never written is worse than no field.
+
 **22. Correlations have a range of validity; clamp to it.** The Cossali wetted-wall
 threshold `2100 + 5880·δ^1.44` was fitted for `δ = h/d` up to order one and rises without
 bound. Extrapolated into the sump it claimed deeper liquid is ever harder to splash — at
@@ -300,6 +429,105 @@ bound. Extrapolated into the sump it claimed deeper liquid is ever harder to spl
 of what a plunging jet does. Past ~1 diameter the mechanism becomes cavity collapse and a
 Worthington jet and the threshold flattens. `WET_SPLASH_K_FILM_MAX_DELTA` holds δ at the
 edge of the evidence.
+
+**28. `softRaster` shades from vertex normals. Do not let it fall back to face
+normals.** It ignored the vertex normals both meshes carry and lit every triangle flat.
+That is not a cosmetic shortcut: the casting's exterior is fitted in height bands, so
+flat shading drew each band as its own facet and all six fixtures wore horizontal
+corduroy that is not on the object. Because the WebGL viewport was smooth, the stripes
+read as a geometry fault for a long time. Two-sided — the normal is flipped toward the
+eye — because the interior loft is a single sheet seen from inside the bowl and a
+one-sided term drops half of every fixture into silhouette.
+
+**29. The casting's envelope must be fitted per *edge*, not per vertex.** `buildShell`
+binned each interior vertex into the nearest height band. Interior rows are uniform in
+arclength, not in height, so wherever the profile is steep — the whole back wall —
+consecutive rows are further apart in y than the bands are: bands between two rows got
+nothing and were filled by copying a neighbour, bands that caught a row jumped out to
+it, and the raw fit is used again as a floor under the smoothed one so no amount of
+smoothing removed it. Now every grid edge raises every band it crosses, at the height
+where it crosses. Two details are load-bearing. (a) An edge crossing *exactly one* band
+is the common case, not a degenerate one — excluding it (`hi <= lo` instead of
+`hi < lo`) makes the whole mechanism a near no-op, which is how this looked fixed while
+the ribbing metric barely moved. (b) Vertices are spread into both bracketing bands only
+where their column **turns back in height**; spreading every vertex guarantees
+containment and reintroduces the ribbing as a ±2 mm alternation, because a vertex
+part-way above a band line raises that band to its own reach. `ShellMesh.fit.protrusion`
+is the check that the turning-point rule is sufficient, and `fit.ribbing` measures the
+alternation. Both print in `fixture-lab`.
+
+**30. Measure ribbing as *alternation*, not as the largest second difference.** A urinal
+has real creases in it — the corner where a vertical wall meets the sump, the fast taper
+of the bottom cap, the 68 mm step where the front lip ends. Those are single-signed and
+belong there, and a max-second-difference metric is dominated by them: it read 36 mm on a
+casting whose visible ribbing was gone. Taking the smaller of each consecutive pair of
+opposite-signed second differences scores designed creases near zero.
+
+**31. The patch's `u = ±1` boundary is not the rim of the opening.** It is the profile
+swept out to the full half width, so it runs from the top of the back wall all the way
+*down* through the sump and back up to the lip — on the default bowl it reaches
+y = −28 mm at 21° off centre. Anything that treats the boundary loop as the mouth's edge
+gets that point. Deriving the casting's top height from the lowest loop height per angle
+pins the casting to the sump floor at that angle and the solid collapses to a point,
+which renders as a large triangular blade sticking out of the front of the fixture. The
+`v = 0` and `v = 1` rows *are* genuine top edges and are safe to use, but only where they
+coincide with the outer wall — at θ = 0 the rim is 14 mm from the axis while the wall is
+340 mm out, so flooring to boundary points regardless of radius drags the casting up to
+rim height and paves the mouth over.
+
+**32. The solid body's top follows the opening, angle by angle.** Not one height. A
+constant top at the front-lip height is right at the front and nowhere else, and at the
+sides it leaves a horizontal annulus over solid ceramic with no cavity to trim it
+against — a 50 mm plate standing proud of the fixture like a collar on a plant pot, with
+the thin back panel apparently balanced on it. The test per angle is: stand on the outer
+wall at a height and look straight down; a hit a long way below means the wall is out
+over the open mouth. Smooth the result hard (24 passes) — the raw test steps 115 mm over
+one or two angular columns, and the strip capping the wall then twists into a flange.
+Cap that strip at `rimThickness + clearance`, not at `wallThickness + clearance + 12 mm`:
+where the top edge is climbing it is a near-vertical face, and 52 mm of it reads as a
+flange.
+
+**33. Facing backward is not the same as being at the back.** The thickness exemption in
+`buildShell` keyed off the outward normal's −z component alone. The rim wraps forward to
+275 mm at the sides, and those points still face backward and upward, so they were
+granted the full 300 mm thickness cap 275 mm from the mounting plane — and the rim band,
+whose width *is* that thickness, drew the result edge on: a pair of thin plates out of
+the sides of the fixture like carrying handles. The exemption is about position, so it is
+now gated on distance from the mounting plane as well.
+
+**34. Cull the casting skin where *both* rows are below the cut, not either.** With
+"either", the one row straddling the cut is emitted, and at the front that row is the
+lip: the profile turns over there, so the row below the lip tip is already under the cut
+while the tip is above it. The result is a free-standing ring of offset quads around the
+lip that renders as a bright flap curling out of the bowl. The lip keeps its visible
+edge from the rim band, which runs round the whole loop.
+
+**35. A physically based metal with no environment renders black.** The flushometer is
+`metalness: 0.92`, and a metal has no diffuse response — everything you see on chrome is
+reflected surroundings. With two directional lights and no `scene.environment` it drew as
+a black silhouette over a white fixture and looked like a hole in the scene. Lowering the
+metalness fixes the symptom by making it not be metal; a PMREM'd `RoomEnvironment` fixes
+the cause, and the glaze picks up a specular sheen from the same source. Do not remove it
+without replacing it.
+
+**36. Frame offline views by projecting the corners, not by scaling a dimension.**
+`framedThreeQuarterView` used `1.68 ×` the largest box dimension. That is a guess loose
+enough for the worst case and therefore far too loose for every other, and it ignores
+both the frame's aspect ratio and which axis binds — the fixtures are portrait, so height
+binds. They covered 11–16% of their cards. Projecting the eight corners and shrinking the
+distance until they just fit took it to 16–26%, and it also stopped `compact-waterless`
+being silently *cropped*, which the loose guess was doing in the other direction.
+
+**37. A validation check must select geometry by something the geometry owns.** The
+"peeing on the fixture" check scanned aim elevation in degrees and took the highest
+blocked angle. That worked only while the casting had the Trap 32 collar for a level
+stream to hit; on the corrected casting no elevation between +20° and −20° lands on the
+ceramic at all — above −14° the stream strikes the flushometer over the rim, a 32 mm tube
+that most of the flow goes past, and below it the stream enters the bowl. It failed at
+2.96× against a 3× threshold with nothing wrong in the solver. It now walks
+`aimTargetV`, which is a *fraction of the profile* and so means the same thing on every
+fixture, and requires the hit to be at or below `casting.max.y`. This is the same lesson
+as Trap 27, found again in the same check.
 
 ---
 
@@ -316,7 +544,20 @@ Re-measure with a throwaway script over `PRESETS` × resolutions if you touch
 `surface.ts`, `wrap.ts` or any preset's `wrapDepth` / `taperExponent` / `widthSump`.
 Those three quantities are what move it.
 
-`npm run validate` → **43/43** (~85 s). `npm run build` clean.
+`npm run validate` → **46/46** (~100 s). `npm run build` clean.
+
+Peeing *on* the fixture rather than into it, oval bowl, 150 mL, seed 4242, 48×96.
+Into the bowl at the preset's own default aim (v = 0.26, 55° on the interior):
+**6685 µL/L**. Onto the casting at v = 0.50, which the trace reports blocked 393 mm above
+the datum: **291 446 µL/L**, 43.6×. Walking v forward from there, 0.55 → 247 669,
+0.60 → 54 795, 0.65 → 20 053, 0.70 → 8925: the penalty is enormous but it falls away
+fast, because past the front rim the stream starts clearing the fixture again. Closure
+stays 0.0000% in all of them, which it did not before Trap 24 was fixed.
+
+Aiming by raw elevation instead reaches the **metalwork**, not the ceramic — see Trap 37.
+For the record, at 150 mL/seed 4242: +14° gives 56 634 µL/L (8.5×) and +20° gives
+19 788 (3.0×), both on the flush valve; −14° grazes the top of the casting at 7717 (1.2×);
+−16° and below enter the bowl.
 
 Splashback reference points, oval bowl, default posture, 300 mL void, seed 12345:
 aim v = 0.18 gives 3234 µL/L all-in — 1222 µL/L during sustained flow against
@@ -324,14 +565,117 @@ aim v = 0.18 gives 3234 µL/L all-in — 1222 µL/L during sustained flow agains
 rim, gives 24 715 µL/L and is the worst aim available. All four figures were unavailable
 before this pass: the tail split did not exist and the rim strike reported zero.
 
-Fixture envelopes (W × D × H mm): classic-bowl 401×363×475, flat-wall 368×363×528,
-stall-urinal 448×393×1010, trough 942×347×410, compact-waterless 360×392×471,
-nautilus-tall 425×511×596. Real references: TOTO wall-hung 320×340×540, RAK Jazira
-355×330×445, ADA rim limit 430 mm above floor.
+Fixture envelopes and the notch, after the reshape. All six are 0 flipped normals,
+0 degenerate cells, no self-intersection and no clamped parameters at 48×96, 56×104,
+72×132 and 112×200:
+
+| preset | W×D×H mm | notch | openMouth | protrude | ribbing |
+|---|---|---|---|---|---|
+| classic-bowl | 358×388×640 | 47–60 mm | 350 mm | 0–4.1 mm | 5.6–17.4 mm |
+| flat-wall | 392×371×548 | 52 mm | 300 mm | 0 mm | 39.9–40.3 mm |
+| stall-urinal | 458×382×974 | 34–48 mm | 313 mm | 5.0–7.4 mm | 16.6–17.1 mm |
+| trough | 1490×419×290 | 0 mm | 350 mm | 93–95 mm | 228 mm |
+| compact-waterless | 359×497×681 | 48–57 mm | 430 mm | 8.2–11.4 mm | 64–70 mm |
+| nautilus-tall | 365×526×627 | 299–301 mm | 299–301 mm | 1.1 mm | 0.7–0.8 mm |
+
+`protrude` and `ribbing` are the two casting-fit numbers `fixture-lab` prints; see
+Traps 29 and 30 for what they mean and why the ribbing one counts alternation. `nautilus`
+is the reference for "clean": 0.8 mm. The residue on the others is concentrated at one
+place each and is diagnosed, not mysterious — `fixture-lab` prints the height and
+direction. classic-bowl 380 mm / −26°, flat-wall 302 mm / −23°, stall 308 mm / −26° and
+compact 421 mm / +15° are all the **front-lip step**, where the support function has a
+genuine ~68 mm discontinuity and the smoothing plus the raw floor ring around it. The
+trough's 228 mm at 122 mm / −60° is different and structural: it is 1.49 m wide and the
+envelope is a polar `radius(y, θ)` about `x = 0`, which is the wrong parameterisation for
+something that elongated. Both are visible in the render only as a faint crease; neither
+is the corduroy that used to be there.
+
+`nautilus-tall` is the only one still carrying a large notch, and outstanding item 0
+explains why it is structural rather than untuned. ADA reference points: rim 430 mm max
+above floor, depth 345 mm minimum from
+the outer rim face to the wall. Only `classic-bowl` and `trough` currently meet the
+depth minimum; the stall is the non-accessible tall variant by design.
+
+**One physics-relevant consequence of the reshape:** `classic-bowl` now has a broad
+washout floor with the outlet forward of centre (`widthSump` 0.14 → 0.185, `drainZ`
+0.10 → 0.232), which is correct for the reference product but is a materially
+different drainage geometry. Its residual volume and clear time moved with it. The
+suite's standing-pool checks use `defaultSurfaceParams()` rather than this preset, so
+they are unaffected — but if that ever changes, Trap 12 applies.
 
 ---
 
 ## Outstanding work, in priority order
+
+**0. The opening is not a mouth (low now — addressed on all six, one model excepted).**
+
+Fixed across the library *without* touching the wrap law, using Traps 25 and 3
+together. Five of six are now 0–60 mm, against 90–368 before:
+
+| preset | before | after | what did it |
+|---|---|---|---|
+| classic-bowl | 131–138 | 47–60 | `drainZ` forward (Trap 25) |
+| flat-wall | 103–112 | 52 | `wrapDecay` 1.0 → 0.6 |
+| stall-urinal | 91–105 | 34–48 | `drainZ` forward |
+| trough | 0 | 0 | already `backWallTilt` |
+| compact-waterless | 149–154 | 48–57 | `drainZ` forward |
+| nautilus-tall | 356–368 | **299–301** | `wrapDecay` 1.15 → 0.95, and stuck there |
+
+Which lever works depends on the back wall, and this is the useful generalisation:
+
+- **Curved or tilted back wall** → `drainZ` forward (Trap 25). The profile is already
+  moving forward, so raising its depth at the sump lifts the whole side edge.
+- **Dead vertical wall** (`flat-wall`) → `drainZ` barely helps, because the profile is
+  at `z = 0` for the entire height, so the minimum falls on the *wall* rather than at
+  the sump. `wrapDecay` is the lever: hold the wrap open further down. Took it 103 → 52
+  where `drainZ` alone had only reached 79.
+- **Generated wall** (`nautilus-tall`) → neither works well, and it is the one genuine
+  remaining case. `buildProfile` pins the constant-angle wall foot at
+  `z = min(maxWallRun/2, 0.02)` — **a hardcoded 0.02 that no preset value can lift** —
+  so the wall always returns to the mounting plane at the throat and the side edge
+  spans the full depth regardless (`notch == openMouth` exactly, on this model alone).
+  `drainZ` moved it 356 → 344. `wrapDecay` 0.95 reaches 300 and is where it stops:
+  0.85 reaches 290, and **0.6 reaches 282 but grows 26 degenerate cells at 72×132 and
+  153 at 112×200 while staying perfectly clean at 48×96 and 56×104** — Trap 3, hiding
+  from anyone who does not run every resolution. Lifting that hardcoded foot cap is the
+  only thing left, and it is a change to the generator, not a tuning value.
+
+Any further work here must beat the current baseline — **0 flipped normals and 0
+degenerate cells on all six presets at every resolution from 48×96 to 112×200** — and
+must re-run the seed and stand-off sweeps, because enclosure is what stops splash
+leaving and the A/B claim rests on it. It survived this pass: 46/46 with both control
+fixtures reshaped.
+
+The `u = ±1` boundary of the loft *is* the rim of the opening. It should be a
+nearly planar, roughly vertical oval facing the user. It is not. The side edge
+stands `wrapDepth` forward at the rim, then the wrap fades to zero before the sump
+(which Trap 3 requires), so the edge **dives back almost to the mounting plane at
+throat height** and comes forward again up the front rise. The opening is therefore
+a twisted loop spanning the full depth of the bowl, and the fixture renders as a
+scroll or a scoop with a slot cut in its side rather than as a bowl with a mouth.
+
+Measured with `tools/diag-grid.mts` (recreate it; it also prints the Trap 3 quality
+metrics), backward excursion of the side edge and z-spread of the whole boundary
+loop:
+
+| preset | notch | opening z-spread |
+|---|---|---|
+| classic-bowl | 131–138 mm | 280 mm |
+| flat-wall | 103–112 mm | 300 mm |
+| stall-urinal | 91–105 mm | 320 mm |
+| trough | 0 mm | 260 mm |
+| compact-waterless | 149–154 mm | 310 mm |
+| nautilus-tall | 356–368 mm | 356–368 mm |
+
+A real fixture's mouth spreads maybe 40–60 mm in z. `trough` scores 0 on the notch
+only because its `wrapDepth` is 0.05, i.e. it barely wraps at all.
+
+The obvious law — side edge on the front plane, `wrap(v) = frontPlane −
+profile.z(v)` — is exactly the case Trap 3 says collapses cells across the
+horizontal sump floor, so it must be measured, not assumed. Baseline to beat, at
+every resolution from 48×96 to 112×200 and on all six presets: **0 flipped normals,
+0 degenerate cells.** Re-run the seed sweep and the stand-off sweep afterwards too,
+because enclosure is what stops splash leaving and the A/B claim rests on it.
 
 **1. `FixtureExtent` (high).** Every `npm run shoot` line prints
 `castingAheadOfCapture`, currently 0–44 mm depending on model. `CaptureScene` still
@@ -368,15 +712,34 @@ for meshes that already have an exterior. Two import paths, easiest first: fit t
 parametric loft to an imported mesh (keeps the film solver intact, lossy), then native
 imported grids (needs the solver to accept a general grid).
 
-**4. Hardcoded constants (medium).** `BANDS`, `ABINS`, `BODY_A`, `BODY_V` in `shell.ts`
-are module constants, not parameters. Inline magic numbers there too: `0.7 / convexity`
-curvature cap, `1.004` push-out, `0.0025` march step, `smoothstep(0.35, 0.85)` for
-backness. `THUMB_RES` in `ui/thumbnail.ts`; card size in `app.ts`.
+**4. Hardcoded constants (medium).** `BANDS` (112), `ABINS` (49), `BODY_A` (44),
+`BODY_V` (96) in `shell.ts` are module constants, not parameters. They were 56/33/34/56
+and were raised because they are a *sampling rate* on a bilinearly interpolated table, so
+the casting carries a crease at every band and bin; at 56 bands over a 640 mm fixture
+those creases are 11 mm apart, which is visible. Cost is O(BANDS × ABINS²) once per
+rebuild, a few hundred thousand operations, so there is no reason to be frugal. Inline
+magic numbers there too: `0.7 / convexity` curvature cap, `1.004` push-out, `0.0025`
+march step, `smoothstep(0.35, 0.85)` for backness, the 24 smoothing passes on `topY`.
+`THUMB_RES` in `ui/thumbnail.ts`; card size in `app.ts`, which `tools/thumbsheet.mts`
+duplicates and must be kept in step with.
 
-**5. Interior side-wall seam artifact (low).** Visible in three-quarter shots of
-`classic-bowl`. Not diagnosed.
+**5. Per-model shape work still outstanding (medium).** The casting construction is sound
+now; two presets are still not their reference product. `compact-waterless` is bulbous and
+497 mm deep with a 430 mm openMouth — a real waterless unit (Falcon, Sloan) is a compact
+~360 × 350 × 470 with a narrow bowl and a cartridge at the bottom, so its profile wants
+much less forward lean. `trough` has small V-notches at its end caps and hits the polar
+envelope's limit (Trap 29 table). `trough` should also have a sparge pipe along its length
+rather than a single flushometer in the middle.
 
-**6. `shell.ts` structural assumptions (low, but blocks imports).** It assumes symmetry
+**6. Interior side-wall seam artifact (low).** Visible in three-quarter shots of
+`classic-bowl`. Not diagnosed. Related and larger: with `--overlays shell=0` the interior
+is visibly a *saddle*, not a basin — the loft's half width narrows at the sump, so the
+`u = ±1` edges pinch in and the bowl has no side walls in its front half. The casting
+hides it, and Trap 9 is the splash consequence, but it is the reason the interior alone
+does not look like a bowl. Closing it needs a closed ring per height instead of a strip
+per profile station, which is the `FixtureGeometry` work in item 3.
+
+**7. `shell.ts` structural assumptions (low, but blocks imports).** It assumes symmetry
 about `x = 0`, a flat wall-mounted back plane, exactly one forward-facing opening above
 one front lip, and a convex section. A corner unit, a floor-standing pedestal, an
 asymmetric model or a two-opening model breaks it.
@@ -390,6 +753,14 @@ with real rendered thumbnails (`src/ui/thumbnail.ts`, painted one per idle tick,
 each). Then the remaining panel — 24 controls opening flat, with no indication which
 three mattered — was cut to **5 sliders visible by default** out of 21 present.
 
+The picker's cards are **square** (126 × 126), not 4:3. Every fixture is taller than it is
+wide — the stall is 2.7× — and the thumbnail is framed to the card, so a landscape card
+spends its area on background either side and shrinks the object to fit the short axis.
+Square costs three rows of picker height and buys about a third more drawn fixture. The
+thumbnails include the metalwork, because a flushometer is most of what makes a urinal
+recognisable at 126 px — and because its *absence* is recognisable too: `compact-waterless`
+sets `fittings.flushValve = false`, which reads instantly next to five that have one.
+
 Left panel, in order: **Fixture** (picker) · **Aim** · **Stream & posture** (peak flow,
 stand-off, exit height) · **Fluid & wall material** (two selects) · **View** (collapsed)
 · **Advanced** (collapsed).
@@ -402,11 +773,39 @@ for auditability, not for use — **do not remove it**; the model's credibility 
 those numbers being reachable.
 
 `Aim` is the promoted section, because aim is the most sensitive input in the model and
-was previously two abstract numbers buried among twenty. It has an "Aim by clicking"
-toggle (or hold Shift) that picks a target by raycasting the viewport onto the wetted
-interior, live readouts for where the stream lands and the impingement angle there
-against the 30° criterion, and height/side sliders as the fallback. Picking suspends
-`OrbitControls` while armed so the two gestures never fight.
+was previously two abstract numbers buried among twenty. It has live readouts for where
+the stream lands and the impingement angle there against the 30° criterion, plus
+height/side sliders.
+
+**Aim is a click, not a mode.** A plain click on the fixture sets it; a drag orbits;
+the two are told apart by whether the pointer moved more than 5 px, which is what
+every 3-D tool does. It used to be a latch — arm "Aim by clicking", click, then
+remember to disarm or it kept swallowing the orbit gesture — which is three actions
+for the most-used control in the tool. Shift-drag paints aim continuously and
+Shift+arrows nudge it; `A` still gives a sticky mode for anyone who wants one.
+
+### Keyboard
+
+There was none, which for a tool whose main verb is "watch this run" meant a mouse
+trip to the bottom of the window every time. `Space` play/pause · `R` restart ·
+`S`/`.` step 0.1 s · `,` step 0.01 s · `[` `]` speed · `1`–`8` surface view · `C`
+cycle camera · `A` sticky aim · `Shift`+arrows nudge aim · `Esc` cancel · `?` the
+list, which is also the `?` button on the viewport.
+
+Two details keep it from being a nuisance, and both are load-bearing: keys are ignored
+while focus is in an input, select or textarea, so the arrow keys still drive whichever
+slider is held; and `Space` is swallowed rather than allowed through, because the
+browser's default is to scroll the panel *and* re-trigger the last clicked button.
+
+Camera presets are buttons on the right edge of the viewport, not inside the collapsed
+`View` section — they were two clicks and a scroll for something used constantly. The
+four corners of the stage are taken (tabs, HUD, legend, warning note), which is why
+they sit centred on the right edge; a bottom bar landed on top of the note.
+
+The aim sweep is **debounced by 130 ms**. It solves and traces thirteen aim points and
+was running synchronously on every aim tick, including every mouse-move while
+painting — that was the lag. `refreshViews()` flushes any pending sweep so automation
+never photographs a half-updated panel.
 
 Right panel gained **When it happens** (sustained versus weak flow, reading live from
 `metrics.perPhase` with a trailing `*` for mid-run figures), and the Impingement section

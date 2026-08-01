@@ -11,8 +11,7 @@
  *   npx tsx tools/preview.mts classic-bowl     one model, four views
  *   npx tsx tools/preview.mts all out.png      explicit output path
  */
-import { deflateSync } from 'node:zlib';
-import { writeFileSync } from 'node:fs';
+import { writePng } from './png.mts';
 import { PRESETS, UrinalPreset } from '../src/geometry/presets';
 import { buildShell } from '../src/geometry/shell';
 import { UrinalSurface } from '../src/geometry/surface';
@@ -29,49 +28,6 @@ const H = 440;
 const BG: [number, number, number, number] = [16, 20, 26, 255];
 const INTERIOR: [number, number, number] = [198, 205, 217];
 const CASTING: [number, number, number] = [233, 237, 244];
-
-function png(rgba: Uint8ClampedArray, w: number, h: number): Buffer {
-  // RGBA in, RGB out: the encoder below writes colour type 2.
-  const raw = Buffer.alloc((w * 3 + 1) * h);
-  for (let y = 0; y < h; y++) {
-    const row = y * (w * 3 + 1);
-    raw[row] = 0;
-    for (let x = 0; x < w; x++) {
-      const s = (y * w + x) * 4;
-      const d = row + 1 + x * 3;
-      raw[d] = rgba[s];
-      raw[d + 1] = rgba[s + 1];
-      raw[d + 2] = rgba[s + 2];
-    }
-  }
-  const crcTable: number[] = [];
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    crcTable[n] = c >>> 0;
-  }
-  const chunk = (type: string, data: Buffer) => {
-    const len = Buffer.alloc(4);
-    len.writeUInt32BE(data.length);
-    const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
-    let crc = 0xffffffff;
-    for (const byte of body) crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-    const crcBuf = Buffer.alloc(4);
-    crcBuf.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
-    return Buffer.concat([len, body, crcBuf]);
-  };
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(w, 0);
-  ihdr.writeUInt32BE(h, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 2;
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk('IHDR', ihdr),
-    chunk('IDAT', deflateSync(raw)),
-    chunk('IEND', Buffer.alloc(0)),
-  ]);
-}
 
 function tile(images: Uint8ClampedArray[], cols: number) {
   const rows = Math.ceil(images.length / cols);
@@ -114,8 +70,18 @@ function build(preset: UrinalPreset) {
   const surface = new UrinalSurface(preset.params, { nu: 56, nv: 104 });
   const shell = buildShell(surface, preset.shell);
   const meshes: RasterMesh[] = [
-    { positions: surface.vertices, indices: surface.indices, tint: INTERIOR },
-    { positions: shell.positions, indices: shell.indices, tint: CASTING },
+    {
+      positions: surface.vertices,
+      indices: surface.indices,
+      normals: surface.vertexNormals,
+      tint: INTERIOR,
+    },
+    {
+      positions: shell.positions,
+      indices: shell.indices,
+      normals: shell.normals,
+      tint: CASTING,
+    },
   ];
   const box = unionBox(surface.bounds(), { min: shell.min, max: shell.max });
   return { surface, meshes, box };
@@ -142,7 +108,7 @@ if (which === 'all') {
     );
   }
   const t = tile(imgs, 3);
-  writeFileSync(out, png(t.px, t.w, t.h));
+  writePng(out, t.px, t.w, t.h);
 } else {
   const preset = PRESETS.find((p) => p.id === which);
   if (!preset) {
@@ -151,6 +117,6 @@ if (which === 'all') {
   const { meshes, box } = build(preset);
   for (const v of views(box)) imgs.push(rasterise(meshes, v, W, H));
   const t = tile(imgs, 2);
-  writeFileSync(out, png(t.px, t.w, t.h));
+  writePng(out, t.px, t.w, t.h);
 }
 console.log('wrote', out);
