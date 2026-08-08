@@ -40,16 +40,79 @@ import { drawFixtureThumbnail } from './thumbnail';
 // Liquid first, and the default. The data overlays are the reason the tool exists,
 // but opening on one of them hid the fluid behind a static colour map and made a
 // working simulation look inert.
+//
+// The labels are one word wherever a word will do. Eight tabs at their old length
+// wrapped onto a second row below about 1400 px, and the second row ran underneath
+// the HUD in the opposite corner -- so on a 1280-wide laptop two of the eight views
+// could not be clicked at all. The full sentence is still on each tab as a tooltip.
 const VIEW_TABS: Array<{ mode: FieldMode; label: string }> = [
   { mode: FieldMode.Liquid, label: 'Liquid' },
-  { mode: FieldMode.Impingement, label: 'Impingement angle' },
-  { mode: FieldMode.FilmThickness, label: 'Film thickness' },
-  { mode: FieldMode.FilmSpeed, label: 'Film speed' },
-  { mode: FieldMode.Residence, label: 'Residence time' },
-  { mode: FieldMode.ImpactVolume, label: 'Arriving liquid' },
-  { mode: FieldMode.SplashOrigin, label: 'Splash origin' },
+  { mode: FieldMode.Impingement, label: 'Impingement' },
+  { mode: FieldMode.FilmThickness, label: 'Film' },
+  { mode: FieldMode.FilmSpeed, label: 'Speed' },
+  { mode: FieldMode.Residence, label: 'Residence' },
+  { mode: FieldMode.ImpactVolume, label: 'Arriving' },
+  { mode: FieldMode.SplashOrigin, label: 'Splash' },
   { mode: FieldMode.Dry, label: 'Dry' },
 ];
+
+/**
+ * The verdict bands, in one place.
+ *
+ * These used to exist only inside `paintReport`, as a chain of ternaries building
+ * a string. The panel now leads with the same verdict live, and two independent
+ * copies of a threshold table is exactly how the headline and the report come to
+ * disagree about the same run. One table, both readers.
+ *
+ * The numbers are the ones the report already quoted: under 100 µL/L is barely
+ * detectable, 600 is noticeable, 3000 and above is a visibly wet trouser leg.
+ */
+const VERDICT_BANDS: Array<{
+  max: number;
+  label: string;
+  tone: 'good' | 'ok' | 'warn' | 'bad';
+  gloss: string;
+}> = [
+  { max: 100, label: 'CLEAN', tone: 'good', gloss: 'negligible splashback on the user' },
+  { max: 600, label: 'ACCEPTABLE', tone: 'ok', gloss: 'noticeable but modest splashback' },
+  { max: 3000, label: 'POOR', tone: 'warn', gloss: 'significant splashback on the user' },
+  { max: Infinity, label: 'BAD', tone: 'bad', gloss: 'the user is being sprayed' },
+];
+
+function verdictFor(microlitresPerLitre: number): (typeof VERDICT_BANDS)[number] {
+  for (const b of VERDICT_BANDS) if (microlitresPerLitre < b.max) return b;
+  return VERDICT_BANDS[VERDICT_BANDS.length - 1];
+}
+
+/**
+ * One completed run, kept so two fixtures can be put side by side.
+ *
+ * Comparing two designs was the entire point of the tool and it was an exercise in
+ * memory: run one, note the number down somewhere, load the other, run it again,
+ * and hope you remembered which stand-off the first one used. The conditions are
+ * recorded with the result precisely because they are what invalidates a
+ * comparison -- aim, stand-off and seed each move the headline a long way, and one
+ * of them silently differing is how a previous headline claim survived being wrong.
+ */
+interface RunRecord {
+  id: number;
+  modelId: string;
+  modelName: string;
+  /** Microlitres on the user per litre, all phases. Unstable; see the note in the panel. */
+  allIn: number;
+  /** Sustained flow only. The figure the fixture actually governs. */
+  sustained: number;
+  score: number;
+  aimV: number;
+  aimU: number;
+  standoff: number;
+  seed: number;
+  voidVolume: number;
+  fluid: string;
+  wall: string;
+  /** True when it came from `Run full analysis` rather than from playback. */
+  full: boolean;
+}
 
 export class App {
   // Public because the offline screenshot harness drives them. See
@@ -76,6 +139,14 @@ export class App {
 
   private charts: Chart[] = [];
   private zoneBars = new BarList();
+  private verdictEl!: HTMLDivElement;
+  private expectEl!: HTMLParagraphElement;
+  private adviceEl!: HTMLUListElement;
+  private compareEl!: HTMLDivElement;
+  private compareSection!: HTMLElement;
+  /** Completed runs, newest last. Kept only for this session. */
+  private records: RunRecord[] = [];
+  private nextRecordId = 1;
   private reportEl!: HTMLPreElement;
   private scoreEl!: HTMLDivElement;
   private notesEl!: HTMLUListElement;
@@ -95,6 +166,7 @@ export class App {
   private showHeatmaps = true;
   private showStreamPath = true;
   private showWireframe = false;
+  private showFittings = true;
 
   constructor() {
     const cfg = defaultConfig();
@@ -133,6 +205,7 @@ export class App {
     this.buildTransport();
     this.buildAimPicking();
     this.buildViewportBar();
+    this.buildFirstHint();
     this.buildHelp();
     this.buildKeyboard();
 
@@ -223,6 +296,7 @@ export class App {
   setAimTarget(u: number, v: number): void {
     this.sim.config.aimTargetU = clamp(u, -1, 1);
     this.sim.config.aimTargetV = clamp(v, 0, 1);
+    this.dismissFirstHint();
     this.apply('aim');
   }
 
@@ -257,10 +331,13 @@ export class App {
   /**
    * Wire up aim picking: click to aim, drag to orbit.
    *
-   * Shift (or the sticky `A` mode) paints aim continuously, and only then is
-   * orbit suspended — for the duration of that one gesture, so a drag always
-   * orbits and never has to be handed back. See the note in the body for what
-   * this replaced and why.
+   * Shift paints aim continuously and suspends orbit for the duration of that one
+   * gesture, so a Shift-drag never has to be handed back. The sticky `A` mode is
+   * the exception and it is a real one: it holds orbit off for as long as it is
+   * armed, because a mode whose whole purpose is that every drag paints aim cannot
+   * also let every drag orbit. That is why arming it now marks the viewport — the
+   * previous version said "drag to orbit" unconditionally in the shortcut list and
+   * in this comment, while `A` quietly made dragging do nothing of the kind.
    */
   private buildAimPicking(): void {
     const canvas = document.getElementById('gl') as HTMLCanvasElement;
@@ -283,8 +360,8 @@ export class App {
 
     const setCursor = () => {
       canvas.style.cursor = this.aimMode || this.shiftHeld ? 'crosshair' : '';
-      // Orbit stays live unless we are actively painting aim, so a drag always
-      // orbits and never has to be "given back".
+      // Orbit is live except while sticky aim is armed. Shift-painting suspends it
+      // per gesture instead, in the handlers below.
       this.view.controls.enabled = !this.aimMode;
     };
     this.refreshAimCursor = setCursor;
@@ -397,6 +474,11 @@ export class App {
     this.view.setStreamPathVisible(this.showStreamPath);
     this.view.fixture.setWireframeVisible(this.showWireframe);
     this.view.fixture.setShellVisible(this.showShell);
+    // `FixtureView.setFittingsVisible` existed and was called from nowhere, so the
+    // flushometer could not be hidden by any route including the screenshot
+    // harness -- and it is the tallest thing in the scene, directly between the
+    // camera and the rim on the default three-quarter view.
+    this.view.fixture.setFittingsVisible(this.showFittings);
   }
 
   /** Scene furniture, so a shot or an inspection can isolate one thing. */
@@ -406,6 +488,7 @@ export class App {
     streamPath?: boolean;
     wireframe?: boolean;
     shell?: boolean;
+    fittings?: boolean;
   }): void {
     if (o.zones !== undefined) {
       this.showZones = o.zones;
@@ -415,6 +498,7 @@ export class App {
     if (o.streamPath !== undefined) this.showStreamPath = o.streamPath;
     if (o.wireframe !== undefined) this.showWireframe = o.wireframe;
     if (o.shell !== undefined) this.showShell = o.shell;
+    if (o.fittings !== undefined) this.showFittings = o.fittings;
     this.applyViewToggles();
   }
 
@@ -480,14 +564,52 @@ export class App {
     slot.append(label, desc);
 
     const actions = document.getElementById('topbar-actions')!;
+
+    // Hide both sidebars and give the window to the viewport.
+    //
+    // Two sidebars, a top bar and a footer leave the 3-D view — the thing anyone
+    // using this is actually looking at — with 61% of the window at 1600 px and
+    // 51% at 1280 px, which is a laptop. Rather than argue about which panel
+    // deserves its width, this gets both of them out of the way in one click and
+    // brings them back the same way. It is a view state, not a mode: nothing
+    // behaves differently while it is on.
+    const focus = document.createElement('button');
+    focus.className = 'btn';
+    focus.textContent = '⤢ Focus';
+    focus.title = 'Hide both panels and fill the window with the viewport (F)';
+    focus.addEventListener('click', () => this.toggleFocus());
+    this.focusBtn = focus;
+
     const analyse = document.createElement('button');
     analyse.className = 'btn primary';
     analyse.textContent = 'Run full analysis';
+    analyse.title = 'Re-run at analysis resolution and produce the full report';
     analyse.addEventListener('click', () => this.runAnalysis());
-    actions.append(analyse);
+    this.analyseBtn = analyse;
+    actions.append(focus, analyse);
   }
 
   private paintTopbarModel: () => void = () => {};
+  private analyseBtn: HTMLButtonElement | null = null;
+  private focusBtn: HTMLButtonElement | null = null;
+
+  /**
+   * Focus mode: both sidebars away, viewport full width.
+   *
+   * The charts are sized off the right panel's width, so they have to be re-laid
+   * out afterwards or they keep the width of a panel that is no longer there.
+   */
+  private focusMode = false;
+
+  private toggleFocus(): void {
+    this.focusMode = !this.focusMode;
+    document.getElementById('app')!.classList.toggle('focus', this.focusMode);
+    if (this.focusBtn) {
+      this.focusBtn.classList.toggle('active', this.focusMode);
+      this.focusBtn.textContent = this.focusMode ? '⤡ Panels' : '⤢ Focus';
+    }
+    this.resize();
+  }
 
   /**
    * Load a fixture.
@@ -557,8 +679,14 @@ export class App {
       canvas.className = 'model-thumb';
       canvas.width = Math.round(CW * dpr);
       canvas.height = Math.round(CH * dpr);
-      canvas.style.width = `${CW}px`;
-      canvas.style.height = `${CH}px`;
+      // The drawn size is left to the stylesheet, which caps it at the column.
+      // These two lines used to pin it to 126 px inline, and an inline style beats
+      // the `width: 100%` in `.model-thumb` — so once the panel was narrower than
+      // two full cards plus the gutter the grid simply overflowed and the sidebar's
+      // `overflow-x: hidden` sliced the right-hand column off. That happened at
+      // every width below about 1180 px, where the panel has always been 268 px
+      // against the 283 px the cards demand. The backing store is still CW x CH
+      // times the device ratio, so the thumbnail loses no resolution.
       canvas.setAttribute('role', 'img');
       canvas.setAttribute('aria-label', `${p.name}, three-quarter view`);
 
@@ -576,21 +704,22 @@ export class App {
     }
     parent.raw(grid);
 
-    const blurb = document.createElement('p');
-    blurb.className = 'hint model-blurb';
-    const expect = document.createElement('p');
-    expect.className = 'hint model-expect';
-    parent.raw(blurb);
-    parent.raw(expect);
+    // No prose under the grid. The summary was rendered here *and* in the top bar
+    // at the same time, a few centimetres apart — the identical sentence, twice on
+    // screen — and it is a third time on each card as a tooltip. The top bar keeps
+    // it, beside the model name where it belongs. The `expectation` paragraph, five
+    // lines of prediction about how the fixture ought to behave, has moved to the
+    // results panel: it is a claim about the outcome, so it reads properly next to
+    // the measured outcome and not filed among the inputs. Between them they were
+    // about 150 px of the left panel, which was enough to push the stand-off slider
+    // — the control this tool calls the most effective thing a user controls — off
+    // the bottom of the screen at every window size.
     this.paintModelCards = () => {
-      const p = getPreset(this.presetId);
       for (const c of this.modelCards) {
         const on = c.id === this.presetId;
         c.el.classList.toggle('active', on);
         c.el.setAttribute('aria-pressed', String(on));
       }
-      blurb.textContent = p.summary;
-      expect.textContent = p.expectation;
     };
     this.paintModelCards();
 
@@ -640,12 +769,11 @@ export class App {
       // carries the colour scale; the prose belongs here, where it is available
       // before you switch rather than only after.
       b.title = `${i + 1} · ${FixtureView.infoFor(t.mode, 0, 1).description}`;
-      b.addEventListener('click', () => {
-        this.view.fixture.mode = t.mode;
-        this.updateFixtureField();
-        this.updateLegend();
-        this.paintTabs();
-      });
+      // Through `setFieldMode`, which is also what the number keys and the
+      // automation surface call. Clicking a tab used to inline the same four
+      // statements, so anything later added to the one path silently did not
+      // happen on the other.
+      b.addEventListener('click', () => this.setFieldMode(t.mode));
       bar.append(b);
       this.tabEls.push(b);
     });
@@ -669,9 +797,11 @@ export class App {
     const c = this.sim.config;
 
     // ---- Fixture ---------------------------------------------------------
-    const fix = this.left.section('Fixture', {
-      hint: 'Six models spanning the design space. Pick one to load its geometry.',
-    });
+    // No hint. "Six models spanning the design space, pick one to load its
+    // geometry" sat above six labelled, captioned, individually rendered cards in
+    // a section headed FIXTURE, and cost two lines of a panel whose later sections
+    // do not fit on the screen.
+    const fix = this.left.section('Fixture');
     this.buildModelPicker(fix);
 
     // ---- Aim -------------------------------------------------------------
@@ -681,28 +811,17 @@ export class App {
     // fixture, moving the aim from the upper wall down onto the front rim takes
     // splashback from 335 to over 16000 µL/L. Nothing else in the tool has that
     // authority, and nothing else was as hard to picture.
+    // The gesture is taught by the chip on the viewport at start-up and by the `?`
+    // list, both of which are where the gesture happens. Repeating it here in three
+    // lines of prose, below the fold, taught nobody anything.
     const aim = this.left.section('Aim', {
-      hint:
-        'Click the bowl to aim. Drag to orbit. Shift-drag paints aim, Shift plus the ' +
-        'arrow keys nudges it.',
+      hint: 'Click the bowl to aim. Shift-drag paints it; Shift plus arrows nudges.',
     });
-    const aimRow = aim.buttonRow();
-    // Sticky mode is now a convenience rather than the way in: a plain click on the
-    // fixture aims, because a mode you have to arm and then remember to disarm is
-    // the wrong shape for the most-used control in the tool.
-    this.aimBtn = aimRow.button('Lock aim mode (A)', () => {
-      this.aimMode = !this.aimMode;
-      this.refreshAimCursor();
-      this.paintAimButton();
-    });
-    this.paintAimButton = () => {
-      this.aimBtn.textContent = this.aimMode
-        ? '✓ Aim locked — click or drag'
-        : 'Lock aim mode (A)';
-      this.aimBtn.classList.toggle('active', this.aimMode);
-    };
-    this.paintAimButton();
-
+    // The sticky-aim latch is no longer a button here. It was the first control in
+    // the section — top billing for the exact interaction this panel's own history
+    // records as the wrong shape for the job, sitting directly above a hint telling
+    // you that clicking the bowl already works. `A` still toggles it and the
+    // shortcut list still documents it, so nothing is lost but the invitation.
     aim.readout('Lands at', () => {
       const t = this.aimTrace;
       if (!t) return '—';
@@ -710,15 +829,29 @@ export class App {
       if (!t.reached || !t.point) return 'nothing — clears the fixture';
       return `${((t.point.y - this.sim.surface.floorY) * 1000).toFixed(0)} mm above floor`;
     });
-    aim.readout('Impingement there', () => {
-      const t = this.aimTrace;
-      if (!t) return '—';
-      if (t.blocked) return 'strikes the casing';
-      if (!t.reached) return '—';
-      const deg = radToDeg(t.angle);
-      const crit = radToDeg(CRITICAL_IMPINGEMENT_ANGLE);
-      return `${deg.toFixed(1)}° — ${deg <= crit ? 'under' : 'over'} the ${crit.toFixed(0)}° criterion`;
-    }, 'headline');
+    // Coloured against the criterion. `.kv.good` and `.kv.bad` were in the
+    // stylesheet and no readout in the tool ever asked for either — thirty-one
+    // call sites, all of them plain or 'headline'. This is the one number in the
+    // panel with a published pass/fail line through it, so it is the one that
+    // should be able to go red.
+    aim.readout(
+      'Impingement there',
+      () => {
+        const t = this.aimTrace;
+        if (!t) return '—';
+        if (t.blocked) return 'strikes the casing';
+        if (!t.reached) return '—';
+        const deg = radToDeg(t.angle);
+        const crit = radToDeg(CRITICAL_IMPINGEMENT_ANGLE);
+        return `${deg.toFixed(1)}° — ${deg <= crit ? 'under' : 'over'} the ${crit.toFixed(0)}° criterion`;
+      },
+      'headline',
+      () => {
+        const t = this.aimTrace;
+        if (!t || !t.reached) return t?.blocked ? 'bad' : '';
+        return t.angle <= CRITICAL_IMPINGEMENT_ANGLE ? 'good' : 'bad';
+      }
+    );
     // Named for the direction the slider actually moves the aim. It was "Aim
     // height", which reads as "higher number, higher on the wall" and does the
     // opposite: v walks *down* the profile from the rim, so dragging right lowers
@@ -733,7 +866,12 @@ export class App {
       get: () => c.aimTargetV ?? 0.18,
       set: (v) => (c.aimTargetV = v),
       effect: 'aim',
-      hint: '0 is the top of the back wall, 0.5 the sump. Higher means lower down.',
+      // Not "0.5 the sump". `v` is a fraction of *this* fixture's own profile, so
+      // where 0.5 lands depends entirely on which fixture is loaded — it is the
+      // stall's default aim and it is well past the trough's lip. The readouts
+      // directly above give the landing height in millimetres, which is the answer
+      // that means the same thing on all six.
+      hint: '0 the top of the back wall, 1 the front lip — read "Lands at" above.',
     });
     aim.slider({
       label: 'Aim side of centre',
@@ -744,7 +882,7 @@ export class App {
       get: () => c.aimTargetU,
       set: (v) => (c.aimTargetU = v),
       effect: 'aim',
-      hint: 'Aiming off-centre decides whether splash leaves past the side of the bowl.',
+      hint: 'Decides whether splash leaves past the side of the bowl.',
     });
 
     // ---- Stream and posture ----------------------------------------------
@@ -846,28 +984,40 @@ export class App {
       set: (v) => (this.showStreamPath = v),
       effect: 'view',
     });
-    const camRow = disp.buttonRow();
-    camRow.button('3/4', () =>
-      this.view.applyCameraPreset(CameraPreset.ThreeQuarter, this.sim.surface, this.sim.capture)
-    );
-    camRow.button('Front', () =>
-      this.view.applyCameraPreset(CameraPreset.Front, this.sim.surface, this.sim.capture)
-    );
-    camRow.button('Side', () =>
-      this.view.applyCameraPreset(CameraPreset.Side, this.sim.surface, this.sim.capture)
-    );
-    camRow.button('Top', () =>
-      this.view.applyCameraPreset(CameraPreset.Top, this.sim.surface, this.sim.capture)
-    );
-    camRow.button('User eye', () =>
-      this.view.applyCameraPreset(CameraPreset.UserEye, this.sim.surface, this.sim.capture)
-    );
+    // No camera buttons here.
+    //
+    // They were moved onto the right edge of the viewport because sitting inside a
+    // collapsed section made changing the camera two clicks and a scroll — but the
+    // old copy was never deleted, so there were two sets of five, and they did not
+    // behave the same. The viewport buttons record which preset is showing;
+    // these called `applyCameraPreset` directly and left `cameraIndex` untouched,
+    // so pressing `C` after using one of them resumed the cycle from whichever view
+    // you had been on before, skipping past the one actually on screen.
+    disp.toggle({
+      label: 'Show flush valve & pipework',
+      get: () => this.showFittings,
+      set: (v) => (this.showFittings = v),
+      effect: 'view',
+      hint:
+        'The metalwork is solid and collidable, not scenery — a level stream hits ' +
+        'the valve body. Hiding it is for seeing the ceramic, not for changing it.',
+    });
 
     this.buildAdvancedPanel(this.left);
   }
 
-  private aimBtn!: HTMLButtonElement;
-  private paintAimButton: () => void = () => {};
+  /**
+   * Show that sticky aim is armed.
+   *
+   * With the panel button gone, `A` needs to say something for itself. A crosshair
+   * cursor is the only other signal and it is invisible in a screenshot and easy to
+   * miss in use — and this mode suspends orbit, so a user who armed it by accident
+   * finds dragging silently broken with nothing on screen to explain it.
+   */
+  private paintAimButton: () => void = () => {
+    const stage = document.getElementById('stage');
+    if (stage) stage.classList.toggle('aim-locked', this.aimMode);
+  };
 
   /**
    * Everything that is not a decision anyone makes while evaluating a fixture.
@@ -1012,7 +1162,7 @@ export class App {
       hint: '0 disables rivulet formation. Set to 1 for physical behaviour.',
     });
     md.slider({
-      label: 'Grid resolution across width',
+      label: 'Grid across width (on rebuild)',
       min: 32,
       max: 112,
       step: 8,
@@ -1022,7 +1172,7 @@ export class App {
       effect: 'rebuild',
     });
     md.slider({
-      label: 'Grid resolution along profile',
+      label: 'Grid along profile (on rebuild)',
       min: 64,
       max: 200,
       step: 8,
@@ -1031,6 +1181,17 @@ export class App {
       set: (v) => (c.resolutionV = Math.round(v)),
       effect: 'rebuild',
     });
+    // What the mesh on screen actually is, which is not always what the two
+    // sliders above say. `Run full analysis` raises the resolution to at least
+    // 72 x 132, rebuilds at it, and afterwards restores the config values without
+    // rebuilding — so the sliders drop back to 56 / 104 while the live surface, and
+    // the `Grid` line in the report, stay at the analysis figures until the next
+    // geometry change. Two readings of one quantity, on screen together,
+    // disagreeing. Stating both is honest; making the sliders lie is not.
+    md.readout(
+      'Grid in use',
+      () => `${this.sim.surface.nu} × ${this.sim.surface.nv} cells`
+    );
     md.slider({
       label: 'Random seed',
       min: 1,
@@ -1109,14 +1270,49 @@ export class App {
     this.right = new Panel(this);
     host.append(this.right.root);
 
-    // ---- Headline --------------------------------------------------------
+    // ---- The answer ------------------------------------------------------
+    //
+    // The panel used to open with nineteen readouts, three charts and a
+    // thirteen-row table, and the one document that actually answered the
+    // question -- "is this fixture good, and why" -- was a collapsed <pre> at the
+    // bottom of the scroll. That is the wrong way round. The verdict, the number
+    // it rests on, the phase split that dominates it and the advice derived from
+    // this run are now the first things in the panel; everything that was here
+    // before is still here, one disclosure down, in the order you would ask for
+    // it.
+    this.verdictEl = document.createElement('div');
+    this.verdictEl.className = 'verdict';
+    this.right.raw(this.verdictEl);
+
+    // ---- What would help -------------------------------------------------
+    // Derived from this run's own numbers. It was written for the report and was
+    // therefore unreachable until a full analysis had been run, which is a long
+    // wait for the most actionable thing the tool says.
+    const help = this.right.section('What would help');
+    this.adviceEl = document.createElement('ul');
+    this.adviceEl.className = 'advice-list';
+    help.raw(this.adviceEl);
+
+    // What this fixture is *supposed* to do, under what it did. This text used to
+    // sit in the left panel under the picker, where it was a prediction filed
+    // among the inputs; it belongs beside the measurement it predicts. Below the
+    // advice rather than above it, because it is the same six sentences on every
+    // run of a given fixture and the advice is not.
+    this.expectEl = document.createElement('p');
+    this.expectEl.className = 'hint expect-note';
+    help.raw(this.expectEl);
+
+    // ---- Compare ---------------------------------------------------------
+    this.buildComparePanel(this.right);
+
+    // ---- Splashback detail -----------------------------------------------
     //
     // Everything here reads live from the metrics and switches to the finished
     // report when there is one, with a trailing `*` marking a mid-run figure.
     // Nine of these used to be a literal em-dash until a full analysis had been
     // run, so the results panel spent every playback looking broken while the
     // simulation underneath it had the numbers all along.
-    const head = this.right.section('Splashback');
+    const head = this.right.section('Splashback detail', { collapsed: true });
     head.readout('On the user', () => this.userPerLitre(), 'headline');
     head.readout('— thrown back', () =>
       this.uL(this.splashNow().userSplashVolume)
@@ -1144,10 +1340,12 @@ export class App {
     // and it was previously invisible: the weak rise and dribble are a fifth of
     // the volume and the great majority of the splashback.
     const when = this.right.section('When it happens', {
+      collapsed: true,
       hint:
         'Splashback per litre, split by how strong the stream was. A slow stream ' +
         'leaves on the same aim but falls short and steeper, so it lands nearer the ' +
-        'front of the fixture — often on the rim itself.',
+        'front of the fixture — often on the rim itself. The headline above carries ' +
+        'the ratio, because it is usually the whole story.',
     });
     // Read live from the metrics rather than waiting for a full analysis, because
     // the effect is large enough to be obvious a few seconds into a playback and
@@ -1176,12 +1374,16 @@ export class App {
       if (!s || !w || s.emitted <= floor || w.emitted <= floor) return '—';
       const sv = (s.userVolume * 1e9) / (s.emitted * 1000);
       const wv = (w.userVolume * 1e9) / (w.emitted * 1000);
-      if (sv <= 0) return wv > 0 ? 'all of it in the tail' : '—';
-      return `${(wv / sv).toFixed(0)}× worse per litre`;
+      // `this.live` on every branch. This section's own hint promises that a
+      // trailing asterisk marks a mid-run figure, and the two readouts above it
+      // keep that promise; this one dropped it, so a ratio still moving was
+      // presented with the same authority as a finished one.
+      if (sv <= 0) return wv > 0 ? `all of it in the tail${this.live}` : '—';
+      return `${(wv / sv).toFixed(0)}× worse per litre${this.live}`;
     });
 
     // ---- Impingement -----------------------------------------------------
-    const imp = this.right.section('Impingement');
+    const imp = this.right.section('Impingement', { collapsed: true });
     imp.readout('Reachable area over 30°', () => {
       const f = this.sim.impingement.fractionOverCritical;
       return `${(100 * f).toFixed(0)} %`;
@@ -1205,10 +1407,16 @@ export class App {
         ? `${(100 * a.primaryFractionOverCritical).toFixed(0)} %${this.live}`
         : '—';
     });
+    // The angle beside this volume is `meanAngle`, which is taken over every
+    // impact of every generation — primary arrivals included — not over the
+    // re-impacts alone. The report already said "all generations" where it quotes
+    // the same pair; the panel did not, in the very section whose closing note
+    // warns that the combined figure dilutes and biases a statistic about the
+    // stream. Labelled, not silently changed: the underlying metric is not mine.
     imp.readout('Re-impacting splash', () => {
       const a = this.impingementNow();
       return a.secondaryVolume > 0
-        ? `${(a.secondaryVolume * 1e6).toFixed(1)} mL at ` +
+        ? `${(a.secondaryVolume * 1e6).toFixed(1)} mL, all gen. mean ` +
             `${radToDeg(a.meanAngle).toFixed(0)}°${this.live}`
         : '—';
     });
@@ -1224,19 +1432,27 @@ export class App {
     );
 
     // ---- Aim sweep -------------------------------------------------------
+    // The hint used to promise that aiming "from the upper wall down into the
+    // throat raised measured splashback more than tenfold". That is true of some
+    // fixtures and flatly contradicted by the table printed directly underneath it
+    // on others -- the oval bowl reads 55-57° at every reachable aim, because it is
+    // a uniformly steep target, which is the whole point of its own description. A
+    // hint that the adjacent data disproves is worse than no hint. What is true on
+    // every fixture is the range, and the table states it.
     const sweep = this.right.section('Aim sweep', {
+      collapsed: true,
       hint:
-        'Local impingement angle for each aim point, traced ballistically. Pure ' +
-        'geometry, so it is instant. Check this first: aim is the most sensitive ' +
-        'input in the model. On the same fixture, moving the aim from the upper ' +
-        'wall down into the throat raised measured splashback more than tenfold, ' +
-        'because the throat fillet is steep and no wall-shape strategy governs it.',
+        'Local impingement angle for each aim point, traced ballistically against ' +
+        'the interior, the casting and the metalwork. Pure geometry, so it needs ' +
+        'no run — it settles about a tenth of a second after you stop moving the ' +
+        'aim. How much the angle varies across the range is itself the answer: a ' +
+        'fixture that reads the same everywhere cannot be fixed by aiming.',
     });
     this.sweepEl = document.createElement('div');
     sweep.raw(this.sweepEl);
 
     // ---- Drainage --------------------------------------------------------
-    const dr = this.right.section('Drainage & hygiene');
+    const dr = this.right.section('Drainage & hygiene', { collapsed: true });
     const mL = (v: number) => `${(v * 1e6).toFixed(2)} mL${this.live}`;
     const cm2 = (v: number) => `${(v * 1e4).toFixed(0)} cm²${this.live}`;
     dr.readout('Left on the wall', () => mL(this.drainageNow().residualVolume));
@@ -1262,7 +1478,7 @@ export class App {
     dr.readout('Spilled / dripped', () => mL(this.drainageNow().spilledVolume));
 
     // ---- Score -----------------------------------------------------------
-    const sc = this.right.section('Design score');
+    const sc = this.right.section('Design score', { collapsed: true });
     this.scoreEl = document.createElement('div');
     this.scoreEl.className = 'score-ring';
     sc.raw(this.scoreEl);
@@ -1277,15 +1493,16 @@ export class App {
     );
 
     // ---- Charts ----------------------------------------------------------
-    const ch = this.right.section('Time series');
+    const ch = this.right.section('Time series', { collapsed: true });
     const m = () => this.sim.metrics.samples;
     const marker = () =>
       this.sim.metrics.flowEndTime >= 0
         ? [{ t: this.sim.metrics.flowEndTime, label: 'flow ends', color: '#ffd166' }]
         : [];
 
+    // Titles no longer repeat the units, because the axes now carry them.
     const c1 = new Chart({
-      title: 'Flow rate (mL/s) · film volume (mL)',
+      title: 'Flow rate · film volume',
       leftLabel: 'mL/s',
       rightLabel: 'mL',
       count: () => m().length,
@@ -1297,7 +1514,7 @@ export class App {
       ],
     });
     const c2 = new Chart({
-      title: 'Cumulative on user (µL) · drained (mL)',
+      title: 'Cumulative on user · drained',
       leftLabel: 'µL',
       rightLabel: 'mL',
       count: () => m().length,
@@ -1309,7 +1526,7 @@ export class App {
       ],
     });
     const c3 = new Chart({
-      title: 'Airborne (µL) · live droplets',
+      title: 'Airborne · live droplets',
       leftLabel: 'µL',
       rightLabel: 'count',
       count: () => m().length,
@@ -1334,6 +1551,192 @@ export class App {
       void navigator.clipboard?.writeText(this.reportEl.textContent ?? '');
     });
     repRow.button('Download .txt', () => this.downloadReport());
+  }
+
+  // =======================================================================
+  // Comparison
+  // =======================================================================
+
+  /**
+   * Two fixtures, side by side.
+   *
+   * Comparing designs is the entire point of this tool and there was no way to do
+   * it: you ran one fixture, remembered the number, loaded the other, ran that,
+   * and compared from memory -- including remembering whether the two runs had
+   * used the same stand-off. Every finished run is now kept, with the conditions
+   * that produced it.
+   *
+   * Two decisions here are not cosmetic.
+   *
+   * The table leads with the **sustained-flow** figure rather than the all-in one.
+   * The all-in number is not stably signed: the same pair of fixtures measured
+   * 0.42x at 90 mm stand-off and 2.76x at 250 mm, i.e. it reverses which design is
+   * better across the range of one posture slider, because a decaying stream falls
+   * short onto the fixture's own rim and a deeper fixture falls short sooner. A
+   * comparison table built on that would confidently rank the wrong fixture first.
+   * The sustained figure isolates the part the shape governs. The all-in column is
+   * still shown, because it is what the user actually receives.
+   *
+   * And the conditions are compared, not just recorded. Aim, stand-off, seed, void
+   * volume, fluid and wall material each move the headline a long way, so a table
+   * whose rows differ in any of them is not a comparison at all. Rows that do not
+   * match the newest run are marked, and the panel says so.
+   */
+  private buildComparePanel(parent: Panel): void {
+    // The reasoning for ranking on `sustained` is in the doc comment above rather
+    // than on screen: this hint is visible on every run once there is a table
+    // under it, and five lines of justification above a four-row table is the
+    // kind of thing this pass exists to remove. The column header and the tooltip
+    // carry what a reader needs at the moment of reading.
+    const sec = parent.section('Compare runs', {
+      hint:
+        'Rank on sustained — that is the part the fixture shape governs, and it is ' +
+        'stable across seeds. Hover a row for the conditions it ran under.',
+    });
+    this.compareEl = document.createElement('div');
+    sec.raw(this.compareEl);
+    // Held so the whole section can be hidden until there is something in it.
+    this.compareSection = this.compareEl.closest('.section') as HTMLElement;
+    this.paintCompare();
+  }
+
+  /** Record a finished run. Called wherever a report comes into existence. */
+  private recordRun(full: boolean): void {
+    const r = this.report;
+    if (!r) return;
+    const c = this.sim.config;
+    const p = getPreset(this.presetId);
+    this.records.push({
+      id: this.nextRecordId++,
+      modelId: this.presetId,
+      modelName: p.name,
+      allIn: r.splash.userMicrolitresPerLitre,
+      sustained: r.splash.sustainedMicrolitresPerLitre,
+      score: r.score.total,
+      aimV: c.aimTargetV ?? 0,
+      aimU: c.aimTargetU,
+      standoff: c.posture.standoff,
+      seed: c.seed,
+      voidVolume: c.stream.voidVolume,
+      fluid: c.fluid.name,
+      wall: c.wall.name,
+      full,
+    });
+    // Keeping every run of a long session turns the panel into the wall of text
+    // this pass exists to remove.
+    if (this.records.length > 8) this.records.shift();
+    this.paintCompare();
+  }
+
+  /** The conditions that invalidate a comparison if they differ. */
+  private conditionsOf(r: RunRecord): string {
+    return [
+      r.aimV.toFixed(2),
+      r.aimU.toFixed(2),
+      r.standoff.toFixed(4),
+      r.seed,
+      r.voidVolume.toExponential(3),
+      r.fluid,
+      r.wall,
+    ].join('|');
+  }
+
+  private paintCompare(): void {
+    this.compareEl.replaceChildren();
+    if (this.compareSection) {
+      this.compareSection.classList.toggle('hidden', this.records.length === 0);
+    }
+    if (this.records.length === 0) return;
+
+    const newest = this.records[this.records.length - 1];
+    const baseline = this.conditionsOf(newest);
+    let mismatched = 0;
+
+    const table = document.createElement('table');
+    table.className = 'compare-table';
+    const head = document.createElement('tr');
+    for (const h of ['fixture', 'sustained', 'all-in', 'score', '']) {
+      const th = document.createElement('th');
+      th.textContent = h;
+      head.append(th);
+    }
+    table.append(head);
+
+    // Best sustained figure among rows that are actually comparable with each
+    // other. Highlighting a winner across mismatched conditions would be the
+    // exact error the conditions column exists to prevent.
+    const comparable = this.records.filter((r) => this.conditionsOf(r) === baseline);
+    let best: RunRecord | null = null;
+    if (comparable.length > 1) {
+      best = comparable[0];
+      for (const r of comparable) if (r.sustained < best!.sustained) best = r;
+    }
+
+    for (const rec of this.records) {
+      const tr = document.createElement('tr');
+      const differs = this.conditionsOf(rec) !== baseline;
+      if (differs) {
+        tr.classList.add('mismatch');
+        mismatched++;
+      }
+      if (best && rec === best) tr.classList.add('best');
+
+      const name = document.createElement('td');
+      name.textContent = rec.modelName;
+      name.title =
+        `aim v=${rec.aimV.toFixed(2)} u=${rec.aimU.toFixed(2)}, ` +
+        `stand-off ${(rec.standoff * 1000).toFixed(0)} mm, seed ${rec.seed}, ` +
+        `${(rec.voidVolume * 1e6).toFixed(0)} mL of ${rec.fluid} on ${rec.wall}` +
+        (rec.full ? '' : ' (playback resolution)') +
+        (differs ? ' — conditions differ from the newest run' : '');
+      const sus = document.createElement('td');
+      sus.textContent = rec.sustained.toFixed(0);
+      const all = document.createElement('td');
+      all.textContent = rec.allIn.toFixed(0);
+      const sco = document.createElement('td');
+      sco.textContent = rec.score.toFixed(0);
+
+      const del = document.createElement('td');
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.className = 'row-x';
+      x.textContent = '×';
+      x.title = 'Remove this run';
+      x.addEventListener('click', () => {
+        this.records = this.records.filter((q) => q.id !== rec.id);
+        this.paintCompare();
+      });
+      del.append(x);
+
+      tr.append(name, sus, all, sco, del);
+      table.append(tr);
+    }
+    this.compareEl.append(table);
+
+    const foot = document.createElement('p');
+    foot.className = 'hint';
+    const conds =
+      `Newest run: aim v=${newest.aimV.toFixed(2)}, stand-off ` +
+      `${(newest.standoff * 1000).toFixed(0)} mm, seed ${newest.seed}, ` +
+      `${(newest.voidVolume * 1e6).toFixed(0)} mL.`;
+    foot.textContent =
+      mismatched > 0
+        ? `${conds} ${mismatched} row${mismatched === 1 ? '' : 's'} ran under ` +
+          'different conditions and cannot be compared with it — hover a row for ' +
+          'its own. Re-run them on matching settings before drawing a conclusion.'
+        : `${conds} All rows share these, so the comparison is controlled.`;
+    if (mismatched > 0) foot.classList.add('warn-text');
+    this.compareEl.append(foot);
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'btn wide';
+    clear.textContent = 'Clear comparison';
+    clear.addEventListener('click', () => {
+      this.records = [];
+      this.paintCompare();
+    });
+    this.compareEl.append(clear);
   }
 
   // =======================================================================
@@ -1426,23 +1829,29 @@ export class App {
 
   private buildTransport(): void {
     const host = document.getElementById('transport')!;
+    // The layout is in the stylesheet now, under `.transport-inner`. The class was
+    // being set and then every rule it should have carried was applied inline,
+    // one property at a time, duplicating what `#transport` already declared.
     this.transport = new Panel(this, 'transport-inner');
     host.append(this.transport.root);
-    this.transport.root.style.display = 'flex';
-    this.transport.root.style.alignItems = 'center';
-    this.transport.root.style.gap = '12px';
-    this.transport.root.style.width = '100%';
 
     this.playBtn = this.transport.button('▶ Play', () => this.togglePlay(), 'primary');
     this.transport.button('Restart', () => {
       this.sim.restart();
       this.report = null;
       this.refreshGeometryDependent();
+      this.refreshViews();
     });
-    this.transport.button('Step 0.1 s', () => {
-      for (let i = 0; i < 100 && this.sim.phase !== SimPhase.Finished; i++) this.sim.step();
-      this.sim.sample();
-    });
+    // Straight through `stepBy`, which is what the `S` and `.` keys call.
+    //
+    // This used to be its own loop: a hundred raw `sim.step()` calls and a sample,
+    // with no `finishRun()` and no `refreshViews()`. So stepping a run to its end
+    // with the button left `report` null for ever — the Report section went on
+    // saying "run a full analysis to produce a report" and the Design score went on
+    // saying "run a full analysis for a score", on a run that had finished. The
+    // identical action from the keyboard produced both. Verified: 700 clicks of the
+    // button completed the run and produced neither.
+    this.transport.button('Step 0.1 s', () => this.stepBy(0.1));
 
     const speedSel = document.createElement('select');
     speedSel.style.width = 'auto';
@@ -1573,6 +1982,10 @@ export class App {
         case 'C':
           this.cycleCamera();
           break;
+        case 'f':
+        case 'F':
+          this.toggleFocus();
+          break;
         case '[':
           this.nudgeSpeed(-1);
           break;
@@ -1650,6 +2063,39 @@ export class App {
     stage.append(bar);
   }
 
+  /**
+   * Say once, on the viewport, what the main gesture is.
+   *
+   * Clicking the bowl to aim is the tool's most-used interaction and there was
+   * nothing anywhere on screen that mentioned it: the sentence that explains it is
+   * in the left panel's Aim section, which at every window size opened below the
+   * fold behind the fixture picker. The keyboard map had the same problem in a
+   * milder form — it existed, and only the `?` button advertised it. This clears
+   * itself on the first aim or after ten seconds, and never argues with anything
+   * else on the stage because it is gone by the time anything else has something
+   * to say.
+   */
+  private buildFirstHint(): void {
+    const stage = document.getElementById('stage')!;
+    const el = document.createElement('div');
+    el.className = 'first-hint';
+    el.innerHTML =
+      'Click the bowl to aim · drag to orbit · <kbd>?</kbd> for shortcuts';
+    stage.append(el);
+    this.firstHintEl = el;
+    window.setTimeout(() => this.dismissFirstHint(), 10000);
+  }
+
+  private firstHintEl: HTMLElement | null = null;
+
+  private dismissFirstHint(): void {
+    const el = this.firstHintEl;
+    if (!el) return;
+    this.firstHintEl = null;
+    el.classList.add('gone');
+    window.setTimeout(() => el.remove(), 600);
+  }
+
   /** Shortcut reference, so the keyboard layer is discoverable rather than secret. */
   private buildHelp(): void {
     const stage = document.getElementById('stage')!;
@@ -1663,11 +2109,15 @@ export class App {
       ['[  ]', 'slower / faster'],
       ['1 – 8', 'surface view'],
       ['C', 'cycle camera'],
+      ['F', 'hide panels / show'],
       ['click bowl', 'set aim'],
       ['drag', 'orbit'],
       ['Shift + drag', 'paint aim'],
       ['Shift + arrows', 'nudge aim'],
-      ['A', 'sticky aim mode'],
+      // Says what it does. Listed flatly as "sticky aim mode" next to an
+      // unqualified "drag — orbit", it read as an extra way to aim; it also turns
+      // orbit off for as long as it is armed, which is a surprise worth one word.
+      ['A', 'lock aim (orbit off)'],
       ['Esc', 'cancel'],
       ['?', 'this list'],
     ];
@@ -1817,10 +2267,12 @@ export class App {
     // essentially zero and therefore wins "best aim" outright. It is the *worst*
     // recommendation available — a nudge of one sweep step puts the stream on the
     // outside of the fixture — and the model's own tremor is larger than that
-    // step. Measured on the untouched library: classic-bowl v = 0.49, flat-wall
-    // 0.62 and nautilus-tall 0.55 all report 0° this way, each flanked by blocked
-    // aims. They are still listed, because "there is a gap in the rim here" is
-    // true and worth seeing; they are just not offered as an answer.
+    // step. The effect was found on classic-bowl at v = 0.49, and on flat-wall and
+    // nautilus-tall at 0.62 and 0.55 — the latter two measured with a wider walk
+    // than this sweep takes, which stops at 0.54, so do not expect to reproduce
+    // them from the table below. They are still listed where they fall in range,
+    // because "there is a gap in the rim here" is true and worth seeing; they are
+    // just not offered as an answer.
     for (let i = 0; i < rows.length; i++) {
       const prev = rows[i - 1];
       const next = rows[i + 1];
@@ -1904,7 +2356,13 @@ export class App {
     btn.className = 'btn wide';
     btn.textContent = `Use best aim (v=${best.v.toFixed(2)})`;
     btn.addEventListener('click', () => {
-      this.setAimTarget(0, best.v);
+      // At the *current* side-of-centre, which is where the sweep traced it.
+      // Every row above was solved through `aimAtProfileFraction`, i.e. at
+      // `aimTargetU` as it stands — but this button used to force `u = 0`, so with
+      // the side slider off centre it applied an aim at a different point on the
+      // surface from the one whose angle the table had just quoted, and silently
+      // snapped the slider back to the middle.
+      this.setAimTarget(this.sim.config.aimTargetU, best.v);
     });
     this.sweepEl.append(btn);
   }
@@ -1924,6 +2382,11 @@ export class App {
   private async runAnalysis(): Promise<void> {
     if (this.analysing) return;
     this.analysing = true;
+    // The button used to stay fully live during the three minutes an analysis
+    // takes, and every further click hit the `analysing` guard above and did
+    // nothing at all. A control that looks pressable and silently discards the
+    // press is worse than one that is visibly out of action.
+    if (this.analyseBtn) this.analyseBtn.disabled = true;
     this.running = false;
     this.playBtn.textContent = '▶ Play';
     const prog = document.getElementById('progress')!;
@@ -1972,13 +2435,25 @@ export class App {
     this.sim.sample();
     this.report = this.sim.report();
 
+    // Restored for playback, which cannot afford the analysis grid. The live
+    // surface stays at the analysis resolution until the next rebuild, so these
+    // two numbers and the grid actually in use genuinely differ for a while —
+    // which is why `Advanced` carries a separate `Grid in use` readout rather than
+    // letting the sliders imply they describe the current mesh.
     cfg.resolutionU = savedU;
     cfg.resolutionV = savedV;
     prog.classList.add('hidden');
     this.analysing = false;
+    if (this.analyseBtn) this.analyseBtn.disabled = false;
     this.paintReport();
+    this.recordRun(true);
+    this.updateVerdict();
+    this.updateAdvice();
+    // Opened here and only here. Asking for a full analysis is asking for the
+    // document; reaching the end of a playback is not, which is why `finishRun`
+    // leaves it folded. Leaving it folded after an explicit analysis was the
+    // original complaint and it still stands.
     this.expandSection(this.reportEl);
-    this.reportEl.scrollIntoView({ block: 'nearest' });
     this.right.refresh();
     this.updateCharts();
   }
@@ -2011,15 +2486,13 @@ export class App {
     const rule = (ch = '─') => ch.repeat(58);
 
     // ---- Verdict ---------------------------------------------------------
+    // Off the shared band table, which the panel headline reads too. It was a
+    // chain of ternaries here and nowhere else; now that the same verdict is on
+    // screen live, two copies of the thresholds would be two places for them to
+    // drift apart.
     const upl = sp.userMicrolitresPerLitre;
-    const verdict =
-      upl < 100
-        ? 'CLEAN — negligible splashback on the user'
-        : upl < 600
-          ? 'ACCEPTABLE — noticeable but modest splashback'
-          : upl < 3000
-            ? 'POOR — significant splashback on the user'
-            : 'BAD — the user is being sprayed';
+    const band = verdictFor(upl);
+    const verdict = `${band.label} — ${band.gloss}`;
     L.push(`${p.name.toUpperCase()} — ${cfg.fluid.name}, ${cfg.wall.name}`);
     L.push(rule('═'));
     L.push(`VERDICT   ${verdict}`);
@@ -2123,46 +2596,12 @@ export class App {
     // Derived from this run rather than generic advice, so it is worth reading.
     L.push('WHAT WOULD HELP');
     L.push(rule());
-    const advice: string[] = [];
-    if (this.aimTrace?.blocked) {
-      advice.push(
-        'The aim strikes the outside of the fixture. Nothing else matters until ' +
-          'that is fixed — aim higher or stand closer.'
-      );
-    }
-    if (act.primaryFractionOverCritical > 0.5) {
-      advice.push(
-        `${(100 * act.primaryFractionOverCritical).toFixed(0)}% of the stream lands steeper than 30°. ` +
-          'Check the aim sweep for a shallower aim point on this fixture.'
-      );
-    }
-    if (reach > bu.breakupLength * 1.3) {
-      advice.push(
-        `The wall is ${(reach * 100).toFixed(0)} cm away but the jet breaks up at ` +
-          `${(bu.breakupLength * 100).toFixed(0)} cm, so a droplet train arrives and every ` +
-          'droplet fires its own corona. Standing closer is the single most ' +
-          'effective change available to the user.'
-      );
-    }
-    if (it.exteriorSplashedVolume > 0.2e-6) {
-      advice.push(
-        `${(it.exteriorSplashedVolume * 1e6).toFixed(1)} mL was thrown back off the casing itself. ` +
-          'That is the stream or its splash hitting the outside of the fixture.'
-      );
-    }
-    if (weakRatio > 4) {
-      advice.push(
-        'Most of the splashback is in the weak phases, which the fixture cannot ' +
-          'fix. A shallower fixture, or a shorter stand-off during the tail, would.'
-      );
-    }
-    if (r.drainage.maxStandingDepth > 1.5e-3) {
-      advice.push(
-        `${(r.drainage.maxStandingDepth * 1000).toFixed(1)} mm of liquid is standing at the end of the run. ` +
-          'Impacts into standing liquid splash more readily than onto damp glaze.'
-      );
-    }
-    if (advice.length === 0) advice.push('Nothing stands out. This configuration behaves well.');
+    // One generator, two renderings. This list is the most actionable thing the
+    // tool produces and it existed only inside the report, so it could not be seen
+    // until a full analysis had finished; it now paints live into the panel as
+    // well, off `buildAdvice`, and the report prints the same strings rather than
+    // a second copy of the same six conditions.
+    const advice = this.buildAdvice();
     for (const a of advice) {
       // Wrapped by hand: this is a <pre>, so the browser will not do it.
       const words = a.split(' ');
@@ -2304,6 +2743,8 @@ export class App {
       this.updateTransport();
       this.updateZoneBars();
       this.updateScore();
+      this.updateVerdict();
+      this.updateAdvice();
       if (!this.report) this.right.refresh();
     }
 
@@ -2362,7 +2803,14 @@ export class App {
     this.sim.sample();
     this.report = this.sim.report();
     this.paintReport();
-    this.expandSection(this.reportEl);
+    // Not expanded here, unlike `runAnalysis`. This path fires whenever playback
+    // reaches the end, and unfolding a sixty-line document under the cursor is a
+    // surprise when nobody asked for it. The verdict at the top of the panel has
+    // already switched from the live figures to the finished ones, which is the
+    // part that matters; the report is one click away and says so.
+    this.recordRun(false);
+    this.updateVerdict();
+    this.updateAdvice();
     this.right.refresh();
   }
 
@@ -2382,6 +2830,8 @@ export class App {
     this.updateTransport();
     this.updateZoneBars();
     this.updateScore();
+    this.updateVerdict();
+    this.updateAdvice();
     this.left.refresh();
     this.right.refresh();
     this.view.render();
@@ -2389,6 +2839,9 @@ export class App {
 
   setFieldMode(mode: FieldMode): void {
     this.view.fixture.mode = mode;
+    // The start-up chip sits where the legend goes, so a view with a colour scale
+    // must not have to share the corner with it.
+    this.dismissFirstHint();
     this.updateFixtureField();
     this.updateLegend();
     this.paintTabs();
@@ -2414,20 +2867,39 @@ export class App {
 
   private updateHud(): void {
     const s = this.sim.stats();
-    const tPeak = this.sim.emitter.flow.peakFraction * this.sim.emitter.flow.duration;
-    const bu = this.sim.emitter.breakupAt(Math.min(this.sim.time || tPeak, tPeak));
+    const bu = this.sim.emitter.breakupAt(this.breakupTime());
     const reach = this.reachToFixture();
+    // Four of the seven lines that used to be here -- film, airborne, drained, on
+    // user -- are the right-hand panel's job and were duplicated verbatim from it,
+    // in a block that sits over the fixture and, at 1280 px, on top of two of the
+    // view tabs. What is left is what belongs on the viewport: how much liquid is
+    // in the air, and the jet-versus-droplets question that the note underneath
+    // then explains.
     this.hudEl.innerHTML =
-      `droplets <b>${s.particles}</b><br>` +
-      `coherent <b>${s.coherent}</b> · splash <b>${s.secondaries}</b><br>` +
-      `film <b>${(s.filmVolume * 1e6).toFixed(2)} mL</b><br>` +
-      `airborne <b>${(s.airborne * 1e9).toFixed(0)} µL</b><br>` +
-      `drained <b>${(s.drained * 1e6).toFixed(1)} mL</b><br>` +
-      `on user <b>${(s.userVolume * 1e9).toFixed(0)} µL</b><br>` +
+      `droplets <b>${s.particles}</b> · coherent <b>${s.coherent}</b><br>` +
       `breakup <b>${(bu.breakupLength * 100).toFixed(0)} cm</b> / reach ` +
       `<b>${reach.dist > 0 ? `${(reach.dist * 100).toFixed(0)} cm` : '—'}</b>` +
       (reach.blocked ? ' <b>(casing)</b>' : '');
     this.updateOverlayNote(bu.breakupLength, reach);
+  }
+
+  /**
+   * The instant the breakup length should be evaluated at.
+   *
+   * The same instant the aim trace uses, which is the whole point. This was
+   * `min(time, peak)` — clamped at the flow peak, which the default curve reaches
+   * about a quarter of the way in — while `reach` on the same HUD line, and in the
+   * same sentence of the overlay note, came from the current time. So for roughly
+   * the last three quarters of every void the tool was comparing a breakup length
+   * frozen at peak flow against a reach measured now, and concluding "coherent
+   * jet" or "droplet train" from the pair. That is Trap 10 exactly, which was
+   * fixed for the trajectory and for reach and missed here.
+   */
+  private breakupTime(): number {
+    const flow = this.sim.emitter.flow;
+    return this.sim.phase === SimPhase.Voiding && this.sim.time > 0
+      ? Math.min(this.sim.time, flow.duration)
+      : flow.peakFraction * flow.duration;
   }
 
   /**
@@ -2540,6 +3012,167 @@ export class App {
         color: colors[i],
       }))
     );
+  }
+
+  /**
+   * The verdict, the number under it, and the phase split — live.
+   *
+   * This is the tool's answer to the only question it exists to settle, and until
+   * now it was reachable in exactly one place: a collapsed `<pre>` at the bottom
+   * of the right-hand panel, after a full analysis. Everything above it was raw
+   * material. The banding comes from `VERDICT_BANDS`, which the report reads too,
+   * so the headline and the document cannot disagree about the same run.
+   */
+  private updateVerdict(): void {
+    const sp = this.splashNow();
+    const el = this.verdictEl;
+    el.replaceChildren();
+
+    const emitted = this.sim.metrics.emittedVolume;
+    const thin = !this.report && emitted < 0.1 * this.sim.config.stream.voidVolume;
+
+    const band = document.createElement('div');
+    band.className = 'verdict-band';
+    const value = document.createElement('div');
+    value.className = 'verdict-value';
+    const sub = document.createElement('div');
+    sub.className = 'verdict-sub';
+
+    if (thin) {
+      // Same guard as the headline readout. µL/L against the first few millilitres
+      // of a void is arithmetic rather than a measurement, and quoting it opened
+      // every run announcing a catastrophe in the band the report calls "the user
+      // is being sprayed".
+      band.textContent = 'MEASURING';
+      band.classList.add('tone-none');
+      value.textContent = `${(sp.userVolume * 1e9).toFixed(0)} µL so far`;
+      sub.textContent =
+        `${(emitted * 1e6).toFixed(0)} mL of ${(this.sim.config.stream.voidVolume * 1e6).toFixed(0)} mL ` +
+        'voided — too little to quote a per-litre figure against.';
+    } else {
+      const v = verdictFor(sp.userMicrolitresPerLitre);
+      band.textContent = v.label;
+      band.classList.add(`tone-${v.tone}`);
+      const star = this.report ? '' : '*';
+      value.textContent = `${sp.userMicrolitresPerLitre.toFixed(0)} µL/L${star}`;
+      sub.textContent =
+        `${v.gloss} — ${(sp.userVolume * 1e9).toFixed(0)} µL in ${sp.userDroplets} droplets, ` +
+        `from a ${(emitted * 1e6).toFixed(0)} mL void.`;
+    }
+    el.append(band, value, sub);
+
+    // The phase split, promoted out of its own section. It is the largest single
+    // effect in the model -- the weak rise and dribble are about a fifth of the
+    // volume and the great majority of the splashback -- so stating it here is the
+    // difference between the headline being explained and being a mystery.
+    const src = this.report ? this.report.splash.perPhase : this.sim.metrics.perPhase;
+    const s = src[FlowPhase.Sustained];
+    const w = src[FlowPhase.Weak];
+    const floor = this.report ? 1e-12 : 0.1 * this.sim.config.stream.voidVolume;
+    if (s && w && s.emitted > floor && w.emitted > floor) {
+      const sv = (s.userVolume * 1e9) / (s.emitted * 1000);
+      const wv = (w.userVolume * 1e9) / (w.emitted * 1000);
+      const line = document.createElement('div');
+      line.className = 'verdict-phase';
+      if (sv > 0 && wv / sv > 2) {
+        line.classList.add('bad');
+        line.textContent =
+          `The weak rise and tail are ${(wv / sv).toFixed(0)}× worse per litre than ` +
+          `sustained flow (${wv.toFixed(0)} against ${sv.toFixed(0)} µL/L). No change ` +
+          'to the bowl shape addresses that.';
+      } else {
+        line.textContent =
+          `Sustained flow ${sv.toFixed(0)} µL/L, weak rise and tail ${wv.toFixed(0)} µL/L.`;
+      }
+      el.append(line);
+    }
+
+    // A run that has finished but was never analysed at full resolution is worth
+    // distinguishing, because the comparison table records which is which.
+    if (!this.report) {
+      const note = document.createElement('div');
+      note.className = 'verdict-foot';
+      note.textContent =
+        '* figures from a run in progress. Run a full analysis for the final ' +
+        'numbers at analysis resolution.';
+      el.append(note);
+    }
+
+    this.expectEl.textContent = getPreset(this.presetId).expectation;
+  }
+
+  /**
+   * What would help, derived from this run.
+   *
+   * Written for the report, where it was the best thing in the document and
+   * unreachable until a full analysis had completed. The same list now paints
+   * live into the panel, so the most actionable output in the tool is available a
+   * few seconds into a playback rather than three minutes later.
+   */
+  private buildAdvice(): string[] {
+    const act = this.impingementNow();
+    const sp = this.splashNow();
+    const it = this.sim.impact.totals;
+    const dr = this.drainageNow();
+    const bu = this.sim.emitter.breakupAt(
+      this.sim.emitter.flow.peakFraction * this.sim.emitter.flow.duration
+    );
+    const { dist: reach } = this.reachToFixture();
+    const advice: string[] = [];
+
+    if (this.aimTrace?.blocked) {
+      advice.push(
+        'The aim strikes the outside of the fixture. Nothing else matters until ' +
+          'that is fixed — aim higher or stand closer.'
+      );
+    }
+    if (act.primaryVolume > 0 && act.primaryFractionOverCritical > 0.5) {
+      advice.push(
+        `${(100 * act.primaryFractionOverCritical).toFixed(0)}% of the stream lands steeper than 30°. ` +
+          'Check the aim sweep for a shallower aim point on this fixture.'
+      );
+    }
+    if (reach > bu.breakupLength * 1.3) {
+      advice.push(
+        `The wall is ${(reach * 100).toFixed(0)} cm away but the jet breaks up at ` +
+          `${(bu.breakupLength * 100).toFixed(0)} cm, so a droplet train arrives and every ` +
+          'droplet fires its own corona. Standing closer is the single most ' +
+          'effective change available to the user.'
+      );
+    }
+    if (it.exteriorSplashedVolume > 0.2e-6) {
+      advice.push(
+        `${(it.exteriorSplashedVolume * 1e6).toFixed(1)} mL was thrown back off the casing itself. ` +
+          'That is the stream or its splash hitting the outside of the fixture.'
+      );
+    }
+    const weakRatio =
+      sp.weakMicrolitresPerLitre / Math.max(1, sp.sustainedMicrolitresPerLitre);
+    if (weakRatio > 4) {
+      advice.push(
+        'Most of the splashback is in the weak phases, which the fixture cannot ' +
+          'fix. A shallower fixture, or a shorter stand-off during the tail, would.'
+      );
+    }
+    if (dr.maxStandingDepth > 1.5e-3) {
+      advice.push(
+        `${(dr.maxStandingDepth * 1000).toFixed(1)} mm of liquid is standing at the end of the run. ` +
+          'Impacts into standing liquid splash more readily than onto damp glaze.'
+      );
+    }
+    if (advice.length === 0) {
+      advice.push('Nothing stands out. This configuration behaves well.');
+    }
+    return advice;
+  }
+
+  private updateAdvice(): void {
+    this.adviceEl.replaceChildren();
+    for (const a of this.buildAdvice()) {
+      const li = document.createElement('li');
+      li.textContent = a;
+      this.adviceEl.append(li);
+    }
   }
 
   private updateScore(): void {

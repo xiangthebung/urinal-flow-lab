@@ -439,13 +439,23 @@ export class SceneView {
       (this.aimMarker.material as THREE.MeshBasicMaterial).color.setHex(
         blocked ? 0xffa03c : 0x35e0ff
       );
-      this.aimMarker.visible = true;
+      // Gated on the toggle, not set unconditionally. The marker lives on the
+      // scene rather than inside `streamGroup`, so hiding the group never hid it;
+      // this line then re-showed it on the next update. The frame loop calls
+      // through here about every 80 ms, so turning "Show aim trajectory" off made
+      // the dashed line vanish and the marker sphere come straight back and stay,
+      // and `setOverlays({ streamPath: false })` photographed it too.
+      this.aimMarker.visible = this.streamPathVisible;
     } else {
       this.aimMarker.visible = false;
     }
   }
 
+  /** Whether the aim trajectory and its impact marker are wanted at all. */
+  private streamPathVisible = true;
+
   setStreamPathVisible(v: boolean): void {
+    this.streamPathVisible = v;
     this.streamGroup.visible = v;
     this.aimMarker.visible = v && this.aimMarker.visible;
   }

@@ -217,8 +217,21 @@ export class Panel {
     return row;
   }
 
-  /** A read-only line whose value is pulled on refresh. */
-  readout(label: string, get: () => string, cls = ''): this {
+  /**
+   * A read-only line whose value is pulled on refresh.
+   *
+   * `tone` colours the value against whatever criterion the caller has. The
+   * stylesheet has carried `.kv.good`, `.kv.bad` and `.kv.warn` all along and
+   * nothing could reach them: the only class any of the thirty-one call sites
+   * passed was `headline`, because `cls` is applied once at construction and a
+   * pass/fail state is not known until the value is read.
+   */
+  readout(
+    label: string,
+    get: () => string,
+    cls = '',
+    tone?: () => '' | 'good' | 'bad' | 'warn'
+  ): this {
     const row = document.createElement('div');
     row.className = `kv ${cls}`.trim();
     const l = document.createElement('span');
@@ -230,6 +243,12 @@ export class Panel {
     this.root.append(row);
     const paint = () => {
       v.textContent = get();
+      if (tone) {
+        const t = tone();
+        row.classList.toggle('good', t === 'good');
+        row.classList.toggle('bad', t === 'bad');
+        row.classList.toggle('warn', t === 'warn');
+      }
     };
     paint();
     this.refreshables.push({ refresh: paint });

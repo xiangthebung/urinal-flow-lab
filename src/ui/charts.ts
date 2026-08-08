@@ -136,6 +136,32 @@ export class Chart {
         ctx.fillText(fmt(maxR * frac), padL + plotW + 5, padT + (plotH * i) / 4);
       }
     }
+    // The axis units.
+    //
+    // `leftLabel` was declared on the options, supplied by all three charts with a
+    // real unit -- mL/s, µL, µL -- and read by nothing at all; `rightLabel` was read
+    // only as a boolean, to decide padding and whether to draw the right-hand tick
+    // numbers. So every chart shipped with unlabelled axes, and 'count', the unit
+    // of the live-droplet series, appeared nowhere in the product. A field that is
+    // supplied and never read is the same defect as one that is reported and never
+    // written: it looks handled.
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.translate(9, padT + plotH / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText(opts.leftLabel, 0, 0);
+    ctx.restore();
+    if (opts.rightLabel && maxR > 0) {
+      ctx.save();
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.translate(w - 9, padT + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(opts.rightLabel, 0, 0);
+      ctx.restore();
+    }
+
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
     ctx.fillText(`${t0.toFixed(0)} s`, padL, padT + plotH + 4);
