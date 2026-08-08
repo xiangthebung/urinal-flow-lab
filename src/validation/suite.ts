@@ -1,14 +1,25 @@
-import { AIR_DENSITY, AIR_VISCOSITY, GRAVITY } from '../core/constants';
+import {
+  AIR_DENSITY,
+  AIR_VISCOSITY,
+  DRY_SPLASH_K_SMOOTH,
+  GRAVITY,
+  WET_SPLASH_K_BASE,
+  WET_SPLASH_K_FILM,
+} from '../core/constants';
 import {
   URINE_37C,
   WALL_MATERIALS,
   WATER_20C,
   capillaryLength,
   dragCoefficient,
+  dropletDragCoefficient,
   kinematicViscosity,
   maxStaticPuddleThickness,
   nusseltFilmThickness,
+  ohnesorge,
+  reynolds,
   terminalVelocity,
+  weber,
 } from '../core/fluid';
 import { Rng } from '../core/rng';
 import { radToDeg, v3 } from '../core/vec3';
@@ -78,29 +89,41 @@ function check(
 function rayleighTests(): TestResult[] {
   const out: TestResult[] = [];
 
-  // Inviscid Rayleigh: most unstable dimensionless wavenumber is 0.697, giving
-  // a wavelength of 9.02 jet radii. The long-wave dispersion relation used here
-  // gives 1/sqrt(2) = 0.7071, a known ~1.4% overshoot of the exact Bessel result.
-  const b = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0);
+  // The three classical constants below are Rayleigh's *still-air* results, so
+  // they are checked in still air: `solveBreakup`'s last argument is the ambient
+  // gas density and passing 0 removes the aerodynamic term. That matters now that
+  // the term exists. With air at 3 m/s the wavenumber reads 0.708 rather than
+  // 0.695, which still slips inside a 3% tolerance -- so leaving these on the
+  // default would have gone on passing while quietly comparing an air-affected
+  // number to a no-air textbook constant, and the agreement would have been
+  // coincidence rather than evidence. Air gets its own checks below.
+  //
+  // Tolerances tightened from 3%/3%/2% at the same time. The dispersion relation
+  // now carries the exact I1(x)/I0(x) instead of its small-argument limit x/2, so
+  // the peak sits at 0.6947 against Rayleigh's 0.697 -- 0.33%, and that residual
+  // is the genuine viscous shift for urine (Oh = 2.1e-3), not approximation error.
+  // The long-wave form was out by 1.44% and the old tolerance had to cover it.
+  const b = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0, 0);
   out.push(
     check({
-      name: 'Most unstable wavenumber kr',
+      name: 'Most unstable wavenumber kr, still air',
       group: 'Rayleigh-Plateau breakup',
       expected: '0.697 (Rayleigh, exact Bessel)',
       actual: b.wavenumber.toFixed(4),
       errValue: rel(b.wavenumber, 0.697),
-      tolValue: 0.03,
-      reference: 'Rayleigh 1878; long-wave form overshoots by ~1.4% by construction',
+      tolValue: 0.01,
+      reference: 'Rayleigh 1878',
+      notes: 'Residual is the viscous shift, x_max ≈ 0.697/√(1+3·Oh)',
     })
   );
   out.push(
     check({
-      name: 'Wavelength / jet diameter',
+      name: 'Wavelength / jet diameter, still air',
       group: 'Rayleigh-Plateau breakup',
       expected: '4.51 (= 9.02 r / d)',
       actual: (b.wavelength / 0.003).toFixed(4),
       errValue: rel(b.wavelength / 0.003, 4.51),
-      tolValue: 0.03,
+      tolValue: 0.01,
       reference: 'Rayleigh 1878',
     })
   );
@@ -108,17 +131,17 @@ function rayleighTests(): TestResult[] {
   // which for lambda = 9.02r gives 1.891 d_jet.
   out.push(
     check({
-      name: 'Droplet / jet diameter (no satellites)',
+      name: 'Droplet / jet diameter, still air (no satellites)',
       group: 'Rayleigh-Plateau breakup',
       expected: '1.891',
       actual: (b.mainDropletDiameter / 0.003).toFixed(4),
       errValue: rel(b.mainDropletDiameter / 0.003, 1.891),
-      tolValue: 0.02,
+      tolValue: 0.01,
       reference: 'Volume of one wavelength of cylinder recast as a sphere',
     })
   );
   // Mass has to balance across the main-drop / satellite split.
-  const bs = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0.06);
+  const bs = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0.06, 0);
   const r = 0.0015;
   const cyl = Math.PI * r * r * bs.wavelength;
   const drops =
@@ -135,8 +158,11 @@ function rayleighTests(): TestResult[] {
     })
   );
   // Higher surface tension drives the instability faster, so water must break up
-  // sooner than urine at the same diameter and speed.
-  const bw = solveBreakup(WATER_20C, 0.003, 3.0, 0.05, 0);
+  // sooner than urine at the same diameter and speed. Still air on both sides, so
+  // the test isolates the capillary scaling it names: surface tension also enters
+  // the gas Weber number, and letting air in would mix two mechanisms that happen
+  // to point the same way.
+  const bw = solveBreakup(WATER_20C, 0.003, 3.0, 0.05, 0, 0);
   out.push(
     check({
       name: 'Water breaks up sooner than urine (higher σ)',
@@ -148,9 +174,10 @@ function rayleighTests(): TestResult[] {
       reference: 'Growth rate scales as sqrt(σ/ρr³)',
     })
   );
-  // Viscosity damps the instability and stretches the jet.
+  // Viscosity damps the instability and stretches the jet. Still air on both
+  // sides for the same reason.
   const thick = { ...URINE_37C, viscosity: 0.1 };
-  const bt = solveBreakup(thick, 0.003, 3.0, 0.05, 0);
+  const bt = solveBreakup(thick, 0.003, 3.0, 0.05, 0, 0);
   out.push(
     check({
       name: 'Viscosity lengthens the intact jet',
@@ -163,19 +190,161 @@ function rayleighTests(): TestResult[] {
     })
   );
   // Sanity against observation: a 3 mm, 3 m/s anatomical stream is seen to break
-  // up at roughly 15-20 cm on high-speed video.
+  // up at roughly 15-20 cm on high-speed video. In air, because that is what was
+  // filmed.
+  const bAir = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0);
   out.push(
     check({
       name: 'Breakup length matches high-speed observation',
       group: 'Rayleigh-Plateau breakup',
       expected: '15–25 cm for 3 mm at 3 m/s',
-      actual: `${(b.breakupLength * 100).toFixed(1)} cm`,
-      errValue: b.breakupLength >= 0.15 && b.breakupLength <= 0.25 ? 0 : 1,
+      actual: `${(bAir.breakupLength * 100).toFixed(1)} cm`,
+      errValue: bAir.breakupLength >= 0.15 && bAir.breakupLength <= 0.25 ? 0 : 1,
       tolValue: 0.5,
-      reference: 'Calibrated via ε₀/r = 0.05; the one tuned constant in the model',
-      notes: 'Depends only logarithmically on the disturbance ratio',
+      reference:
+        'Hurd & Truscott (BYU Splash Lab, APS DFD 2013) filmed a urethra replica at ' +
+        '21 mL/s and put breakup at 6–7 inches, i.e. 15–18 cm',
+      notes: 'Calibrated via ε₀/r = 0.05, on which the length depends only logarithmically',
     })
   );
+
+  // What the tuned disturbance ratio is really standing in for.
+  //
+  // The dispersion relation above is a *laminar* linear-stability result, and the
+  // stream is not laminar: at 22 mL/s through a 3 mm exit, Re ≈ 10 800. Laminar
+  // theory with a physically plausible initial disturbance (thermal capillary
+  // waves, ln(r/ε₀) ≈ 15) puts breakup around a metre; the measured figure is
+  // 15–18 cm. The model reaches the right answer by carrying ε₀/r = 0.05, i.e.
+  // ln(r/ε₀) = 3.0 -- so that constant is not "surface finish", it is turbulence,
+  // and this check ties it to a published turbulent correlation rather than to a
+  // recollection of a video.
+  //
+  // The two do not have the same velocity scaling and are not meant to: Grant &
+  // Middleman goes as We^0.32, i.e. v^0.64, while linear theory goes as v. They
+  // agree near the anatomical operating point, which is where the calibration was
+  // made, and drift to ~30% by 6 m/s. That is a stated limitation, not a hidden one.
+  {
+    const d = 0.003;
+    const v = 3.0;
+    const weL = (URINE_37C.density * v * v * d) / URINE_37C.surfaceTension;
+    const lGM = d * 8.51 * Math.pow(weL, 0.32);
+    out.push(
+      check({
+        name: 'Breakup length agrees with the turbulent-jet correlation at the operating point',
+        group: 'Rayleigh-Plateau breakup',
+        expected: `${(lGM * 100).toFixed(1)} cm from L/d = 8.51·We^0.32 at We = ${weL.toFixed(0)}`,
+        actual: `${(bAir.breakupLength * 100).toFixed(1)} cm`,
+        errValue: rel(bAir.breakupLength, lGM),
+        tolValue: 0.2,
+        reference:
+          'Grant & Middleman 1966, turbulent branch. Jet Re ≈ 10 800 at peak flow, so ' +
+          'the turbulent branch is the applicable one',
+        notes:
+          'Anatomy closes the loop independently: a 7.1 mm² urethra at Qmax 22.5 mL/s ' +
+          'gives a 3.0 mm jet at 3.2 m/s, and 1.89·d_jet = 5.7 mm drops against the ' +
+          '4.4–7.2 mm measured by Thurairajah et al., PNAS Nexus 2025',
+      })
+    );
+  }
+
+  // -- Aerodynamic breakup: the first wind-induced regime --------------------
+  //
+  // The single most important qualitative fact about breakup length is that it is
+  // *not* monotonic in jet velocity. It rises linearly while capillarity governs,
+  // reaches a maximum, and then falls as gas inertia takes over -- the falling
+  // branch is what defines the first wind-induced regime, and the maximum is
+  // exactly what including the aerodynamic term predicts (Grant & Middleman 1966).
+  //
+  // Without that term the model claimed a coherent jet 1.35 m long at 20 m/s and
+  // 2.08 m at 30 m/s, growing without bound. That is Trap 22 in a different
+  // correlation: a relation used far outside the regime it describes. Breakup
+  // length is one of the two levers the whole tool turns on, so this is checked
+  // rather than assumed.
+  {
+    const speeds: number[] = [];
+    for (let v = 0.5; v <= 30.001; v += 0.5) speeds.push(v);
+    const lengths = speeds.map(
+      (v) => solveBreakup(URINE_37C, 0.003, v, 0.05, 0.06).breakupLength
+    );
+    let peakIdx = 0;
+    for (let i = 1; i < lengths.length; i++) if (lengths[i] > lengths[peakIdx]) peakIdx = i;
+    const rises = peakIdx > 0 && lengths[peakIdx] > lengths[0];
+    const falls = lengths[lengths.length - 1] < 0.6 * lengths[peakIdx];
+    const interior = peakIdx > 0 && peakIdx < lengths.length - 1;
+    out.push(
+      check({
+        name: 'Breakup length peaks and then falls with jet speed',
+        group: 'Rayleigh-Plateau breakup',
+        expected: 'a maximum at an interior speed, then a fall to under 60% of it',
+        actual:
+          `peak ${(lengths[peakIdx] * 100).toFixed(0)} cm at ${speeds[peakIdx].toFixed(1)} m/s, ` +
+          `${(lengths[lengths.length - 1] * 100).toFixed(0)} cm at ${speeds[speeds.length - 1].toFixed(0)} m/s`,
+        errValue: rises && falls && interior ? 0 : 1,
+        tolValue: 0.5,
+        reference:
+          'Grant & Middleman 1966: the breakup curve has a maximum; the falling branch ' +
+          'is the first wind-induced regime',
+        notes:
+          'Capillarity alone gives a length linear in speed for ever. Gas inertia ' +
+          '(Weber 1931) is what turns the curve over',
+      })
+    );
+
+    // The size of the correction, at both ends. Small where the air barely matters
+    // and decisive where it dominates -- a term that is merely present but
+    // mis-scaled would pass a sign test and fail this one.
+    const weGas = (v: number, d: number) => (AIR_DENSITY * v * v * d) / URINE_37C.surfaceTension;
+    const slowAir = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0.06).breakupLength;
+    const slowVac = solveBreakup(URINE_37C, 0.003, 3.0, 0.05, 0.06, 0).breakupLength;
+    const fastAir = solveBreakup(URINE_37C, 0.003, 20.0, 0.05, 0.06).breakupLength;
+    const fastVac = solveBreakup(URINE_37C, 0.003, 20.0, 0.05, 0.06, 0).breakupLength;
+    const slowCut = 1 - slowAir / slowVac;
+    const fastCut = 1 - fastAir / fastVac;
+    out.push(
+      check({
+        name: 'Air shortens the jet in proportion to the gas Weber number',
+        group: 'Rayleigh-Plateau breakup',
+        expected: 'under 10% at We_gas ≈ 0.6, over 50% at We_gas ≈ 26',
+        actual:
+          `We_gas ${weGas(3, 0.003).toFixed(2)} → ${(100 * slowCut).toFixed(1)}% shorter; ` +
+          `We_gas ${weGas(20, 0.003).toFixed(1)} → ${(100 * fastCut).toFixed(1)}% shorter`,
+        errValue: slowCut > 0 && slowCut < 0.1 && fastCut > 0.5 ? 0 : 1,
+        tolValue: 0.5,
+        reference: 'Weber 1931 gas-inertia term, attenuated by Sterling & Sleicher 1975 C = 0.175',
+        notes:
+          'At the default posture the stream sits at We_gas ≈ 0.63, just past the ' +
+          'Rayleigh-regime boundary, so the correction there is a few percent and the ' +
+          'documented 21 cm breakup is unchanged',
+      })
+    );
+
+    // Structural: air widens the unstable band past the Plateau limit. The old
+    // growth-rate function returned a flat zero for every x >= 1, so it could not
+    // represent this at all however large the gas term became.
+    const fast = solveBreakup(URINE_37C, 0.003, 20.0, 0.05, 0.06);
+    out.push(
+      check({
+        name: 'Air pushes the fastest mode past the Plateau limit kr = 1',
+        group: 'Rayleigh-Plateau breakup',
+        expected: 'kr > 1 at We_gas ≈ 26, and drops smaller than the still-air ones',
+        actual:
+          `kr ${fast.wavenumber.toFixed(3)} (still air ${solveBreakup(URINE_37C, 0.003, 20, 0.05, 0.06, 0).wavenumber.toFixed(3)}), ` +
+          `d_drop/d_jet ${(fast.mainDropletDiameter / 0.003).toFixed(2)}`,
+        errValue:
+          fast.wavenumber > 1 &&
+          fast.mainDropletDiameter < solveBreakup(URINE_37C, 0.003, 20, 0.05, 0.06, 0).mainDropletDiameter
+            ? 0
+            : 1,
+        tolValue: 0.5,
+        reference:
+          'Sterling & Sleicher 1975: air moves the most rapidly growing mode to the ' +
+          'short-wave part of the spectrum',
+        notes:
+          'Consequential rather than cosmetic — a faster jet makes smaller drops, and ' +
+          'the Mundo splash group goes as d^0.75',
+      })
+    );
+  }
   return out;
 }
 
@@ -187,9 +356,13 @@ function dragTests(): TestResult[] {
   const out: TestResult[] = [];
   for (const d of [0.0005, 0.002, 0.005]) {
     const vT = terminalVelocity(URINE_37C, d);
-    // At terminal velocity drag must exactly balance the buoyant weight.
+    // At terminal velocity drag must exactly balance the buoyant weight. This is
+    // self-consistency -- it uses the same Cd the solver used, so it can only
+    // catch a failure of the iteration to converge. The Gunn & Kinzer case below
+    // is the one that tests whether the drag law is right.
     const re = (AIR_DENSITY * vT * d) / AIR_VISCOSITY;
-    const cd = dragCoefficient(re);
+    const weGas = (AIR_DENSITY * vT * vT * d) / URINE_37C.surfaceTension;
+    const cd = dropletDragCoefficient(re, weGas);
     const drag = 0.5 * AIR_DENSITY * cd * ((Math.PI * d * d) / 4) * vT * vT;
     const weight = ((URINE_37C.density - AIR_DENSITY) * GRAVITY * Math.PI * d ** 3) / 6;
     out.push(
@@ -197,13 +370,111 @@ function dragTests(): TestResult[] {
         name: `Terminal velocity force balance, d = ${(d * 1000).toFixed(1)} mm`,
         group: 'Droplet aerodynamics',
         expected: `drag = weight = ${weight.toExponential(3)} N`,
-        actual: `${drag.toExponential(3)} N at ${vT.toFixed(3)} m/s (Re ${re.toFixed(0)})`,
+        actual:
+          `${drag.toExponential(3)} N at ${vT.toFixed(3)} m/s ` +
+          `(Re ${re.toFixed(0)}, We_gas ${weGas.toFixed(2)})`,
         errValue: rel(drag, weight),
         tolValue: 0.005,
-        reference: 'Schiller-Naumann drag law',
+        reference: 'Clift & Gauvin drag with the Liu-Reitz deformation factor',
       })
     );
   }
+  // -- Against a real measurement, not against ourselves ---------------------
+  //
+  // The three force-balance cases above are self-consistency: they compute drag
+  // with the same Cd the solver used and confirm it equals the weight. That
+  // proves the iteration converges and says nothing at all about whether the drag
+  // law is right. Gunn & Kinzer measured terminal velocities of real water drops
+  // and the numbers have stood since 1949, so this is the first check here that
+  // the drag law could actually fail.
+  //
+  // It found something. The old law -- Schiller-Naumann below Re = 1000, flat 0.44
+  // above, rigid sphere throughout -- was 22.0% out at 5 mm. Replacing 0.44 with
+  // Clift & Gauvin and *keeping* the rigid sphere makes it worse, 30.6%, because
+  // the too-high plateau had been quietly standing in for the missing deformation.
+  // With both corrected the worst error over 0.5-5 mm is 6.5%.
+  {
+    const gunnKinzer: Array<[number, number]> = [
+      [0.0005, 2.06],
+      [0.001, 4.03],
+      [0.002, 6.49],
+      [0.003, 8.06],
+      [0.004, 8.83],
+      [0.005, 9.09],
+    ];
+    let worst = 0;
+    let worstD = 0;
+    for (const [d, vRef] of gunnKinzer) {
+      const e = rel(terminalVelocity(WATER_20C, d), vRef);
+      if (e > worst) {
+        worst = e;
+        worstD = d;
+      }
+    }
+    out.push(
+      check({
+        name: 'Terminal velocity matches measured raindrops, 0.5–5 mm',
+        group: 'Droplet aerodynamics',
+        expected: '2.06 / 4.03 / 6.49 / 8.06 / 8.83 / 9.09 m/s at 0.5–5 mm',
+        actual:
+          gunnKinzer.map(([d]) => terminalVelocity(WATER_20C, d).toFixed(2)).join(' / ') +
+          ` m/s (worst at ${(worstD * 1000).toFixed(1)} mm)`,
+        errValue: worst,
+        tolValue: 0.09,
+        reference: 'Gunn & Kinzer 1949, J. Meteorology 6, 243–248, at 1013 mb and 20 °C',
+        notes:
+          'The only test here the drag law can fail. Rigid-sphere drag alone reads ' +
+          '30.6% high at 5 mm; a drop that size is visibly flattened and carries about ' +
+          'twice a sphere’s drag',
+      })
+    );
+  }
+
+  // The drag law must not have a seam in it. The old one switched from
+  // Schiller-Naumann to a flat 0.44 at Re = 1000 -- only a 0.39% step, but the
+  // model's main drops cross that Reynolds number as they decelerate, and a
+  // piecewise law invites a much larger one next time it is edited.
+  {
+    const below = dragCoefficient(999.999);
+    const above = dragCoefficient(1000.001);
+    out.push(
+      check({
+        name: 'Drag coefficient is continuous across the Newton transition',
+        group: 'Droplet aerodynamics',
+        expected: 'no step at Re = 1000',
+        actual: `Cd = ${below.toFixed(6)} below, ${above.toFixed(6)} above`,
+        errValue: rel(above, below),
+        tolValue: 1e-5,
+        reference: 'Clift & Gauvin 1970 is a single expression over the whole range',
+      })
+    );
+  }
+
+  // Aerodynamic breakup is deliberately absent, and this records why: the drops
+  // this model makes never get near the threshold for it. If a future change
+  // makes them, this fails and the omission has to be revisited.
+  {
+    const dMax = 0.006;
+    const vMax = 8;
+    const weMax = (AIR_DENSITY * vMax * vMax * dMax) / URINE_37C.surfaceTension;
+    out.push(
+      check({
+        name: 'Airborne droplets stay below the aerodynamic breakup threshold',
+        group: 'Droplet aerodynamics',
+        expected: 'We_gas < 11 for any droplet this model produces',
+        actual: `worst case ${(dMax * 1000).toFixed(0)} mm at ${vMax} m/s gives We_gas = ${weMax.toFixed(1)}`,
+        errValue: weMax < 11 ? 0 : 1,
+        tolValue: 0.5,
+        reference:
+          'Bag-breakup onset We_gas = 11 ± 2 (Guildenbecher, López-Rivera & Sojka 2009); ' +
+          '12 (Pilch & Erdman 1987)',
+        notes:
+          'So secondary atomisation is not modelled, on purpose. Deformation is, because ' +
+          'that begins at We_gas ≈ 1 and the main drops reach it',
+      })
+    );
+  }
+
   // Stokes limit: for very small droplets Cd -> 24/Re, giving v = ρ g d²/(18 μ).
   const dSmall = 2e-5;
   const vStokes = ((URINE_37C.density - AIR_DENSITY) * GRAVITY * dSmall * dSmall) / (18 * AIR_VISCOSITY);
@@ -694,6 +965,52 @@ function splashTests(): TestResult[] {
     })
   );
 
+  // The dry and wetted branches use *different* dimensionless groups, and the
+  // model has to keep them apart. Mundo's K = We^0.5 Re^0.25 against ~57.7;
+  // Cossali's K = We Oh^-0.4 against 2100 + 5880 delta^1.44. Since Oh =
+  // sqrt(We)/Re the second is We^0.8 Re^0.4, i.e. the first raised to 1.6 --
+  // exactly, not approximately.
+  //
+  // Checked because the comment in constants.ts asserted for a long time that the
+  // two shared the We^0.5 Re^0.25 grouping "so a single K can be compared against
+  // either threshold". The code never did that, but the comment invited someone to
+  // make it so, and collapsing the two would move the wetted threshold by a power
+  // of 1.6 -- silently, and in a direction that flatters the fixture.
+  {
+    let worst = 0;
+    for (const [v, d] of [
+      [1, 0.002],
+      [3, 0.0055],
+      [5, 0.0005],
+      [0.4, 0.004],
+    ] as const) {
+      const kM = Math.sqrt(weber(URINE_37C, v, d)) * Math.pow(reynolds(URINE_37C, v, d), 0.25);
+      const kC = weber(URINE_37C, v, d) * Math.pow(ohnesorge(URINE_37C, d), -0.4);
+      worst = Math.max(worst, rel(kC, Math.pow(kM, 1.6)));
+    }
+    // Where each threshold sits once mapped onto the other's scale.
+    const dryOnCossali = Math.pow(DRY_SPLASH_K_SMOOTH, 1.6);
+    const wetThin = WET_SPLASH_K_BASE + WET_SPLASH_K_FILM * Math.pow(0.005, 1.44);
+    out.push(
+      check({
+        name: 'The dry and wetted correlations stay on their own scales',
+        group: 'Splash threshold',
+        expected: 'K_Cossali = K_Mundo^1.6 identically, over four decades of conditions',
+        actual: `worst deviation ${(100 * worst).toExponential(2)}%`,
+        errValue: worst,
+        tolValue: 1e-9,
+        reference: 'Oh = √We/Re, so We·Oh^-0.4 = We^0.8·Re^0.4 = (We^0.5·Re^0.25)^1.6',
+        notes:
+          `On one scale the two thresholds are dry ${dryOnCossali.toFixed(0)} against ` +
+          `wetted ${wetThin.toFixed(0)} at δ = 0.005, so as implemented a thinly wetted ` +
+          `wall is ${(Math.pow(wetThin, 1 / 1.6) / DRY_SPLASH_K_SMOOTH).toFixed(2)}× harder ` +
+          'to splash than a dry one. Cossali also published a dry, roughness-dependent ' +
+          'threshold 649 + 3.76/R^0.63 whose rough asymptote IS Mundo\'s 57.7 — so this ' +
+          'branch is a rough wall, not the smooth glaze it is labelled. See constants.ts',
+      })
+    );
+  }
+
   // A slow droplet must simply deposit.
   const slow = resolver.probeThreshold(0.35, Math.PI / 2, 0.002, hFilm);
   out.push(
@@ -941,6 +1258,51 @@ function endToEndTests(): TestResult[] {
           'books the rest to the zone, so closure is the check that it is exhaustive',
       })
     );
+
+    // The splash correlations must not manufacture energy — asserted directly,
+    // rather than by trusting the guard that would catch it.
+    //
+    // `emitSecondaries` caps outgoing kinetic energy plus new surface energy at
+    // the incoming kinetic energy. Trap 38 is the story of that guard being
+    // *inert*: it summed the energy of a nominal droplet instead of the parcel's
+    // real multiplicity, so it under-counted by tens exactly when the secondary
+    // cap was binding. It was fixed to compute on the liquid that actually moves,
+    // but nothing ever checked whether it now fires.
+    //
+    // Measured: it does not, and that is the right answer. Over four cases and
+    // 21 853 splash events — including this one, the stream thrown onto the front
+    // rim, and near-normal incidence on the flat slab — it bound zero times. An
+    // empirical ejection speed of 0.55·v_n + 0.12·v_t and a mass fraction capped
+    // at 0.7 put outgoing kinetic energy near 14% of incoming, with the surface
+    // cost around 2%, so the budget is never approached. The correlations are
+    // mutually consistent and the guard has nothing to do.
+    //
+    // Checked as a rate rather than as zero, so that a future change which makes
+    // it bind occasionally and legitimately does not fail, while one that pushes
+    // the splash model past its own energy budget does.
+    {
+      const t = sim.impact.totals;
+      const rate = t.energyGuardEvents / Math.max(1, t.splashEvents);
+      out.push(
+        check({
+          name: 'The splash model stays inside its own energy budget',
+          group: 'End to end',
+          expected: 'the kinetic-energy guard has to clamp fewer than 1% of splash events',
+          actual:
+            `${t.energyGuardEvents} of ${t.splashEvents} clamped ` +
+            `(worst scale ${t.energyGuardWorstScale.toFixed(3)})`,
+          errValue: rate,
+          tolValue: 0.01,
+          reference:
+            'Outgoing KE plus the surface energy of the new interface cannot exceed the ' +
+            'incoming KE',
+          notes:
+            'This is the worst aim on the fixture, so if the empirical ejection speed and ' +
+            'mass fraction were going to over-produce anywhere it would be here. A guard ' +
+            'that never fires is only reassuring once someone has counted',
+        })
+      );
+    }
   }
   // ---- Peeing on the fixture rather than into it -------------------------
   // The outside of a urinal is hard glazed ceramic and chrome, standing closer to
@@ -1082,6 +1444,116 @@ function endToEndTests(): TestResult[] {
         notes:
           'escapedVolume was declared, reset and reported but never incremented, and was ' +
           'missing from the closure sum; this case drifted to 0.0718% before the fix',
+      })
+    );
+  }
+
+  // ---- Satellites, and the aim policy that governs the tail ---------------
+  //
+  // Two claims off one pair of runs, because each run is a few seconds of wall
+  // clock and they share a configuration.
+  {
+    const mkRun = (tracking: 'fixed' | 'tracked') => {
+      const c = defaultConfig();
+      const p = getPreset('classic-bowl');
+      c.surface = { ...p.params };
+      c.casting = { ...(p.shell ?? {}) };
+      c.fittings = { ...(p.fittings ?? {}) };
+      c.stream.voidVolume = 150e-6;
+      c.drainTime = 1;
+      c.resolutionU = 48;
+      c.resolutionV = 96;
+      c.particleCapacity = 140000;
+      c.seed = 4242;
+      c.aimTargetV = p.defaultAimV ?? 0.18;
+      c.aimTracking = tracking;
+      const sim = new Simulation(c);
+      const rep = sim.run();
+      return { sim, rep, phi: c.stream.satelliteFraction };
+    };
+    const held = mkRun('fixed');
+    const tracked = mkRun('tracked');
+
+    // A wavelength of jet does not become one sphere. `solveBreakup` has always
+    // computed the main-drop / satellite split and the check above has always
+    // confirmed it conserves volume -- but nothing downstream acted on it. Every
+    // parcel stayed whole, adopted the *main* drop's diameter while keeping the
+    // *whole* wavelength's volume, and not one particle in a run ever carried
+    // PFlag.Satellite, a flag the droplet renderer has its own style for. So
+    // `satelliteFraction` was a parameter, a validated quantity and a render path
+    // that between them changed nothing but the drop diameter, by (1-phi)^(1/3).
+    const share = held.sim.particles.satelliteVolumeReleased / Math.max(1e-12, held.rep.voidedVolume);
+    out.push(
+      check({
+        name: 'Satellite drops are actually pinched off, and carry their stated share',
+        group: 'End to end',
+        expected: `volume share within 80–100% of satelliteFraction = ${held.phi}`,
+        actual:
+          `${held.sim.particles.satellitesReleased} satellites carrying ` +
+          `${(held.sim.particles.satelliteVolumeReleased * 1e6).toFixed(3)} mL, ` +
+          `share ${(100 * share).toFixed(2)}% of ${(held.rep.voidedVolume * 1e6).toFixed(1)} mL voided`,
+        errValue:
+          held.sim.particles.satellitesReleased > 100 &&
+          share > 0.8 * held.phi &&
+          share <= held.phi * 1.001
+            ? 0
+            : 1,
+        tolValue: 0.5,
+        reference: 'The main-drop / satellite split solveBreakup already computed',
+        notes:
+          'Short of the full fraction only by the parcels that reach the wall still ' +
+          'coherent, which never pinch off. Volume closure is what proves the split ' +
+          'neither loses nor invents liquid',
+      })
+    );
+
+    // Trap 17 says the weak rise and tail dominate splashback. That claim was
+    // measured with the aim solved once at peak exit speed and then held, which
+    // makes a decaying stream fall progressively shorter onto the fixture's own
+    // rim -- so it was fair to ask how much of the tail was the modelling choice
+    // rather than the physics. Answer: tracking the target perfectly cuts the tail
+    // to roughly a third, and it *still* dominates. The claim survives its own
+    // most optimistic assumption, which is a stronger statement than the original.
+    const ratioHeld =
+      held.rep.splash.weakMicrolitresPerLitre /
+      Math.max(1, held.rep.splash.sustainedMicrolitresPerLitre);
+    const ratioTracked =
+      tracked.rep.splash.weakMicrolitresPerLitre /
+      Math.max(1, tracked.rep.splash.sustainedMicrolitresPerLitre);
+    const relief =
+      tracked.rep.splash.weakMicrolitresPerLitre /
+      Math.max(1, held.rep.splash.weakMicrolitresPerLitre);
+    out.push(
+      check({
+        name: 'Weak flow dominates whether or not the user tracks their aim',
+        group: 'End to end',
+        expected: 'tail at least 4× sustained under both aim policies, and tracking helps',
+        actual:
+          `held aim ${ratioHeld.toFixed(1)}× (weak ${held.rep.splash.weakMicrolitresPerLitre.toFixed(0)} µL/L), ` +
+          `tracked ${ratioTracked.toFixed(1)}× (weak ${tracked.rep.splash.weakMicrolitresPerLitre.toFixed(0)} µL/L); ` +
+          `tracking leaves ${(100 * relief).toFixed(0)}% of the tail, ` +
+          `${tracked.sim.unreachableSteps} steps out of ballistic range`,
+        errValue: ratioHeld >= 4 && ratioTracked >= 4 && relief < 1 ? 0 : 1,
+        tolValue: 0.5,
+        reference:
+          'Held aim is the default and what every published figure here was measured ' +
+          'with; tracked is the optimistic bound of a user re-solving continuously',
+        notes:
+          'Measured 0.30–0.37× on the oval bowl and flat slab over two seeds, with the ' +
+          'liquid thrown onto the outside of the fixture during the tail falling from ' +
+          '~16 mL to ~5 mL. So the all-in figure carries a factor-of-three sensitivity ' +
+          'to a modelling choice — one more reason Traps 16 and 42 rule it out as a headline',
+      })
+    );
+    out.push(
+      check({
+        name: 'Volume closes under aim tracking',
+        group: 'End to end',
+        expected: 'every drop accounted for with the aim re-solved every step',
+        actual: `${(100 * tracked.rep.volumeClosureError).toFixed(4)}% unaccounted`,
+        errValue: tracked.rep.volumeClosureError,
+        tolValue: 1e-4,
+        reference: 'Conservation of mass; re-aiming must not disturb the balance',
       })
     );
   }

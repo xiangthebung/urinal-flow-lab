@@ -76,6 +76,18 @@ export interface PhaseTally {
   userDroplets: number;
   /** Volume striking the outside of the fixture during this phase, m^3. */
   exteriorVolume: number;
+  /**
+   * Of that, the volume that arrived straight from the stream, m^3.
+   *
+   * The distinction is the whole point. Splash landing on the casting is a
+   * consequence; the *stream* landing on the casting is Trap 14's mechanism, the
+   * single worst outcome available, and it is a different failure with a
+   * different remedy. Kept per phase because that is where it lives: the aim is
+   * solved once at peak exit speed, so a stream that is slower than peak falls
+   * short of its target and onto the fixture's own front rim, which happens
+   * during the rise and again during the tail and not in between.
+   */
+  exteriorDirectVolume: number;
 }
 
 const emptyPhase = (): PhaseTally => ({
@@ -83,6 +95,7 @@ const emptyPhase = (): PhaseTally => ({
   userVolume: 0,
   userDroplets: 0,
   exteriorVolume: 0,
+  exteriorDirectVolume: 0,
 });
 
 export interface TimeSample {
@@ -183,6 +196,24 @@ export interface SplashbackReport {
   sustainedMicrolitresPerLitre: number;
   /** The same, for the weak rise and decay. */
   weakMicrolitresPerLitre: number;
+  /**
+   * Volume of the *stream itself* that landed on the outside of the fixture, m^3.
+   *
+   * Generation 0 only, so this is liquid that never touched the fixture before
+   * arriving on its casing -- the stream missing, not splash coming back. It
+   * separates "this fixture splashes" from "this fixture was being sprayed on its
+   * own outside for part of the run", which per Trap 14 are different failures
+   * with wildly different magnitudes, and which the headline µL/L figure mixes
+   * together.
+   *
+   * Measured rather than predicted: it is what the swept-segment test actually
+   * booked, so it includes tremor and the real trajectory. `traceAim().blocked`
+   * answers the same question for one instant and one nominal aim, and is the
+   * right thing for a live readout; this is the right thing for a report.
+   */
+  streamOnExteriorVolume: number;
+  /** The same as a fraction of the volume voided. */
+  streamOnExteriorFraction: number;
 }
 
 export interface DrainageReport {
@@ -391,6 +422,7 @@ export class Metrics {
         ph.userDroplets++;
       } else if (zone === CaptureZone.FixtureExterior) {
         ph.exteriorVolume += volume;
+        if (generation === 0) ph.exteriorDirectVolume += volume;
       }
     }
 
@@ -457,7 +489,11 @@ export class Metrics {
     const litres = Math.max(1e-12, this.emittedVolume) * 1000;
     const perL = (p: PhaseTally): number =>
       p.emitted > 1e-12 ? (p.userVolume * 1e9) / (p.emitted * 1000) : 0;
+    const onExterior = this.perZone[CaptureZone.FixtureExterior].directVolume;
     return {
+      streamOnExteriorVolume: onExterior,
+      streamOnExteriorFraction:
+        this.emittedVolume > 1e-12 ? onExterior / this.emittedVolume : 0,
       userVolume,
       userSplashVolume: userSplash,
       userDirectVolume: userDirect,

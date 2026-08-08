@@ -1,5 +1,5 @@
 import { AIR_DENSITY, AIR_VISCOSITY, GRAVITY } from '../core/constants';
-import { FluidProperties, dragCoefficient } from '../core/fluid';
+import { FluidProperties, dropletDragCoefficient } from '../core/fluid';
 import { Vec3, v3 } from '../core/vec3';
 import { SolidCollider } from '../geometry/collider';
 import { SurfaceHit, UrinalSurface } from '../geometry/surface';
@@ -27,14 +27,14 @@ export const enum PFlag {
   Satellite = 1 << 3,
 }
 
-/** Why a particle left the simulation, for accounting. */
-export const enum PEnd {
-  StillAlive = 0,
-  HitSurface = 1,
-  Captured = 2,
-  OutOfBounds = 3,
-  TooSlow = 4,
-}
+// A `PEnd` enum -- StillAlive / HitSurface / Captured / OutOfBounds / TooSlow,
+// commented "why a particle left the simulation, for accounting" -- used to stand
+// here. Nothing in the project ever referenced it: no particle was ever tagged
+// with one, no total was ever kept per cause, and the accounting it named is done
+// elsewhere, by volume rather than by cause. Removed rather than wired up, because
+// the volume balance already closes at 0.0000% without it and a per-cause count
+// that agreed with nothing would be a second source of truth. If a cause breakdown
+// is ever wanted, it has to be added to the closure sum on the same day (Trap 24).
 
 export interface ImpactEvent {
   index: number;
@@ -85,9 +85,26 @@ export interface CaptureTester {
   test(from: Vec3, to: Vec3, out: { t: number; zone: number }): boolean;
 }
 
+/**
+ * A satellite drop pinched off the thread between two main drops.
+ *
+ * Emitted as a request rather than spawned inside the integration loop, so that
+ * allocating a slot cannot change how many particles that same loop visits. The
+ * caller spawns them immediately afterwards, which costs the satellite one step
+ * of flight -- a millimetre or two -- and keeps the sweep deterministic.
+ */
+export interface SatelliteSplit {
+  position: Vec3;
+  velocity: Vec3;
+  volume: number;
+  diameter: number;
+}
+
 export interface ParticleStepResult {
   impacts: ImpactEvent[];
   captures: CaptureEvent[];
+  /** Satellite drops pinched off this step, for the caller to spawn. */
+  satellites: SatelliteSplit[];
   /** Volume that had to be dropped because the buffer was full, m^3. */
   overflowVolume: number;
 }
@@ -111,6 +128,8 @@ export class ParticleSystem {
   readonly breakupTimer: Float32Array;
   /** Diameter to adopt at pinch-off, m. */
   readonly breakupDiameter: Float32Array;
+  /** Volume that leaves as a satellite at pinch-off, m^3. Zeroed once released. */
+  readonly satelliteVolume: Float32Array;
   readonly age: Float32Array;
   readonly flags: Uint8Array;
   readonly generation: Uint8Array;
@@ -123,6 +142,9 @@ export class ParticleSystem {
 
   /** Running accounting, m^3. */
   overflowVolume = 0;
+  /** Satellite drops pinched off since the last reset, and the volume in them. */
+  satellitesReleased = 0;
+  satelliteVolumeReleased = 0;
 
   constructor(capacity = 240000) {
     this.capacity = capacity;
@@ -137,6 +159,7 @@ export class ParticleSystem {
     this.jetDiameter = new Float32Array(capacity);
     this.breakupTimer = new Float32Array(capacity);
     this.breakupDiameter = new Float32Array(capacity);
+    this.satelliteVolume = new Float32Array(capacity);
     this.age = new Float32Array(capacity);
     this.flags = new Uint8Array(capacity);
     this.generation = new Uint8Array(capacity);
@@ -157,6 +180,8 @@ export class ParticleSystem {
     this.freeCount = 0;
     this.liveCount = 0;
     this.overflowVolume = 0;
+    this.satellitesReleased = 0;
+    this.satelliteVolumeReleased = 0;
   }
 
   /** Claim a slot, or -1 when full. */
@@ -191,6 +216,7 @@ export class ParticleSystem {
     this.jetDiameter[i] = p.jetDiameter;
     this.breakupTimer[i] = p.timeToBreakup;
     this.breakupDiameter[i] = p.breakupDiameter;
+    this.satelliteVolume[i] = p.satelliteVolume;
     this.age[i] = 0;
     this.flags[i] = PFlag.Alive | PFlag.Coherent;
     this.generation[i] = 0;
@@ -227,6 +253,7 @@ export class ParticleSystem {
     this.jetDiameter[i] = diameter;
     this.breakupTimer[i] = -1;
     this.breakupDiameter[i] = diameter;
+    this.satelliteVolume[i] = 0;
     this.age[i] = 0;
     this.flags[i] =
       PFlag.Alive |
@@ -268,6 +295,7 @@ export class ParticleSystem {
   ): void {
     out.impacts.length = 0;
     out.captures.length = 0;
+    out.satellites.length = 0;
     out.overflowVolume = 0;
 
     // Gravity reduced by buoyancy. Small for liquid in air, but free to include.
@@ -293,6 +321,23 @@ export class ParticleSystem {
           this.flags[i] = f & ~PFlag.Coherent;
           this.diameter[i] = this.breakupDiameter[i];
           coherent = false;
+          // The thread between two main drops collapses into a satellite. Split
+          // it off here, so the parcel's volume and its diameter agree from this
+          // point on: while it was a length of jet it carried the whole
+          // wavelength, and a wavelength does not become one sphere.
+          const satVol = this.satelliteVolume[i];
+          if (satVol > 0 && satVol < this.volume[i]) {
+            this.volume[i] -= satVol;
+            this.satelliteVolume[i] = 0;
+            this.satellitesReleased++;
+            this.satelliteVolumeReleased += satVol;
+            out.satellites.push({
+              position: v3(this.px[i], this.py[i], this.pz[i]),
+              velocity: v3(this.vx[i], this.vy[i], this.vz[i]),
+              volume: satVol,
+              diameter: Math.cbrt((6 * satVol) / Math.PI),
+            });
+          }
           if (onBreakup) onBreakup(i);
         }
       }
@@ -313,7 +358,11 @@ export class ParticleSystem {
         const speed = Math.hypot(vxi, vyi, vzi);
         if (speed > 1e-9 && d > 1e-9) {
           const re = (AIR_DENSITY * speed * d) / AIR_VISCOSITY;
-          const cd = dragCoefficient(re);
+          // Deformed-droplet drag, not rigid-sphere. The main drops off a 3 mm
+          // stream are 5-6 mm across, and at that size aerodynamic flattening is
+          // worth tens of percent of the drag rather than a rounding error.
+          const weGas = (AIR_DENSITY * speed * speed * d) / fluid.surfaceTension;
+          const cd = dropletDragCoefficient(re, weGas);
           // Linearised implicit update: unconditionally stable and keeps the
           // direction, which explicit Euler loses for small droplets whose drag
           // time constant approaches the step size.
@@ -460,5 +509,6 @@ export class ParticleSystem {
 export const makeStepResult = (): ParticleStepResult => ({
   impacts: [],
   captures: [],
+  satellites: [],
   overflowVolume: 0,
 });

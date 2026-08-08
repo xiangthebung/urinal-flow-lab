@@ -182,6 +182,18 @@ export interface ImpactTotals {
   exteriorEvents: number;
   /** Of `splashedVolume`, how much was thrown off the casting exterior, m^3. */
   exteriorSplashedVolume: number;
+  /**
+   * Splash events where the kinetic-energy budget had to scale the ejecta back.
+   *
+   * Counted because Trap 38 is the story of this guard being *inert* -- it summed
+   * the energy of a nominal droplet rather than of the parcel's real multiplicity,
+   * so it under-counted by tens exactly when the secondary cap was binding, which
+   * is when the impact is most violent and the guard exists. A guard that cannot
+   * fire is indistinguishable from no guard, and the only way to tell is to count.
+   */
+  energyGuardEvents: number;
+  /** Of those, the least the ejection speed was scaled to. 1 = never bound. */
+  energyGuardWorstScale: number;
 }
 
 /**
@@ -239,6 +251,8 @@ const emptyTotals = (): ImpactTotals => ({
   droppedVolume: 0,
   exteriorEvents: 0,
   exteriorSplashedVolume: 0,
+  energyGuardEvents: 0,
+  energyGuardWorstScale: 1,
 });
 
 /**
@@ -743,6 +757,10 @@ export class ImpactResolver {
     let scale = 1;
     if (ejectedKe > budget && ejectedKe > 1e-18) {
       scale = Math.sqrt(budget / ejectedKe);
+      this.totals.energyGuardEvents++;
+      if (scale < this.totals.energyGuardWorstScale) {
+        this.totals.energyGuardWorstScale = scale;
+      }
     }
 
     const off = 0.5 * medianD + 2e-4;
