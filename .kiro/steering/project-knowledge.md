@@ -103,6 +103,19 @@ tools/      shoot.mts      headless screenshots of the running app
 
 ### Load-bearing contracts
 
+- **`FixtureExtent` is the only correct answer to "where is the fixture".**
+  `src/sim/extent.ts`, built from interior ∪ casting (`ceramic`) and again with the
+  metalwork (`all`), and consumed by `CaptureScene`, the emitter, the room, the user
+  figure, the zones and the camera. Everything used to derive its answer from
+  `surface.bounds()`, which is the wetted patch and stops 0–44 mm short of the real
+  front face. Two consequences, both real: the user stood `standoff` in front of the
+  *interior*, so the control labelled "stand-off from fixture" over-reported the gap
+  by up to a third in the optimistic direction; and the `FixtureExterior` capture
+  plane, nominally 4 mm in front of the ceramic, sat *inside* the casting where
+  nothing could reach it. `npm run shoot` prints `castingAheadOfCapture`, which is
+  the residual — it now reads 0 mm on every model. Posture uses `ceramic`, because a
+  person does not stand back from the flush valve; framing uses `all`, because a
+  cropped flushometer is what makes a render look wrong.
 - **`UrinalSurface` is one lofted patch over `(u,v)`**, `u ∈ [-1,1]` across the width,
   `v ∈ [0,1]` from the top of the back wall to the front lip tip, uniform in
   arclength. The film solver is finite-volume and *requires* a structured grid with a
@@ -174,6 +187,10 @@ Two per-preset fields carry things that genuinely differ by model:
   Two are worth knowing: the oval bowl is 55° *anywhere* from v = 0.10 to 0.38 — it is
   a uniformly steep target, which is the mechanism its `expectation` text describes —
   and the trough has so little wall that v = 0.30 already reads 80°.
+  **`compact-waterless` is now 0.12, not 0.26** — 0.26 was inside the band its own
+  casting blocks, so the preset could not be aimed into at its own default. See Trap 44,
+  and re-check `traceAim().blocked` at every preset's default after any casting or
+  posture change.
 
 **`src/validation/suite.ts` hardcodes the ids `classic-bowl`, `flat-wall` and
 `nautilus-tall`.** Renaming or removing them breaks the suite. `flat-wall` must keep a
@@ -322,7 +339,8 @@ mechanism metric is the splash *fraction* ratio, stable at 1.39–1.45×.
 **17. Weak flow dominates splashback, and it is the largest single effect in the model.**
 The rise and the dribble are ~18% of the void and produce **6–16× more splashback per
 litre** than sustained flow (flat slab 10.3–16.6×, oval bowl 6.1–7.2×, constant-angle
-over 17 000× because its sustained figure is ~0). Any aggregate that mixes the phases is
+over 17 000× because its sustained figure is ~0; with the controls carrying their own
+casting, seed 4242 reads 20.8× and 5260×). Any aggregate that mixes the phases is
 reporting mostly the tail. This is why `FlowPhase` exists and why the report leads with
 "when it happens". No change to the bowl shape addresses it.
 
@@ -518,6 +536,81 @@ binds. They covered 11–16% of their cards. Projecting the eight corners and sh
 distance until they just fit took it to 16–26%, and it also stopped `compact-waterless`
 being silently *cropped*, which the loose guess was doing in the other direction.
 
+**38. A parcel is not a droplet once the secondary cap binds, and the energy guard
+has to know that.** `emitSecondaries` clamps the count to `maxSecondaries` (10) to
+bound cost, so each spawned parcel carries `splashVolume / count` and stands in for
+however many droplets of diameter `dd` that makes. The kinetic-energy budget that
+stops the model manufacturing splashback out of nothing was summing
+`0.5 ρ (π/6 dd³) sp²` — the *nominal* droplet — so it under-counted the outgoing
+energy by the parcel multiplicity and never bound. That multiplicity is largest
+exactly when the impact is most violent, i.e. in the cases the guard exists for. The
+surface-energy term had the same fault in the same direction, and the parent's area
+was one sphere when the parent may be a whole wavelength of jet. All three are now
+computed on the liquid that actually moves.
+
+**39. Emission sub-stepping needs the accumulator, not its fractional part.**
+`StreamEmitter.step` spread parcels back along the step by
+`emitAccumulator − floor(emitAccumulator)`. Subtracting one does not change a
+fractional part, so every parcel emitted in a step got the same offset: five parcels
+in a millisecond left from one point with identical velocities and flew as a lump.
+The comment said "so parcels do not stack on one point". The remaining accumulator
+*is* the number of wavelengths still queued behind this one, so
+`back = accumulator / emissionFrequency` is the parcel's real age.
+
+**40. The roughness correction on the dry threshold could only ever lower it.**
+`dryCriticalK * clamp(1/(1 + 900·Ra/d), 0.45, 1.6)`: `1/(1+x)` never exceeds 1, so
+the 1.6 ceiling was unreachable and the doc's "a very smooth fired glaze raises it"
+could not happen. Worse at the other end — a fired sanitary glaze at Ra = 0.3 µm read
+45 against Mundo's smooth 57.7, a 21% cut for the surface that *is* the smooth
+reference, and aged glaze hit the 0.45 floor at 26, below the published rough figure
+of ~33. It now smoothsteps between `DRY_SPLASH_K_SMOOTH` and `DRY_SPLASH_K_ROUGH` on
+Ra/d, so both ends land where the measurements are and the second constant is no
+longer declared-and-unread.
+
+**41. Resolve a swept segment by distance, not by category.** `ParticleSystem.step`
+tested the interior, then the casting, then the capture zones — so a droplet that
+crossed a shin panel on its way to the fixture was booked to the fixture. Small at the
+default posture and wrong at any posture where the legs reach in front of part of the
+ceramic, which is what `legSetback` exists to vary. All three are now compared on `t`.
+
+**42. The design score must not be built on the all-in splashback figure.** That is
+Trap 16 restated: the all-in number reverses which of two fixtures is better across
+the range of one posture slider, so a 0–100 figure a designer would rank by inherited
+that instability wholesale. `scoreDesign` now takes the splash sub-score from
+`sustainedMicrolitresPerLitre` — the part the fixture governs, stable across seeds —
+and pushes the tail into a note, where it belongs, because no bowl shape addresses it.
+
+**44. `compact-waterless` could not be aimed into, and nothing said so.** Its
+`defaultAimV` was 0.26 and the comment beside it said "past v = 0.30 the casting blocks
+the aim". Measured: the casting blocks everything past **v ≈ 0.15**, so the fixture's
+own default aim was a rim strike — Trap 14's worst outcome, reported as the model's
+nominal behaviour, on every run anyone ever did of that preset. It survived because the
+reach readout raycast the interior alone (Trap 15) and answered "no wall" rather than
+"the casting is in the way", so the HUD read `reach 0 cm` and the note went blank. Now
+0.12, one sweep step clear of the boundary. The reachable band is 67° from end to end,
+which is the real verdict on the shape and is outstanding item 5 — aim cannot fix a
+fixture you cannot aim into. **Check `traceAim().blocked` at a preset's own
+`defaultAimV` whenever the casting or the posture changes.**
+
+**45. A tangential graze reports 0° and wins "best aim" outright.** Where the trace
+catches the rim edge-on, `traceAim` returns `reached` with an impingement angle of
+essentially zero, and the aim sweep then recommends it. Measured on the untouched
+library: classic-bowl v = 0.49, flat-wall 0.62 and nautilus-tall 0.55 all read 0°, each
+flanked on both sides by aims the casing blocks. It is the worst possible
+recommendation — one sweep step either way puts the stream on the outside of the
+fixture, and the model's own tremor is larger than that step. The sweep now marks any
+reachable aim adjacent to a blocked one as grazing, lists it, and excludes it from the
+recommendation.
+
+**43. A control fixture must be simulated as the fixture it is.** The headline A/B in
+`suite.ts` built `flat-wall` and `nautilus-tall` from `preset.params` alone and left
+`casting` and `fittings` at the defaults, so the two controls wore the default bowl's
+exterior and metalwork. Neither the app nor the picker shows those fixtures. The
+casting is solid, it splashes, it hides 19–44% of the interior from the exit point,
+and the metalwork stands closer to the user than any ceramic — so "same stream, same
+seed, same aim" was controlling everything except the part of the fixture nearest the
+user.
+
 **37. A validation check must select geometry by something the geometry owns.** The
 "peeing on the fixture" check scanned aim elevation in degrees and took the highest
 blocked angle. That worked only while the casting had the Trap 32 collar for a level
@@ -544,15 +637,27 @@ Re-measure with a throwaway script over `PRESETS` × resolutions if you touch
 `surface.ts`, `wrap.ts` or any preset's `wrapDepth` / `taperExponent` / `widthSump`.
 Those three quantities are what move it.
 
-`npm run validate` → **46/46** (~100 s). `npm run build` clean.
+`npm run validate` → **46/46** (~180 s). `npm run build` clean.
 
-Peeing *on* the fixture rather than into it, oval bowl, 150 mL, seed 4242, 48×96.
-Into the bowl at the preset's own default aim (v = 0.26, 55° on the interior):
-**6685 µL/L**. Onto the casting at v = 0.50, which the trace reports blocked 393 mm above
-the datum: **291 446 µL/L**, 43.6×. Walking v forward from there, 0.55 → 247 669,
-0.60 → 54 795, 0.65 → 20 053, 0.70 → 8925: the penalty is enormous but it falls away
-fast, because past the front rim the stream starts clearing the fixture again. Closure
-stays 0.0000% in all of them, which it did not before Trap 24 was fixed.
+> **The absolute µL/L figures below moved on 2026-08-08** and the older ones are kept
+> only for the shape of the argument. Three changes account for it, all of them making
+> the geometry more like the product: the emitter sits `standoff` from the *ceramic*
+> rather than from the wetted interior (`FixtureExtent`, 0–44 mm nearer than before),
+> the dry-splash threshold for a smooth glaze is the published 57.7 instead of an
+> effective 45, and the A/B controls carry their own casting and metalwork. Ratios are
+> what to trust; every check in the suite is written as one for that reason.
+
+Peeing *on* the fixture rather than into it, oval bowl, 150 mL, seed 4242, 48×96, and
+the check now walks `aimTargetV` to find the first target the casting blocks (Trap 37).
+Into the bowl at the preset's own default aim (v = 0.26, 56° on the interior):
+**7908 µL/L**. Onto the casting at v = 0.45, which the trace reports blocked 397 mm
+above the datum: **119 790 µL/L**, 15.1×. Before this pass the same two cases read 5668
+and 98 559 (17.4×), and before Trap 24 the second one did not close.
+
+The earlier walk forward from a *deeper* strike, for the shape of it: at v = 0.50 →
+291 446, 0.55 → 247 669, 0.60 → 54 795, 0.65 → 20 053, 0.70 → 8925. The penalty is
+enormous but falls away fast, because past the front rim the stream starts clearing the
+fixture again. Closure stays 0.0000% in all of them.
 
 Aiming by raw elevation instead reaches the **metalwork**, not the ceramic — see Trap 37.
 For the record, at 150 mL/seed 4242: +14° gives 56 634 µL/L (8.5×) and +20° gives
@@ -677,16 +782,12 @@ every resolution from 48×96 to 112×200 and on all six presets: **0 flipped nor
 0 degenerate cells.** Re-run the seed sweep and the stand-off sweep afterwards too,
 because enclosure is what stops splash leaving and the A/B claim rests on it.
 
-**1. `FixtureExtent` (high).** Every `npm run shoot` line prints
-`castingAheadOfCapture`, currently 0–44 mm depending on model. `CaptureScene` still
-derives everything — emitter stand-off, user figure, shin/thigh planes, floor, heat
-planes — from `surface.bounds().max.z`, the **interior**. Consequently the
-`FixtureExterior` capture plane sits at `interiorFrontZ + 4 mm`, i.e. *inside* the
-ceramic, and "stand-off from fixture" under-reports the real gap. The casting collider
-now intercepts droplets before they reach that plane, so it is masked rather than
-fixed. The fix is one object carrying front/back/bottom/bounds/floor, built from
-interior ∪ casting, consumed by capture, camera, room, user and zones — which kills the
-whole class at source instead of patching six call sites.
+**1. `FixtureExtent` — done.** `src/sim/extent.ts`; see the load-bearing contract
+above. `castingAheadOfCapture` now reads 0 mm on every model. One consequence worth
+knowing: the constant-angle generator's two-pass alignment now measures the front face
+off the *ceramic*, so each pass costs a casting build. That is deliberate — aligning
+the generator to a user standing 0–44 mm further forward than the one the simulation
+then places is the exact mistake the alignment code exists to prevent.
 
 **2. Per-model default aim (high, partly done).** Aim is now two-dimensional
 (`aimTargetU` / `aimTargetV`), directly pickable in the viewport, and traced against the
@@ -711,6 +812,13 @@ and imported meshes all arrive through one door; `FixtureGeometry` as an interfa
 for meshes that already have an exterior. Two import paths, easiest first: fit the
 parametric loft to an imported mesh (keeps the film solver intact, lossy), then native
 imported grids (needs the solver to accept a general grid).
+
+**3b. The picker's card caption measures the ceramic, not the plumbing (done).** It
+used to be read off the same box the view is framed on, which includes the flushometer
+and its supply pipe — so the cards advertised the oval bowl as 878 mm tall against a
+catalogue 640, and the trough as 796 against 290. `ThumbnailResult.dims` now comes from
+interior ∪ casting while the frame still holds the metalwork. `tools/thumbsheet.mts`
+prints the captions, and they now match the envelope table above exactly.
 
 **4. Hardcoded constants (medium).** `BANDS` (112), `ABINS` (49), `BODY_A` (44),
 `BODY_V` (96) in `shell.ts` are module constants, not parameters. They were 56/33/34/56
@@ -816,3 +924,54 @@ WOULD HELP → DRAINAGE → SOLVER**. "What would help" is derived from the run'
 rather than being generic advice. The previous version printed forty-odd quantities in
 solver order with no comparison and no statement of what any of it implied, and its
 headline was the all-generations impingement figure from Trap 20.
+
+### The results panel reads live
+
+Nineteen readouts across Splashback, Impingement and Drainage used to print a literal
+em-dash until a full analysis had been run, so the right-hand panel spent every
+playback looking broken while the simulation underneath it held every one of those
+numbers. They now read from the running metrics and switch to the finished report when
+there is one, with a trailing `*` marking a mid-run figure — the convention the
+headline already used. Three of the sources walk the whole film grid and
+`actualImpingement` sorts two arrays as long as it, so each is computed once per
+simulated instant and shared: it was being called four times per repaint at 8 Hz.
+
+**A per-litre figure needs a denominator.** µL/L against the few millilitres voided in
+the first second reads as tens of thousands, so the most prominent number in the tool
+opened every run announcing a catastrophe in the band its own report calls "the user is
+being sprayed". Below a tenth of the void, the absolute volume is shown instead. Same
+guard on the two per-phase figures and the tail ratio.
+
+**The overlay note is one element and had two writers.** The geometry warning
+("profile self-intersects — not manufacturable") was written by
+`refreshGeometryDependent`, and the jet-coherence hint by `updateHud` at ~8 Hz, into
+the same node. The warning was overwritten within a frame of appearing and was in
+practice unreachable. There is now one writer, `updateOverlayNote`, with a priority
+order: geometry invalid → aim strikes the casing → stream falling short → coherent at
+the wall → broken up before it. The middle two are new and both matter: an aim on the
+casing is the worst outcome available, and "falling short" is the tail mechanism of
+Trap 17, which the note went *blank* for because the old reach test used peak exit
+speed and so always found a wall in front of it.
+
+**The reach readout goes through `traceAim`** — Trap 15 in a place the original fix
+missed. `App.distanceToWall` raycast the interior alone, so it reported a distance to a
+point the liquid could never reach and returned 0, i.e. "no wall at all", for exactly
+the aims stopped dead by the front rim. It is now arc length along the traced path,
+casting and metalwork included.
+
+**"Aim height" was named for the opposite of what it does.** `v` walks *down* the
+profile from the rim, so dragging the slider right lowered the impact point. Renamed
+"Aim down the wall"; the readouts above it already give the landing point in mm above
+the floor, which is the answer anyone actually wants.
+
+**The legend is for decoding a colour scale.** The two appearance-only views have none,
+so it drew a permanent paragraph over the default view restating the tab highlighted a
+few centimetres away. The prose moved onto the tabs as tooltips, where it is readable
+*before* you switch; `.legend:empty` hides the panel.
+
+**The camera frames by projecting the eight corners**, the same fix Trap 36 made for
+the offline renderer, and per preset direction. It fitted the bounding *sphere* and
+then multiplied by a 0.62 fill factor, which never crops and is loose by the ratio
+between a box and the sphere around it — the fixtures covered about a fifth of the
+viewport. It matters most on the trough: 1.49 m wide and 0.29 m tall, so the distance
+that frames it from the front is nowhere near the one that frames it from the side.

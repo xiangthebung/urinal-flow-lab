@@ -1,8 +1,9 @@
-import { CRITICAL_IMPINGEMENT_ANGLE, FILM_DRY_THICKNESS } from '../core/constants';
+import { CRITICAL_IMPINGEMENT_ANGLE } from '../core/constants';
 import { Vec3, clamp, radToDeg, v3 } from '../core/vec3';
 import { SolidCollider } from '../geometry/collider';
 import { UrinalSurface } from '../geometry/surface';
 import { CaptureZone, ZONE_NAMES } from './capture';
+import { FixtureExtent } from './extent';
 import { FilmSolver } from './film';
 
 /**
@@ -201,9 +202,17 @@ export interface DrainageReport {
   retainedFloorVolume: number;
   /** Residual above the unavoidable retained film, m^3. This is the avoidable part. */
   excessVolume: number;
-  /** Time after flow stopped for the bulk to clear to twice the retained floor, s. -1 if never. */
+  /**
+   * Time after flow stopped for the drainable film to fall to a tenth of its
+   * peak, s. -1 if it never did within the run window.
+   *
+   * Measured against the *peak drainable excess*, not against the total residual
+   * and not against the retained floor. Drainage speed goes as the cube of
+   * thickness, so a fraction-of-total criterion reads "never" for every design
+   * ever built; the excess is the part a designer can move.
+   */
   bulkClearTime: number;
-  /** Time after flow stopped to come within 20% of the retained floor, s. -1 if never. */
+  /** Time after flow stopped for the drainable film to fall to 2% of its peak, s. -1 if never. */
   nearDryTime: number;
   /** Wetted area at the end, m^2. */
   finalWettedArea: number;
@@ -298,21 +307,33 @@ export class Metrics {
   peakExcessVolume = 0;
   /** Time flow stopped, s. -1 while still flowing. */
   flowEndTime = -1;
-  private drainMark95 = -1;
-  private drainMark99 = -1;
+  /** Seconds after flow stopped at which the drainable excess reached 10% of peak. */
+  private drainMark90 = -1;
+  /** The same at 2% of peak. */
+  private drainMark98 = -1;
 
-  constructor(surface: UrinalSurface, floorY: number, frontZ: number) {
+  constructor(surface: UrinalSurface, extent: FixtureExtent, lateralOffset = 0) {
     this.surface = surface;
-    const b = surface.bounds();
+    const b = extent.ceramic;
     this.floorMap = new Heatmap(
       b.min.x - 0.5,
       b.max.x + 0.5,
       b.min.z - 0.2,
-      frontZ + 0.9,
+      extent.frontZ + 0.9,
       72,
       72
     );
-    this.bodyMap = new Heatmap(-0.3, 0.3, floorY, floorY + 1.0, 48, 80);
+    // Centred on the user, not on the fixture: with the posture offset sideways
+    // the body map used to sit over the centreline and the deposition that
+    // actually landed on the trousers fell outside its bins.
+    this.bodyMap = new Heatmap(
+      lateralOffset - 0.3,
+      lateralOffset + 0.3,
+      extent.floorY,
+      extent.floorY + 1.0,
+      48,
+      80
+    );
     const n = surface.nu * surface.nv;
     this.impactVolume = new Float64Array(n);
     this.impactAngleSum = new Float64Array(n);
@@ -342,8 +363,8 @@ export class Metrics {
     this.peakWettedArea = 0;
     this.peakExcessVolume = 0;
     this.flowEndTime = -1;
-    this.drainMark95 = -1;
-    this.drainMark99 = -1;
+    this.drainMark90 = -1;
+    this.drainMark98 = -1;
   }
 
   recordCapture(
@@ -409,8 +430,8 @@ export class Metrics {
     if (excess > this.peakExcessVolume) this.peakExcessVolume = excess;
     if (this.flowEndTime >= 0 && this.peakExcessVolume > 1e-12) {
       const frac = excess / this.peakExcessVolume;
-      if (this.drainMark95 < 0 && frac <= 0.1) this.drainMark95 = s.t - this.flowEndTime;
-      if (this.drainMark99 < 0 && frac <= 0.02) this.drainMark99 = s.t - this.flowEndTime;
+      if (this.drainMark90 < 0 && frac <= 0.1) this.drainMark90 = s.t - this.flowEndTime;
+      if (this.drainMark98 < 0 && frac <= 0.02) this.drainMark98 = s.t - this.flowEndTime;
     }
   }
 
@@ -473,8 +494,8 @@ export class Metrics {
       peakFilmVolume: this.peakFilmVolume,
       retainedFloorVolume: Math.max(0, residual - excess),
       excessVolume: excess,
-      bulkClearTime: this.drainMark95,
-      nearDryTime: this.drainMark99,
+      bulkClearTime: this.drainMark90,
+      nearDryTime: this.drainMark98,
       finalWettedArea: film.wettedArea(),
       peakWettedArea: this.peakWettedArea,
       stagnantArea: film.stagnantArea(),
@@ -765,11 +786,36 @@ export function scoreDesign(
 ): ScoreBreakdown {
   const notes: string[] = [];
 
-  // Splash: microlitres on the user per litre voided. 2000 uL/L is dire,
-  // 20 uL/L is excellent. Log scale, because the range spans three decades.
-  const upl = Math.max(0.5, splash.userMicrolitresPerLitre);
+  // Splash: microlitres on the user per litre voided, over the *sustained* part
+  // of the void. 2000 uL/L is dire, 20 uL/L is excellent. Log scale, because the
+  // range spans three decades.
+  //
+  // Sustained rather than all-in, and that is the difference between a ranking
+  // and a coin toss. The all-in figure is not stably signed: measured
+  // flat-slab-against-constant-angle ratios of 0.42x at 90 mm stand-off, 0.51x at
+  // 120 mm, 1.22x at 180 mm and 2.76x at 250 mm -- it reverses which fixture is
+  // better across the range of a single posture slider, because a decaying stream
+  // falls short onto the fixture's own front rim and a deeper fixture falls short
+  // sooner. That is real physics, but it is a property of how deep the envelope
+  // is and of the user's posture, not of the wall the designer is drawing. During
+  // sustained flow the stream reaches the surface the design governs, so the
+  // number reflects the shape and is stable: across five seeds the flat slab sits
+  // at 354-579 uL/L and the constant-angle wall at 0-1.
+  //
+  // The tail is not swept under the rug -- it is the largest single effect in the
+  // model and it gets its own note below, plus its own section in the UI. It is
+  // simply not something a bowl shape can be scored on.
+  const upl = Math.max(0.5, splash.sustainedMicrolitresPerLitre);
   const splashScore = clamp(100 * (1 - (Math.log10(upl) - 1.3) / 2.0), 0, 100);
-  if (upl > 500) notes.push('splashback onto the user is high');
+  if (upl > 500) notes.push('splashback onto the user during sustained flow is high');
+  const weakRatio =
+    splash.weakMicrolitresPerLitre / Math.max(1, splash.sustainedMicrolitresPerLitre);
+  if (weakRatio > 4 && splash.weakMicrolitresPerLitre > 100) {
+    notes.push(
+      `the weak rise and tail are ${weakRatio.toFixed(0)}× worse per litre than sustained ` +
+        'flow — no change to the bowl shape addresses that'
+    );
+  }
 
   // Drainage: judged on the liquid that could have left but did not, plus how
   // long the bulk took to clear. Measuring against the avoidable excess rather
@@ -854,5 +900,3 @@ export function summarise(
   }
   return lines;
 }
-
-export const DRY_THRESHOLD = FILM_DRY_THICKNESS * 4;

@@ -903,6 +903,17 @@ export class FilmSolver implements FilmSink {
     return h > threshold;
   }
 
+  /**
+   * Turn accumulated edge outflow into discrete drips.
+   *
+   * The direction a drip leaves in is the direction the liquid was already
+   * travelling when it ran out of surface, and which edge that was decides it.
+   * Sending every drip along +v -- down the profile -- was right for the front
+   * lip and wrong for the other three: liquid pouring over the left side edge left
+   * heading downhill into the bowl instead of outward past the rim, so it
+   * re-collided with the cell it had just left and the run-off never actually got
+   * outside the fixture. The side edges are also where most of it goes.
+   */
   private releaseDrips(lCap: number): void {
     const dripVol = (Math.PI / 6) * Math.pow(2.2 * lCap, 3);
     const s = this.surface;
@@ -919,17 +930,48 @@ export class FilmSolver implements FilmSink {
       const n = s.getCellNormal(c, v3());
       const h = Math.max(FILM_DRY_THICKNESS, this.h[c]);
       const speed = clamp(Math.hypot(this.hu[c], this.hv[c]) / h, 0, 3);
-      const to = s.cellTangentV;
       const o = c * 3;
-      // Leaves along the surface, nudged clear of the wall so it does not
-      // immediately re-collide with the cell it came from.
+      const i = c % this.nu;
+      const j = (c - i) / this.nu;
+
+      // Which edge this cell sits on, and therefore which way liquid left it.
+      // 0 side edge, 1 top rim, 2 front lip, 3 overhang drip.
+      let boundary = 3;
+      let ex = 0;
+      let ey = 0;
+      let ez = 0;
+      const tu = s.cellTangentU;
+      const tv = s.cellTangentV;
+      if (i === 0 || i === this.nu - 1) {
+        boundary = 0;
+        const sign = i === 0 ? -1 : 1;
+        ex = tu[o] * sign;
+        ey = tu[o + 1] * sign;
+        ez = tu[o + 2] * sign;
+      } else if (j === this.nv - 1) {
+        boundary = 2;
+        ex = tv[o];
+        ey = tv[o + 1];
+        ez = tv[o + 2];
+      } else if (j === 0) {
+        boundary = 1;
+        ex = -tv[o];
+        ey = -tv[o + 1];
+        ez = -tv[o + 2];
+      } else {
+        // Not on an edge at all: this is a drip shed from an overhang, so it
+        // simply falls off the wall.
+        ex = -n.x;
+        ey = -n.y;
+        ez = -n.z;
+      }
+      // Leaves along the surface in the direction it was flowing, nudged clear of
+      // the wall so it does not immediately re-collide with the cell it came from.
       const vel = v3(
-        to[o] * speed - n.x * 0.02,
-        to[o + 1] * speed - n.y * 0.02,
-        to[o + 2] * speed - n.z * 0.02
+        ex * speed - n.x * 0.02,
+        ey * speed - n.y * 0.02,
+        ez * speed - n.z * 0.02
       );
-      const boundary =
-        Math.floor(c / this.nu) === this.nv - 1 ? 2 : c % this.nu === 0 || c % this.nu === this.nu - 1 ? 0 : 3;
       for (let k = 0; k < nDrips; k++) {
         this.shed.push({
           position: v3(

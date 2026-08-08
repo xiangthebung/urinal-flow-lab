@@ -417,6 +417,11 @@ input[type="checkbox"] {
   border-radius: 5px;
   backdrop-filter: blur(6px);
 }
+/* The appearance-only views have no colour scale, so the legend is left empty
+   rather than drawn as a blank panel over the viewport. */
+.legend:empty {
+  display: none;
+}
 .legend-title {
   font-size: 11.5px;
   font-weight: 600;
@@ -486,6 +491,12 @@ input[type="checkbox"] {
 }
 .overlay-note.show {
   display: block;
+}
+/* A problem rather than an observation: the aim is on the outside of the
+   fixture, or the profile is not manufacturable. */
+.overlay-note.bad {
+  border-left-color: var(--bad);
+  color: var(--text);
 }
 
 .progress {

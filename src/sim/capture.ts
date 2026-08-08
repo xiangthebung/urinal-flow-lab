@@ -1,6 +1,6 @@
 import { Vec3, v3 } from '../core/vec3';
 import { CaptureTester } from './particles';
-import { UrinalSurface } from '../geometry/surface';
+import { FixtureExtent } from './extent';
 
 /**
  * Everything that is not the fixture: the floor, and the person standing at it.
@@ -93,25 +93,33 @@ export interface CaptureHit {
 export class CaptureScene implements CaptureTester {
   private rects: CaptureRect[] = [];
   readonly floorY: number;
+  /**
+   * Front-most point of the ceramic, m.
+   *
+   * The *fixture's* front, not the wetted interior's. Stand-off is measured from
+   * here, so getting it from the interior alone put the user up to 44 mm closer
+   * than the control said -- see `FixtureExtent`.
+   */
   readonly fixtureFrontZ: number;
+  readonly extent: FixtureExtent;
   readonly posture: UserPosture;
   /** z of the plane the legs occupy. */
   readonly legZ: number;
   /** Boundary between "near" and "far" floor, m from the fixture. */
   readonly nearFloorDepth = 0.6;
 
-  constructor(surface: UrinalSurface, posture: UserPosture) {
+  constructor(extent: FixtureExtent, posture: UserPosture) {
     this.posture = posture;
-    this.floorY = surface.floorY;
-    const b = surface.bounds();
-    this.fixtureFrontZ = b.max.z;
+    this.extent = extent;
+    this.floorY = extent.floorY;
+    this.fixtureFrontZ = extent.frontZ;
     const emitterZ = this.fixtureFrontZ + posture.standoff;
     this.legZ = emitterZ + posture.legSetback;
-    this.build(surface, posture);
+    this.build(extent, posture);
   }
 
-  private build(surface: UrinalSurface, p: UserPosture): void {
-    const b = surface.bounds();
+  private build(extent: FixtureExtent, p: UserPosture): void {
+    const b = extent.ceramic;
     const cx = p.lateralOffset;
 
     // -- Floor -------------------------------------------------------------
@@ -203,6 +211,9 @@ export class CaptureScene implements CaptureTester {
     // to catch liquid; below it the front face is solid ceramic, which is the only
     // part this plane was ever meant to represent. The casting collider handles the
     // real ceramic in front of it, so this is now purely a backstop.
+    //
+    // It sits in front of the *ceramic*. Placing it 4 mm ahead of the interior put
+    // it inside the casting on every model, where nothing could reach it.
     this.rects.push({
       zone: CaptureZone.FixtureExterior,
       axis: 2,
@@ -210,7 +221,7 @@ export class CaptureScene implements CaptureTester {
       aMin: b.min.x - 0.02,
       aMax: b.max.x + 0.02,
       bMin: this.floorY,
-      bMax: surface.lipY,
+      bMax: extent.lipY,
       dir: -1,
     });
   }
@@ -261,8 +272,8 @@ export class CaptureScene implements CaptureTester {
   }
 
   /** Generous simulation bounds; anything outside is no longer interesting. */
-  simulationBounds(surface: UrinalSurface): { min: Vec3; max: Vec3 } {
-    const b = surface.bounds();
+  simulationBounds(): { min: Vec3; max: Vec3 } {
+    const b = this.extent.all;
     return {
       min: v3(b.min.x - 1.5, this.floorY - 0.1, b.min.z - 0.6),
       max: v3(b.max.x + 1.5, b.max.y + 1.2, this.fixtureFrontZ + 2.0),

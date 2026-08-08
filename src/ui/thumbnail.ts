@@ -22,7 +22,17 @@ import {
 const THUMB_RES = { nu: 30, nv: 56 };
 
 export interface ThumbnailResult {
-  /** Outside dimensions of the casting in mm, width x depth x height. */
+  /**
+   * Outside dimensions of the *ceramic* in mm, width x depth x height.
+   *
+   * The fixture, not the fixture plus its plumbing. This used to be measured off
+   * the same box the view is framed on, which includes the flushometer and its
+   * supply pipe -- so the cards advertised the oval bowl as 878 mm tall against a
+   * catalogue 640, and the trough as 796 mm against 290. That is the height of the
+   * pipe reaching up the wall behind it, and quoting it as the product's envelope
+   * next to a preset whose comment cites a real model number is the kind of error
+   * this tool exists not to make.
+   */
   dims: { w: number; d: number; h: number };
 }
 
@@ -55,8 +65,12 @@ export function renderFixtureThumbnail(
   // absence is what makes one recognisable too: the waterless model has no
   // flushometer, and that reads instantly next to five that do.
   const fittings = buildFittings(surface, shell, fittingParams ?? {});
-  let box = unionBox(surface.bounds(), { min: shell.min, max: shell.max });
-  if (!fittings.empty) box = unionBox(box, { min: fittings.min, max: fittings.max });
+  // The ceramic is what the caption measures; the frame has to hold the metalwork
+  // too or the flushometer is cropped off the top of the card.
+  const ceramic = unionBox(surface.bounds(), { min: shell.min, max: shell.max });
+  const box = fittings.empty
+    ? ceramic
+    : unionBox(ceramic, { min: fittings.min, max: fittings.max });
 
   const meshes: RasterMesh[] = [
     // Interior first so the casting wins any ties on the shared rim edge.
@@ -92,9 +106,9 @@ export function renderFixtureThumbnail(
     width,
     height,
     dims: {
-      w: Math.round((box.max.x - box.min.x) * 1000),
-      d: Math.round((box.max.z - box.min.z) * 1000),
-      h: Math.round((box.max.y - box.min.y) * 1000),
+      w: Math.round((ceramic.max.x - ceramic.min.x) * 1000),
+      d: Math.round((ceramic.max.z - ceramic.min.z) * 1000),
+      h: Math.round((ceramic.max.y - ceramic.min.y) * 1000),
     },
   };
 }

@@ -142,7 +142,10 @@ export class SceneView {
     this.buildZones(surface, capture);
     this.buildHeatPlanes(surface, capture);
 
-    const b = surface.bounds();
+    // Centred on the whole fixture, metalwork included. Centring on the wetted
+    // interior put the orbit pivot inside the bowl, so the object swung about a
+    // point well below and behind the thing being looked at.
+    const b = capture.extent.all;
     this.target.set(
       0,
       (b.min.y + b.max.y) * 0.5,
@@ -172,11 +175,6 @@ export class SceneView {
     };
   }
 
-  /** Back face of the casting, so the mounting wall can sit behind it. */
-  private get fixtureBackZ(): number {
-    return this.shell ? this.shell.min.z : 0;
-  }
-
   private clear(g: THREE.Group): void {
     while (g.children.length) {
       const c = g.children.pop()!;
@@ -187,7 +185,7 @@ export class SceneView {
 
   private buildRoom(surface: UrinalSurface, capture: CaptureScene): void {
     this.clear(this.roomGroup);
-    const b = surface.bounds();
+    const b = capture.extent.ceramic;
 
     // Floor.
     const floor = new THREE.Mesh(
@@ -214,7 +212,7 @@ export class SceneView {
       new THREE.PlaneGeometry(3, 2.6),
       new THREE.MeshStandardMaterial({ color: 0x323d4a, roughness: 0.9 })
     );
-    wall.position.set(0, surface.floorY + 1.3, Math.min(b.min.z, this.fixtureBackZ) - 0.004);
+    wall.position.set(0, surface.floorY + 1.3, b.min.z - 0.004);
     this.roomGroup.add(wall);
   }
 
@@ -338,7 +336,7 @@ export class SceneView {
    */
   private buildHeatPlanes(surface: UrinalSurface, capture: CaptureScene): void {
     this.clear(this.heatGroup);
-    const b = surface.bounds();
+    const b = capture.extent.ceramic;
 
     const floorW = b.max.x - b.min.x + 1.0;
     const floorD = capture.fixtureFrontZ + 0.9 - (b.min.z - 0.2);
@@ -370,7 +368,12 @@ export class SceneView {
         depthWrite: false,
       })
     );
-    bodyMesh.position.set(0, surface.floorY + 0.5, capture.legZ - 0.004);
+    // Centred on the user, matching the bins `Metrics.bodyMap` actually uses.
+    bodyMesh.position.set(
+      capture.posture.lateralOffset,
+      surface.floorY + 0.5,
+      capture.legZ - 0.004
+    );
     this.heatGroup.add(bodyMesh);
     this.bodyHeatTexture = bodyTex;
     this.bodyHeatMesh = bodyMesh;
@@ -448,49 +451,112 @@ export class SceneView {
   }
 
   /**
-   * Distance at which a sphere of the given radius fills the frame.
+   * Distance at which the fixture's eight corners just fit the frame, looking
+   * from `off` (a unit direction) at `target`.
    *
-   * Solved from the camera's own field of view and aspect rather than scaled off
-   * the fixture's height by a constant. The constant was 1.9 times the taller of
-   * height and width, which happens to frame a 400 mm bowl in a 4:3 viewport and
-   * nothing else: it ignored depth entirely, so it cropped every model once the
-   * casting was added, and it would crop any imported fixture with unfamiliar
-   * proportions. Fitting the bounding sphere is correct for all of them.
+   * Two earlier versions. The first scaled 1.9 times the taller of height and
+   * width, which frames a 400 mm bowl in a 4:3 viewport and nothing else: it
+   * ignored depth, so it cropped every model once the casting was added. The
+   * second fitted the *bounding sphere*, which never crops but is loose by the
+   * ratio between a box and the sphere around it — half a diagonal for an object
+   * that is mostly flat in one axis — and then multiplied that by a 0.62 fill
+   * factor on top. Together they left the fixture covering a fifth of the
+   * viewport with the rest of the frame empty tiles.
+   *
+   * Projecting the corners is the same fix already made for the offline renderer,
+   * where a loose guess was simultaneously cropping one model and shrinking the
+   * other five. It is a fixed-point iteration rather than a closed form because
+   * the perspective divide makes the exact relation awkward and this costs
+   * nothing: the normalised coordinates fall off roughly as 1/dist, so scaling
+   * the distance by the overshoot converges in a handful of passes.
    */
-  private fitDistance(radius: number, fill = 0.62): number {
-    const vFov = (this.camera.fov * Math.PI) / 180;
-    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * this.camera.aspect);
-    const half = Math.max(0.05, Math.min(vFov, hFov) / 2);
-    return radius / Math.sin(half) / Math.max(0.1, fill);
+  private fitDistance(
+    box: { min: Vec3; max: Vec3 },
+    target: THREE.Vector3,
+    off: THREE.Vector3,
+    margin = 1.1
+  ): number {
+    const f = 1 / Math.tan((this.camera.fov * Math.PI) / 360);
+    const aspect = Math.max(0.1, this.camera.aspect);
+    const corners: THREE.Vector3[] = [];
+    for (const x of [box.min.x, box.max.x]) {
+      for (const y of [box.min.y, box.max.y]) {
+        for (const z of [box.min.z, box.max.z]) {
+          corners.push(new THREE.Vector3(x, y, z));
+        }
+      }
+    }
+    const span = Math.max(
+      1e-4,
+      Math.hypot(box.max.x - box.min.x, box.max.y - box.min.y, box.max.z - box.min.z)
+    );
+    const fwd = off.clone().negate();
+    const worldUp = new THREE.Vector3(0, 1, 0);
+    const right = new THREE.Vector3().crossVectors(fwd, worldUp).normalize();
+    // Degenerate only for a straight-down view, where any horizontal axis will do.
+    if (!Number.isFinite(right.x) || right.lengthSq() < 1e-9) right.set(1, 0, 0);
+    const up = new THREE.Vector3().crossVectors(right, fwd);
+
+    let dist = span * 2;
+    const eye = new THREE.Vector3();
+    const d = new THREE.Vector3();
+    for (let iter = 0; iter < 24; iter++) {
+      eye.copy(target).addScaledVector(off, dist);
+      let worst = 0;
+      for (const c of corners) {
+        d.subVectors(c, eye);
+        const z = d.dot(fwd);
+        if (z <= 1e-4) {
+          worst = Infinity;
+          break;
+        }
+        worst = Math.max(
+          worst,
+          Math.abs((d.dot(right) / z) * (f / aspect)),
+          Math.abs((d.dot(up) / z) * f)
+        );
+      }
+      if (!Number.isFinite(worst)) {
+        dist *= 2;
+        continue;
+      }
+      dist *= worst * margin;
+      if (Math.abs(worst * margin - 1) < 1e-4) break;
+    }
+    return dist;
   }
 
   applyCameraPreset(preset: CameraPreset, surface: UrinalSurface, capture: CaptureScene): void {
-    // Framed on everything the fixture occupies, casting included. Using the
-    // interior alone put the ceramic outside the frame on every model.
-    const b = surface.bounds();
-    const cb = this.castingBounds;
-    const min = cb
-      ? { x: Math.min(b.min.x, cb.min.x), y: Math.min(b.min.y, cb.min.y), z: Math.min(b.min.z, cb.min.z) }
-      : b.min;
-    const max = cb
-      ? { x: Math.max(b.max.x, cb.max.x), y: Math.max(b.max.y, cb.max.y), z: Math.max(b.max.z, cb.max.z) }
-      : b.max;
+    // Framed on everything the fixture occupies, casting *and* metalwork. Using
+    // the interior alone put the ceramic outside the frame on every model, and
+    // stopping at the ceramic cropped the flushometer off the top.
+    const box = capture.extent.all;
+    const { min, max } = box;
     const cy = (min.y + max.y) * 0.5;
     const cz = (min.z + max.z) * 0.5;
-    const radius =
-      0.5 * Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z);
-    const d = this.fitDistance(radius);
 
     this.target.set(0, cy, cz);
+    // A unit direction per preset, then the distance that just contains the
+    // fixture along it. Solving per direction matters on the elongated models:
+    // the trough is 1.49 m wide and 0.29 m tall, so the distance that frames it
+    // from the front is nowhere near the one that frames it from the side.
+    const dirFor = (v: [number, number, number]): THREE.Vector3 =>
+      new THREE.Vector3(v[0], v[1], v[2]).normalize();
+    const place = (v: [number, number, number]): void => {
+      const off = dirFor(v);
+      const d = this.fitDistance(box, this.target, off);
+      this.camera.position.copy(this.target).addScaledVector(off, d);
+    };
+
     switch (preset) {
       case CameraPreset.Front:
-        this.camera.position.set(0, cy, cz + d);
+        place([0, 0, 1]);
         break;
       case CameraPreset.Side:
-        this.camera.position.set(d, cy, cz);
+        place([1, 0, 0]);
         break;
       case CameraPreset.Top:
-        this.camera.position.set(0.001, cy + d, cz);
+        place([0.001, 1, 0]);
         break;
       case CameraPreset.UserEye:
         // Roughly where the user's eyes are: the view that decides whether a
@@ -502,18 +568,11 @@ export class SceneView {
         );
         break;
       case CameraPreset.ThreeQuarter:
-      default: {
-        // A unit direction, then pushed out to the fitted distance, so the angle
-        // is fixed and only the distance responds to the fixture's size.
-        const dir = [0.62, 0.42, 0.78];
-        const m = Math.hypot(dir[0], dir[1], dir[2]);
-        this.camera.position.set(
-          (dir[0] / m) * d,
-          cy + (dir[1] / m) * d,
-          cz + (dir[2] / m) * d
-        );
+      default:
+        // Matches the offline renderer's three-quarter, so a screenshot from the
+        // app and a contact-sheet thumbnail show the same view of the same model.
+        place([0.62, 0.42, 0.78]);
         break;
-      }
     }
     this.controls.target.set(0, cy, cz);
     this.controls.update();

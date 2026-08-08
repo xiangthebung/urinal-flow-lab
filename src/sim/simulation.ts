@@ -16,6 +16,7 @@ import {
 import { ShellMesh, ShellParams, buildShell } from '../geometry/shell';
 import { SurfaceParams, UrinalSurface, defaultSurfaceParams } from '../geometry/surface';
 import { CaptureScene, CaptureZone, UserPosture, defaultPosture } from './capture';
+import { FixtureExtent, fixtureExtent } from './extent';
 import { FilmParams, FilmSolver, defaultFilmParams } from './film';
 import { ImpactModelParams, ImpactResolver, defaultImpactParams } from './impact';
 import {
@@ -178,6 +179,15 @@ export class Simulation {
    * by the front rim.
    */
   castingCollider!: SolidCollider;
+  /**
+   * How much room the fixture occupies, interior *and* casting.
+   *
+   * Public because the renderer frames the camera, the room and the user figure
+   * from it. Everything that needs to know where the fixture is reads this rather
+   * than `surface.bounds()`, which is the wetted patch and stops 0-44 mm short of
+   * the real front face.
+   */
+  extent!: FixtureExtent;
   film!: FilmSolver;
   particles!: ParticleSystem;
   emitter!: StreamEmitter;
@@ -224,6 +234,12 @@ export class Simulation {
    * fixture, and the front of the fixture depends on the wall the generator
    * produces. Two passes settle it, because the front face moves by millimetres on
    * the second pass and the angle depends on it only weakly.
+   *
+   * The front face is the *ceramic's*, so each pass costs a casting build. It used
+   * to take the interior's, which stops 0-44 mm short of the real one, so the
+   * generator was aligned to a user standing that much further forward than the
+   * one the simulation then places -- the exact mistake the paragraph above warns
+   * about, made by the alignment code itself.
    */
   private buildSurface(): UrinalSurface {
     const c = this.config;
@@ -235,25 +251,29 @@ export class Simulation {
     this.alignedStreamSpeed = 0;
     if (c.surface.backWallMode !== 'constantAngle') return surf;
 
+    const ceramicFrontZ = (s: UrinalSurface): number =>
+      fixtureExtent(s, buildShell(s, c.casting)).frontZ;
+
     const speed = this.peakExitSpeed();
+    let frontZ = ceramicFrontZ(surf);
     for (let pass = 0; pass < 2; pass++) {
-      const frontZ = surf.bounds().max.z;
-      const floorY = surf.floorY;
       const origin = {
         z: frontZ + c.posture.standoff,
-        y: floorY + c.posture.emitterHeight,
+        y: surf.floorY + c.posture.emitterHeight,
       };
-      const prevZ = frontZ;
       surf = new UrinalSurface(
         { ...c.surface, streamOrigin: origin, streamSpeed: speed },
         res
       );
+      const nextZ = ceramicFrontZ(surf);
+      const settled = Math.abs(nextZ - frontZ) < 2e-3;
+      frontZ = nextZ;
       // Converged once the front face stops moving meaningfully.
-      if (Math.abs(surf.bounds().max.z - prevZ) < 2e-3) break;
+      if (settled) break;
     }
     // Record what was actually used, so the UI can show it.
     this.alignedStreamOrigin = {
-      z: surf.bounds().max.z + c.posture.standoff,
+      z: frontZ + c.posture.standoff,
       y: surf.floorY + c.posture.emitterHeight,
     };
     this.alignedStreamSpeed = speed;
@@ -281,18 +301,15 @@ export class Simulation {
         : new MeshCollider(this.fittings.positions, this.fittings.indices),
     ]);
     this.rng = new Rng(c.seed);
+    this.extent = fixtureExtent(this.surface, this.casting, this.fittings);
     this.film = new FilmSolver(this.surface, c.fluid, c.wall, c.film);
     this.particles = new ParticleSystem(c.particleCapacity);
-    this.capture = new CaptureScene(this.surface, c.posture);
+    this.capture = new CaptureScene(this.extent, c.posture);
     this.emitter = new StreamEmitter(c.stream, c.fluid, this.rng);
     this.emitter.attachTo(this.capture.fixtureFrontZ, this.surface.floorY);
     this.impact = new ImpactResolver(c.impact, c.fluid, c.wall, this.rng);
-    this.metrics = new Metrics(
-      this.surface,
-      this.surface.floorY,
-      this.capture.fixtureFrontZ
-    );
-    this.bounds = this.capture.simulationBounds(this.surface);
+    this.metrics = new Metrics(this.surface, this.extent, c.posture.lateralOffset);
+    this.bounds = this.capture.simulationBounds();
     this.time = 0;
     this.phase = SimPhase.Idle;
     if (c.aimTargetV !== null) this.aimAtProfileFraction(c.aimTargetV);

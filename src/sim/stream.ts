@@ -1,3 +1,4 @@
+import { GRAVITY } from '../core/constants';
 import { FluidProperties, kinematicViscosity } from '../core/fluid';
 import { Rng } from '../core/rng';
 import { Vec3, v3 } from '../core/vec3';
@@ -476,15 +477,25 @@ export class StreamEmitter {
 
     // How many wavelengths left the exit during this step.
     this.emitAccumulator += breakup.emissionFrequency * dt;
+    const perWavelength = 1 / Math.max(1e-9, breakup.emissionFrequency);
     let guard = 0;
     while (this.emitAccumulator >= 1 && guard++ < 512) {
       this.emitAccumulator -= 1;
       // Spread emissions across the step so parcels do not stack on one point.
-      const frac = this.emitAccumulator - Math.floor(this.emitAccumulator);
-      const back = frac * dt;
+      //
+      // The remaining accumulator counts the wavelengths still queued behind this
+      // one, so it is exactly how long ago this parcel left the exit. Using the
+      // *fractional* part instead gave every parcel in a step the same age -- the
+      // fractional part does not change when you subtract one -- so five parcels
+      // in a millisecond were emitted from a single point with identical
+      // velocities and travelled as one lump. The comment claimed otherwise.
+      const back = Math.min(dt, this.emitAccumulator * perWavelength);
       const pos = v3(
         this.position.x + dir.x * speed * back,
-        this.position.y + dir.y * speed * back,
+        // Gravity over the flight so far. Sub-millimetre at these times, but it
+        // costs nothing and keeps the parcel on the trajectory it would have
+        // been on had the step been finer.
+        this.position.y + dir.y * speed * back - 0.5 * GRAVITY * back * back,
         this.position.z + dir.z * speed * back
       );
       const volume = (Math.PI * dia * dia * 0.25) * breakup.wavelength;
@@ -523,7 +534,7 @@ export class StreamEmitter {
   solveAimForTarget(
     target: Vec3,
     t: number,
-    gravity = 9.80665
+    gravity = GRAVITY
   ): { elevation: number; azimuth: number } | null {
     const speed = this.speedAt(t);
     if (speed <= 1e-6) return null;
@@ -543,7 +554,7 @@ export class StreamEmitter {
   }
 
   /** Point the stream at a target, using the exit speed at peak flow. */
-  aimAt(target: Vec3, gravity = 9.80665): boolean {
+  aimAt(target: Vec3, gravity = GRAVITY): boolean {
     const tPeak = this.flow.peakFraction * this.flow.duration;
     const sol = this.solveAimForTarget(target, tPeak, gravity);
     if (!sol) return false;

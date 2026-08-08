@@ -401,10 +401,26 @@ export const PRESETS: UrinalPreset[] = [
     // supply and no flushometer. The outlet spud stays, because the cartridge does
     // connect to a waste pipe.
     fittings: { flushValve: false },
-    // 63 degrees. Steep everywhere, which is the price of a deep narrow funnel with
-    // no flush: the walls have to converge hard, and converging walls meet a
-    // descending stream closer to normal. Past v = 0.30 the casting blocks the aim.
-    defaultAimV: 0.26,
+    // 67 degrees, and the reachable band is only v = 0.02 to about 0.15 -- past
+    // that this fixture's own casting blocks the stream, because it is 497 mm deep
+    // and the rim stands a long way in front of the wall the aim is trying to
+    // reach. The comment here used to say "past v = 0.30" and the default was 0.26,
+    // which is inside the blocked band: every measurement taken on this preset at
+    // its own default aim was a rim strike, i.e. Trap 14's worst outcome reported
+    // as the fixture's nominal behaviour. It stayed invisible because the reach
+    // readout raycast the interior alone and reported "no wall" rather than "the
+    // casting is in the way".
+    //
+    // 0.12 rather than the shallowest reachable 0.14, so there is a sample of
+    // margin on both sides: at 0.14 a nudge of 0.03 in v flips the fixture into a
+    // rim strike, and the model's own tremor is larger than that. It buys nothing
+    // to sit on the edge — the angle is 67 degrees across the whole band.
+    //
+    // The band being 67 degrees everywhere is the honest verdict on this shape, and
+    // it is outstanding item 5: a real waterless unit is ~360 x 350 x 470 with a
+    // narrow bowl, not a 497 mm deep bulb. Aim cannot fix a fixture you cannot aim
+    // into.
+    defaultAimV: 0.12,
   },
   {
     id: 'nautilus-tall',

@@ -779,7 +779,17 @@ function endToEndTests(): TestResult[] {
   // flat slab sits at 354-579 uL/L while the constant-angle wall sits at 0-1.
   const mk = (preset: string, aim: number, seed: number) => {
     const c = defaultConfig();
-    c.surface = { ...getPreset(preset).params };
+    const p = getPreset(preset);
+    c.surface = { ...p.params };
+    // The preset's own casting and metalwork, not the defaults. This took the
+    // interior alone, so the headline claim was measured on two fixtures that
+    // neither the app nor the picker shows: a `flat-wall` wearing the default
+    // bowl's exterior. The casting is solid and splashes, it hides a fifth to a
+    // half of the interior from the exit point, and the metalwork stands closer
+    // to the user than any ceramic, so "same stream, same seed, same aim" was
+    // controlling everything except the part of the fixture nearest the user.
+    c.casting = { ...(p.shell ?? {}) };
+    c.fittings = { ...(p.fittings ?? {}) };
     c.drainTime = 2;
     c.resolutionU = 48;
     c.resolutionV = 96;
@@ -843,8 +853,9 @@ function endToEndTests(): TestResult[] {
       reference: 'Thurairajah et al., PNAS 2025 report order-of-magnitude suppression',
       notes:
         'Measured over the sustained-flow phase, which is where the stream reaches the ' +
-        'wall the generator governs. Across five seeds: flat 354-579 µL/L, ' +
-        'constant-angle 0-1 µL/L',
+        'wall the generator governs. Across five seeds on the interiors alone: flat ' +
+        '354-579 µL/L, constant-angle 0-1 µL/L. With each control carrying its own ' +
+        'casting and metalwork, seed 4242 reads flat 495 vs constant-angle 0',
     })
   );
 
@@ -870,8 +881,10 @@ function endToEndTests(): TestResult[] {
           'A slow stream leaves on the same aim but falls short and steeper, so it lands ' +
           'nearer the front of the fixture at a higher impingement angle',
         notes:
-          'Measured across five seeds: flat slab 10.3-16.6×, oval bowl 6.1-7.2×, ' +
-          'constant-angle over 17000× because its sustained figure is ~0',
+          'Measured across five seeds on the interiors alone: flat slab 10.3-16.6×, ' +
+          'oval bowl 6.1-7.2×, constant-angle over 17000× because its sustained figure ' +
+          'is ~0. With the controls carrying their own casting, seed 4242 reads flat ' +
+          '20.8× and constant-angle 5260×',
       })
     );
   }

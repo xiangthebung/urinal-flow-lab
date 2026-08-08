@@ -347,14 +347,26 @@ export class ParticleSystem {
         // fraction of the step.
         const hit = surface.raycast(from, dir, 1);
 
-        // The outside of the casting, tested only as far as the interior hit so the
-        // nearer of the two wins. Without this the ceramic is intangible and splash
-        // leaving the bowl flies straight through the body of the fixture. It is not
-        // an impact: the film solver has no cell for the outside of the casting, and
-        // liquid landing there is already an accounted outcome -- it soils the
-        // fixture exterior and runs down the outside.
+        // Everything on the segment is resolved by distance, not by category.
+        //
+        // The capture zones used to be tested only when neither the interior nor
+        // the casting was hit, so a droplet that crossed a shin panel on its way
+        // to the fixture was booked to the fixture. It is a small effect at the
+        // default posture and a wrong one at any posture where the user's legs
+        // reach in front of part of the ceramic -- which is what `legSetback`
+        // exists to control.
+        let capT = Infinity;
+        if (capture && capture.test(from, to, capOut)) capT = capOut.t;
+
+        // The outside of the casting, tested only as far as the nearest thing
+        // already found so the closest wins. Without this the ceramic is
+        // intangible and splash leaving the bowl flies straight through the body
+        // of the fixture. It is not an impact: the film solver has no cell for
+        // the outside of the casting, and liquid landing there is already an
+        // accounted outcome -- it soils the fixture exterior and runs down it.
         if (exterior) {
-          const solid = exterior.raycastSolid(from, dir, hit ? hit.t : 1);
+          const limit = Math.min(hit ? hit.t : 1, capT);
+          const solid = limit > 0 ? exterior.raycastSolid(from, dir, limit) : null;
           if (solid) {
             out.captures.push({
               index: i,
@@ -378,7 +390,7 @@ export class ParticleSystem {
           }
         }
 
-        if (hit) {
+        if (hit && hit.t <= capT) {
           out.impacts.push({
             index: i,
             hit,
@@ -391,14 +403,14 @@ export class ParticleSystem {
           continue; // resolved by the impact model, which kills or respawns it
         }
 
-        if (capture && capture.test(from, to, capOut)) {
+        if (capT < Infinity) {
           out.captures.push({
             index: i,
             from: v3(from.x, from.y, from.z),
             to: v3(
-              from.x + dir.x * capOut.t,
-              from.y + dir.y * capOut.t,
-              from.z + dir.z * capOut.t
+              from.x + dir.x * capT,
+              from.y + dir.y * capT,
+              from.z + dir.z * capT
             ),
             velocity: v3(vxi, vyi, vzi),
             volume: this.volume[i],

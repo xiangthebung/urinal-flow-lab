@@ -76,21 +76,14 @@ export const WET_SPLASH_K_FILM_MAX_DELTA = 1.0;
  */
 export const CRITICAL_IMPINGEMENT_ANGLE = (30 * Math.PI) / 180;
 
-/**
- * Rayleigh-Plateau initial disturbance ratio, eps0 / jet_radius.
- *
- * Breakup length follows L_b = (v / omega) * ln(r / eps0), so this single
- * number sets how far the coherent stream travels before it becomes a
- * droplet train. A perfectly quiet circular nozzle has eps0/r ~ 1e-3
- * (long jet). The human meatus is a compliant, non-circular slit driven by
- * a pulsatile bladder, so the disturbance is large. eps0/r = 0.03 puts
- * breakup at roughly 15-20 cm for a 3 mm, 3 m/s stream, matching the
- * high-speed video from Hurd & Truscott's urethra-replica experiments.
- */
-export const JET_DISTURBANCE_RATIO = 0.03;
-
-/** Secondary droplet count cap per impact event, to bound cost. */
-export const MAX_SECONDARIES_PER_IMPACT = 12;
+// The Rayleigh-Plateau disturbance ratio and the secondary-droplet cap used to
+// live here as module constants as well as on the parameter objects that
+// actually drive the solver. Nothing read the constants, and they had drifted:
+// this file said the disturbance ratio was 0.03 and put breakup at 15-20 cm
+// while `defaultStreamParams` used 0.05 and the UI slider labelled it 0.05. A
+// second, stale, unread copy of a calibrated number is worse than none, so the
+// parameter objects are now the only statement of both. See
+// `StreamParams.disturbanceRatio` and `ImpactModelParams.maxSecondaries`.
 
 /** Below this film thickness (m) a cell is treated as dry. */
 export const FILM_DRY_THICKNESS = 2e-6;

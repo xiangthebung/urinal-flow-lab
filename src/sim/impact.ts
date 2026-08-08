@@ -1,4 +1,5 @@
 import {
+  DRY_SPLASH_K_ROUGH,
   DRY_SPLASH_K_SMOOTH,
   WET_SPLASH_K_BASE,
   WET_SPLASH_K_FILM,
@@ -329,10 +330,24 @@ export class ImpactResolver {
 
     // Dry branch. Roughness relative to the droplet sets the correction: an
     // asperity comparable to the lamella thickness is what trips the corona.
+    //
+    // Mundo's 57.7 is the transition for a *smooth* wall and roughness lowers it,
+    // to around 33 for a wall rough enough that asperities dominate. So the
+    // correction interpolates between the two published endpoints rather than
+    // scaling one of them by an open-ended factor. The old form was
+    // `dryCriticalK * clamp(1/(1 + 900 Ra/d), 0.45, 1.6)`, which has three
+    // problems: 1/(1+x) never exceeds 1 so the 1.6 ceiling was unreachable and
+    // the stated "a very smooth fired glaze raises it" could not happen; a fired
+    // sanitary glaze at Ra = 0.3 um already read 45, a 21% cut for a surface that
+    // is the smooth reference; and aged glaze hit the 0.45 floor at 26, below the
+    // published rough figure. Referencing Ra to the droplet through a smoothstep
+    // keeps both ends where the measurements are.
     const roughRatio = this.wall.roughness / Math.max(1e-9, diameter);
     const dryK = Math.sqrt(weN) * Math.pow(Math.max(1e-9, reN), 0.25);
-    const dryCrit =
-      this.params.dryCriticalK * clamp(1 / (1 + 900 * roughRatio), 0.45, 1.6);
+    const rough = smoothstep(2e-4, 6e-3, roughRatio);
+    const roughFloor =
+      (DRY_SPLASH_K_ROUGH / DRY_SPLASH_K_SMOOTH) * this.params.dryCriticalK;
+    const dryCrit = this.params.dryCriticalK * (1 - rough) + roughFloor * rough;
     const dryRatio = dryK / Math.max(1e-9, dryCrit);
 
     // Wetted branch.
@@ -664,10 +679,21 @@ export class ImpactResolver {
 
     let spawned = 0;
     let ejectedKe = 0;
-    const parentArea = Math.PI * d * d;
+    // Interface the parent brought in, measured the same way as the children's:
+    // as many spheres of diameter `d` as its volume makes. One, for an ordinary
+    // droplet; several, for a coherent parcel carrying a whole wavelength of jet.
+    const parentArea =
+      (parentVolume / Math.max(1e-18, (Math.PI / 6) * d ** 3)) * Math.PI * d * d;
     let childArea = 0;
 
     const dirs: Array<{ x: number; y: number; z: number; sp: number; dd: number }> = [];
+    // A parcel is not one droplet once the cap binds. `count` is clamped to
+    // `maxSecondaries` to bound cost, so each spawned parcel stands in for
+    // `volEach / (pi/6 dd^3)` real droplets of diameter `dd`. The energy budget
+    // below has to be computed on the liquid that actually leaves, not on the
+    // nominal droplet: weighting by the geometric drop volume made the guard
+    // inert by a factor of tens exactly when the cap was binding, which is when
+    // the impact is most violent and the guard matters most.
     for (let k = 0; k < count; k++) {
       const dd = clamp(
         this.rng.logNormal(medianD, p.secondarySizeSpread),
@@ -696,9 +722,11 @@ export class ImpactResolver {
         baseEject * this.rng.logNormal(1, 1.25) * (0.6 + 0.4 * Math.abs(cosPhi))
       );
       dirs.push({ x: ex, y: ey, z: ez, sp, dd });
-      const vol = (Math.PI / 6) * dd ** 3;
-      ejectedKe += 0.5 * f.density * vol * sp * sp;
-      childArea += Math.PI * dd * dd;
+      // Kinetic energy of the liquid this parcel carries, and the interface of
+      // however many droplets of diameter `dd` that liquid makes.
+      ejectedKe += 0.5 * f.density * volEach * sp * sp;
+      const nReal = volEach / Math.max(1e-18, (Math.PI / 6) * dd ** 3);
+      childArea += nReal * Math.PI * dd * dd;
     }
 
     // -- Energy guard --------------------------------------------------------
@@ -826,14 +854,21 @@ export class ImpactResolver {
       particles
     );
 
-    this.totals.splashedVolume += splashVolume;
+    // Volume the buffer refused never left, so it is not splash: it stays on the
+    // casing and goes back to the caller with the rest of the liquid that stayed
+    // put. Counting it as splashed here while `resolve` deducted it on the
+    // interior path made the reported ejected fraction disagree with itself
+    // depending on which surface was struck. It is not booked to
+    // `depositedVolume` either, because there is no film cell out here.
+    const ejected = splashVolume - res.droppedVolume;
+    this.totals.splashedVolume += ejected;
     this.totals.splashEvents++;
     this.totals.exteriorEvents++;
-    this.totals.exteriorSplashedVolume += splashVolume - res.droppedVolume;
+    this.totals.exteriorSplashedVolume += ejected;
 
     return {
-      splashVolume: splashVolume - res.droppedVolume,
-      depositVolume: cap.volume - splashVolume + res.droppedVolume,
+      splashVolume: ejected,
+      depositVolume: cap.volume - ejected,
       secondaryCount: res.spawned,
     };
   }

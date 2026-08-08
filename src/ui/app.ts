@@ -1,13 +1,19 @@
-import { CRITICAL_IMPINGEMENT_ANGLE, GRAVITY } from '../core/constants';
+import { CRITICAL_IMPINGEMENT_ANGLE } from '../core/constants';
 import { FLUID_PRESETS, WALL_MATERIALS, capillaryLength, ohnesorge } from '../core/fluid';
-import { clamp, radToDeg, v3 } from '../core/vec3';
+import { clamp, radToDeg } from '../core/vec3';
 import { PRESETS, getPreset } from '../geometry/presets';
 import { ColorScale, sample, toCss } from '../render/colormap';
 import { DropletColorMode } from '../render/dropletView';
-import { FieldInfo, FieldMode } from '../render/fixtureView';
+import { FieldInfo, FieldMode, FixtureView } from '../render/fixtureView';
 import { CameraPreset, SceneView } from '../render/sceneView';
 import { ZONE_NAMES } from '../sim/capture';
-import { FLOW_PHASE_NAMES, FlowPhase } from '../sim/metrics';
+import {
+  DrainageReport,
+  FLOW_PHASE_NAMES,
+  FlowPhase,
+  Metrics,
+  SplashbackReport,
+} from '../sim/metrics';
 import {
   AimTrace,
   RunReport,
@@ -249,12 +255,12 @@ export class App {
   }
 
   /**
-   * Wire up aim picking.
+   * Wire up aim picking: click to aim, drag to orbit.
    *
-   * Held behind a modifier-free drag on the canvas would fight the orbit
-   * controls, so aiming is a deliberate mode: armed by the "Aim" button or by
-   * holding Shift. While armed the cursor changes and orbiting is suspended, so
-   * there is never any doubt about which gesture is in force.
+   * Shift (or the sticky `A` mode) paints aim continuously, and only then is
+   * orbit suspended — for the duration of that one gesture, so a drag always
+   * orbits and never has to be handed back. See the note in the body for what
+   * this replaced and why.
    */
   private buildAimPicking(): void {
     const canvas = document.getElementById('gl') as HTMLCanvasElement;
@@ -332,7 +338,7 @@ export class App {
     this.updateStreamPath();
     this.applyViewToggles();
     this.updateLegend();
-    this.updateGeometryNotes();
+    this.updateHud();
     this.scheduleAimSweep();
   }
 
@@ -625,11 +631,15 @@ export class App {
 
   private buildViewTabs(): void {
     const bar = document.getElementById('view-tabs')!;
-    for (const t of VIEW_TABS) {
+    VIEW_TABS.forEach((t, i) => {
       const b = document.createElement('button');
       b.className = 'tab';
       b.type = 'button';
       b.textContent = t.label;
+      // What the view means, on the control that selects it. The legend below
+      // carries the colour scale; the prose belongs here, where it is available
+      // before you switch rather than only after.
+      b.title = `${i + 1} · ${FixtureView.infoFor(t.mode, 0, 1).description}`;
       b.addEventListener('click', () => {
         this.view.fixture.mode = t.mode;
         this.updateFixtureField();
@@ -638,7 +648,7 @@ export class App {
       });
       bar.append(b);
       this.tabEls.push(b);
-    }
+    });
     this.paintTabs();
   }
 
@@ -709,8 +719,13 @@ export class App {
       const crit = radToDeg(CRITICAL_IMPINGEMENT_ANGLE);
       return `${deg.toFixed(1)}° — ${deg <= crit ? 'under' : 'over'} the ${crit.toFixed(0)}° criterion`;
     }, 'headline');
+    // Named for the direction the slider actually moves the aim. It was "Aim
+    // height", which reads as "higher number, higher on the wall" and does the
+    // opposite: v walks *down* the profile from the rim, so dragging right lowers
+    // the impact point. The readouts above say where it lands in millimetres
+    // above the floor, which is the answer anyone actually wants.
     aim.slider({
-      label: 'Aim height',
+      label: 'Aim down the wall',
       min: 0.02,
       max: 0.6,
       step: 0.01,
@@ -718,7 +733,7 @@ export class App {
       get: () => c.aimTargetV ?? 0.18,
       set: (v) => (c.aimTargetV = v),
       effect: 'aim',
-      hint: '0 is the top of the back wall, 0.5 the sump.',
+      hint: '0 is the top of the back wall, 0.5 the sump. Higher means lower down.',
     });
     aim.slider({
       label: 'Aim side of centre',
@@ -1095,33 +1110,32 @@ export class App {
     host.append(this.right.root);
 
     // ---- Headline --------------------------------------------------------
+    //
+    // Everything here reads live from the metrics and switches to the finished
+    // report when there is one, with a trailing `*` marking a mid-run figure.
+    // Nine of these used to be a literal em-dash until a full analysis had been
+    // run, so the results panel spent every playback looking broken while the
+    // simulation underneath it had the numbers all along.
     const head = this.right.section('Splashback');
-    head.readout(
-      'On the user',
-      () => {
-        const r = this.report;
-        if (!r) return this.liveUserVolume();
-        return `${r.splash.userMicrolitresPerLitre.toFixed(0)} µL/L`;
-      },
-      'headline'
-    );
+    head.readout('On the user', () => this.userPerLitre(), 'headline');
     head.readout('— thrown back', () =>
-      this.report ? `${(this.report.splash.userSplashVolume * 1e9).toFixed(0)} µL` : '—'
+      this.uL(this.splashNow().userSplashVolume)
     );
-    head.readout('— direct miss', () =>
-      this.report ? `${(this.report.splash.userDirectVolume * 1e9).toFixed(0)} µL` : '—'
-    );
-    head.readout('Droplets on user', () =>
-      this.report ? String(this.report.splash.userDroplets) : '—'
-    );
-    head.readout('Ejected at the wall', () =>
-      this.report ? `${(100 * this.report.splash.splashFraction).toFixed(1)} %` : '—'
-    );
-    head.readout('Floor near fixture', () =>
-      this.report ? `${(this.report.splash.floorNearVolume * 1e6).toFixed(2)} mL` : '—'
-    );
+    head.readout('— direct miss', () => this.uL(this.splashNow().userDirectVolume));
+    head.readout('Droplets on user', () => `${this.splashNow().userDroplets}${this.live}`);
+    head.readout('Ejected at the wall', () => {
+      const f = this.splashNow().splashFraction;
+      return this.splashNow().impactEvents > 0
+        ? `${(100 * f).toFixed(1)} %${this.live}`
+        : '—';
+    });
+    head.readout('Floor near fixture', () => {
+      const v = this.splashNow().floorNearVolume;
+      return `${(v * 1e6).toFixed(2)} mL${this.live}`;
+    });
     head.text(
-      'µL/L normalises by how much was voided, so runs of different volume compare directly.'
+      'µL/L normalises by how much was voided, so runs of different volume compare ' +
+        'directly. A trailing * marks a figure from a run still in progress.'
     );
     head.raw(this.zoneBars.root);
 
@@ -1139,10 +1153,16 @@ export class App {
     // the effect is large enough to be obvious a few seconds into a playback and
     // making it wait for the report is what kept it hidden. A trailing asterisk
     // marks a mid-run figure, matching the headline.
+    // Same guard as the headline: per-litre against a denominator of a few
+    // millilitres is arithmetic, not a measurement. Below a tenth of the void in
+    // a phase, the absolute volume is the honest thing to show.
     const phasePerL = (i: FlowPhase): string => {
       const r = this.report;
       const t = r ? r.splash.perPhase[i] : this.sim.metrics.perPhase[i];
       if (!t || t.emitted <= 1e-12) return '—';
+      if (!r && t.emitted < 0.1 * this.sim.config.stream.voidVolume) {
+        return `${(t.userVolume * 1e9).toFixed(0)} µL so far`;
+      }
       const v = (t.userVolume * 1e9) / (t.emitted * 1000);
       return `${v.toFixed(0)} µL/L${r ? '' : '*'}`;
     };
@@ -1152,7 +1172,8 @@ export class App {
       const src = this.report ? this.report.splash.perPhase : this.sim.metrics.perPhase;
       const s = src[FlowPhase.Sustained];
       const w = src[FlowPhase.Weak];
-      if (!s || !w || s.emitted <= 1e-12 || w.emitted <= 1e-12) return '—';
+      const floor = this.report ? 1e-12 : 0.1 * this.sim.config.stream.voidVolume;
+      if (!s || !w || s.emitted <= floor || w.emitted <= floor) return '—';
       const sv = (s.userVolume * 1e9) / (s.emitted * 1000);
       const wv = (w.userVolume * 1e9) / (w.emitted * 1000);
       if (sv <= 0) return wv > 0 ? 'all of it in the tail' : '—';
@@ -1173,25 +1194,28 @@ export class App {
     // on the default bowl is over 40% of the arriving volume and lands steeper, so
     // it both dilutes and biases a statistic that claims to be about the stream.
     imp.readout('Where the stream landed', () => {
-      const a = this.sim.metrics.actualImpingement();
-      return a.primaryVolume > 0 ? `${radToDeg(a.primaryMeanAngle).toFixed(1)}° mean` : '—';
+      const a = this.impingementNow();
+      return a.primaryVolume > 0
+        ? `${radToDeg(a.primaryMeanAngle).toFixed(1)}° mean${this.live}`
+        : '—';
     });
     imp.readout('Stream volume over 30°', () => {
-      const a = this.sim.metrics.actualImpingement();
+      const a = this.impingementNow();
       return a.primaryVolume > 0
-        ? `${(100 * a.primaryFractionOverCritical).toFixed(0)} %`
+        ? `${(100 * a.primaryFractionOverCritical).toFixed(0)} %${this.live}`
         : '—';
     });
     imp.readout('Re-impacting splash', () => {
-      const a = this.sim.metrics.actualImpingement();
+      const a = this.impingementNow();
       return a.secondaryVolume > 0
-        ? `${(a.secondaryVolume * 1e6).toFixed(1)} mL at ${radToDeg(a.meanAngle).toFixed(0)}°`
+        ? `${(a.secondaryVolume * 1e6).toFixed(1)} mL at ` +
+            `${radToDeg(a.meanAngle).toFixed(0)}°${this.live}`
         : '—';
     });
     imp.readout('Splash concentration', () => {
-      const a = this.sim.metrics.actualImpingement();
+      const a = this.impingementNow();
       return a.hotspotShare > 0
-        ? `${(100 * a.hotspotShare).toFixed(0)}% from worst 10%`
+        ? `${(100 * a.hotspotShare).toFixed(0)}% from worst 10%${this.live}`
         : '—';
     });
     imp.text(
@@ -1213,38 +1237,29 @@ export class App {
 
     // ---- Drainage --------------------------------------------------------
     const dr = this.right.section('Drainage & hygiene');
-    dr.readout('Left on the wall', () =>
-      this.report ? `${(this.report.drainage.residualVolume * 1e6).toFixed(2)} mL` : this.liveFilm()
-    );
-    dr.readout('— avoidable', () =>
-      this.report ? `${(this.report.drainage.excessVolume * 1e6).toFixed(2)} mL` : '—'
-    );
-    dr.readout('— retained film', () =>
-      this.report ? `${(this.report.drainage.retainedFloorVolume * 1e6).toFixed(2)} mL` : '—'
-    );
+    const mL = (v: number) => `${(v * 1e6).toFixed(2)} mL${this.live}`;
+    const cm2 = (v: number) => `${(v * 1e4).toFixed(0)} cm²${this.live}`;
+    dr.readout('Left on the wall', () => mL(this.drainageNow().residualVolume));
+    dr.readout('— avoidable', () => mL(this.drainageNow().excessVolume));
+    dr.readout('— retained film', () => mL(this.drainageNow().retainedFloorVolume));
     dr.readout('Bulk clear time', () => {
-      if (!this.report) return '—';
-      const t = this.report.drainage.bulkClearTime;
-      return t < 0 ? 'not within run' : `${t.toFixed(1)} s`;
+      const d = this.drainageNow();
+      // Only meaningful once the flow has stopped: it is measured from there.
+      if (this.sim.metrics.flowEndTime < 0) return 'while still flowing';
+      return d.bulkClearTime < 0
+        ? `not yet${this.live}`
+        : `${d.bulkClearTime.toFixed(1)} s${this.live}`;
     });
     dr.readout('Deepest standing liquid', () =>
-      this.report ? `${(this.report.drainage.maxStandingDepth * 1000).toFixed(2)} mm` : '—'
+      `${(this.drainageNow().maxStandingDepth * 1000).toFixed(2)} mm${this.live}`
     );
-    dr.readout('Wetted area (peak)', () =>
-      this.report ? `${(this.report.drainage.peakWettedArea * 1e4).toFixed(0)} cm²` : '—'
-    );
-    dr.readout('Stagnant area', () =>
-      this.report ? `${(this.report.drainage.stagnantArea * 1e4).toFixed(0)} cm²` : '—'
-    );
-    dr.readout('Over 20 s residence', () =>
-      this.report ? `${(this.report.drainage.scaleRiskArea * 1e4).toFixed(0)} cm²` : '—'
-    );
+    dr.readout('Wetted area (peak)', () => cm2(this.drainageNow().peakWettedArea));
+    dr.readout('Stagnant area', () => cm2(this.drainageNow().stagnantArea));
+    dr.readout('Over 20 s residence', () => cm2(this.drainageNow().scaleRiskArea));
     dr.readout('Through the drain', () =>
-      this.report ? `${(this.report.drainage.drainedVolume * 1e6).toFixed(1)} mL` : '—'
+      `${(this.drainageNow().drainedVolume * 1e6).toFixed(1)} mL${this.live}`
     );
-    dr.readout('Spilled / dripped', () =>
-      this.report ? `${(this.report.drainage.spilledVolume * 1e6).toFixed(2)} mL` : '—'
-    );
+    dr.readout('Spilled / dripped', () => mL(this.drainageNow().spilledVolume));
 
     // ---- Score -----------------------------------------------------------
     const sc = this.right.section('Design score');
@@ -1256,7 +1271,9 @@ export class App {
     sc.raw(this.notesEl);
     sc.text(
       'Weighted 40% splash, 25% impingement, 20% drainage, 15% hygiene. Parts shown ' +
-        'because the total is a convenience, not a verdict.'
+        'because the total is a convenience, not a verdict. The splash part is scored ' +
+        'on sustained flow only — that is the part the fixture governs, and the all-in ' +
+        'figure reverses which of two designs is better across the stand-off range.'
     );
 
     // ---- Charts ----------------------------------------------------------
@@ -1319,14 +1336,88 @@ export class App {
     repRow.button('Download .txt', () => this.downloadReport());
   }
 
-  private liveUserVolume(): string {
-    const s = this.sim.stats();
-    const litres = Math.max(1e-9, this.sim.metrics.emittedVolume) * 1000;
-    return `${((s.userVolume * 1e9) / litres).toFixed(0)} µL/L*`;
+  // =======================================================================
+  // Live readouts
+  //
+  // The panel shows the finished report when there is one and the running
+  // simulation otherwise, so a playback is as legible as an analysis. Both
+  // `splashback()` and `drainage()` walk the whole film grid, and
+  // `actualImpingement()` sorts two arrays as long as the grid, so each is
+  // computed at most once per simulated instant and shared by every readout that
+  // needs it -- there are nine of them on the drainage section alone, and they
+  // all repaint together.
+  // =======================================================================
+
+  /** `*` while the figures come from a run in progress rather than a report. */
+  private get live(): string {
+    return this.report ? '' : '*';
   }
 
-  private liveFilm(): string {
-    return `${(this.sim.film.totalVolume() * 1e6).toFixed(2)} mL*`;
+  private snapKey(): string {
+    return this.report ? 'report' : `t${this.sim.time.toFixed(4)}`;
+  }
+
+  private splashCache: { key: string; value: SplashbackReport } | null = null;
+  private drainCache: { key: string; value: DrainageReport } | null = null;
+  private impactCache: {
+    key: string;
+    value: ReturnType<Metrics['actualImpingement']>;
+  } | null = null;
+
+  private splashNow(): SplashbackReport {
+    if (this.report) return this.report.splash;
+    const key = this.snapKey();
+    if (this.splashCache?.key === key) return this.splashCache.value;
+    const it = this.sim.impact.totals;
+    const value = this.sim.metrics.splashback(
+      it.depositedVolume + it.splashedVolume,
+      it.splashedVolume,
+      it.splashEvents,
+      it.events
+    );
+    this.splashCache = { key, value };
+    return value;
+  }
+
+  private drainageNow(): DrainageReport {
+    if (this.report) return this.report.drainage;
+    const key = this.snapKey();
+    if (this.drainCache?.key === key) return this.drainCache.value;
+    const value = this.sim.metrics.drainage(this.sim.film);
+    this.drainCache = { key, value };
+    return value;
+  }
+
+  private impingementNow(): ReturnType<Metrics['actualImpingement']> {
+    const key = this.snapKey();
+    if (this.impactCache?.key === key) return this.impactCache.value;
+    const value = this.sim.metrics.actualImpingement();
+    this.impactCache = { key, value };
+    return value;
+  }
+
+  private uL(v: number): string {
+    return `${(v * 1e9).toFixed(0)} µL${this.live}`;
+  }
+
+  /**
+   * The headline figure.
+   *
+   * µL/L is a ratio, and for the first second of a void the denominator is a few
+   * millilitres — so one splash droplet reads as tens of thousands of µL/L, and
+   * the most prominent number in the tool spent the opening of every run
+   * announcing a catastrophe in a band its own report calls "the user is being
+   * sprayed". Arithmetically true, and useless. Below a tenth of the void the
+   * absolute volume is quoted instead, which is meaningful at any point in a run.
+   */
+  private userPerLitre(): string {
+    const sp = this.splashNow();
+    if (this.report) return `${sp.userMicrolitresPerLitre.toFixed(0)} µL/L`;
+    const emitted = this.sim.metrics.emittedVolume;
+    if (emitted < 0.1 * this.sim.config.stream.voidVolume) {
+      return `${(sp.userVolume * 1e9).toFixed(0)} µL so far`;
+    }
+    return `${sp.userMicrolitresPerLitre.toFixed(0)} µL/L*`;
   }
 
   // =======================================================================
@@ -1682,7 +1773,15 @@ export class App {
    * the best.
    */
   private runAimSweep(): void {
-    type Row = { v: number; angle: number; y: number; ok: boolean; blocked: boolean };
+    type Row = {
+      v: number;
+      angle: number;
+      y: number;
+      ok: boolean;
+      blocked: boolean;
+      /** Next to a blocked aim: a millimetre either way and it hits the casing. */
+      marginal: boolean;
+    };
     const rows: Row[] = [];
     const saveEl = this.sim.config.stream.aimElevation;
     const saveAz = this.sim.config.stream.aimAzimuth;
@@ -1692,7 +1791,14 @@ export class App {
       if (!this.sim.aimAtProfileFraction(v)) continue;
       const tr = this.sim.traceAim();
       if (tr.blocked) {
-        rows.push({ v, angle: Number.NaN, y: tr.point ? tr.point.y : 0, ok: false, blocked: true });
+        rows.push({
+          v,
+          angle: Number.NaN,
+          y: tr.point ? tr.point.y : 0,
+          ok: false,
+          blocked: true,
+          marginal: false,
+        });
         continue;
       }
       if (!tr.reached || !tr.point) continue;
@@ -1702,7 +1808,24 @@ export class App {
         y: tr.point.y,
         ok: tr.angle <= CRITICAL_IMPINGEMENT_ANGLE,
         blocked: false,
+        marginal: false,
       });
+    }
+
+    // An aim wedged between two blocked ones is on a knife edge: the ray is
+    // catching the rim tangentially, which reports an impingement angle of
+    // essentially zero and therefore wins "best aim" outright. It is the *worst*
+    // recommendation available — a nudge of one sweep step puts the stream on the
+    // outside of the fixture — and the model's own tremor is larger than that
+    // step. Measured on the untouched library: classic-bowl v = 0.49, flat-wall
+    // 0.62 and nautilus-tall 0.55 all report 0° this way, each flanked by blocked
+    // aims. They are still listed, because "there is a gap in the rim here" is
+    // true and worth seeing; they are just not offered as an answer.
+    for (let i = 0; i < rows.length; i++) {
+      const prev = rows[i - 1];
+      const next = rows[i + 1];
+      if (rows[i].blocked) continue;
+      rows[i].marginal = Boolean(prev?.blocked || next?.blocked);
     }
 
     this.sim.config.stream.aimElevation = saveEl;
@@ -1722,8 +1845,12 @@ export class App {
       this.sweepEl.append(p);
       return;
     }
-    let best = reachable[0];
-    for (const r of reachable) if (r.angle < best.angle) best = r;
+    // Prefer an aim with a blocked-free neighbourhood; fall back to the marginal
+    // ones only if the fixture offers nothing else.
+    const robust = reachable.filter((r) => !r.marginal);
+    const candidates = robust.length > 0 ? robust : reachable;
+    let best = candidates[0];
+    for (const r of candidates) if (r.angle < best.angle) best = r;
 
     const table = document.createElement('table');
     table.className = 'sweep-table';
@@ -1742,7 +1869,9 @@ export class App {
       const cells = [
         r.v.toFixed(2),
         `${(r.y * 1000).toFixed(0)} mm`,
-        r.blocked ? 'hits casing' : `${radToDeg(r.angle).toFixed(1)}°`,
+        r.blocked
+          ? 'hits casing'
+          : `${radToDeg(r.angle).toFixed(1)}°${r.marginal ? ' grazing' : ''}`,
       ];
       for (const c of cells) {
         const td = document.createElement('td');
@@ -1757,12 +1886,18 @@ export class App {
     summary.className = 'hint';
     const nOk = reachable.filter((r) => r.ok).length;
     const nBlocked = rows.length - reachable.length;
+    const nMarginal = reachable.filter((r) => r.marginal).length;
     summary.textContent =
       `Best aim v=${best.v.toFixed(2)} at ${radToDeg(best.angle).toFixed(1)}°. ` +
       `${nOk} of ${reachable.length} reachable aim points meet the 30° criterion` +
       (nBlocked > 0
         ? `, and ${nBlocked} strike the outside of the fixture — the worst outcome available.`
-        : '.');
+        : '.') +
+      (nMarginal > 0
+        ? ` ${nMarginal} graze the rim: they read a shallow angle only because the ` +
+          'stream is catching an edge tangentially, and one step either way puts it ' +
+          'on the casing. Not offered as a recommendation.'
+        : '');
     this.sweepEl.append(summary);
 
     const btn = document.createElement('button');
@@ -1971,16 +2106,11 @@ export class App {
     const bu = this.sim.emitter.breakupAt(
       this.sim.emitter.flow.peakFraction * this.sim.emitter.flow.duration
     );
-    const reach = this.aimTrace && this.aimTrace.point
-      ? Math.hypot(
-          this.aimTrace.point.x - this.sim.emitter.position.x,
-          this.aimTrace.point.y - this.sim.emitter.position.y,
-          this.aimTrace.point.z - this.sim.emitter.position.z
-        )
-      : 0;
+    // Path length, casting included: the same number the HUD quotes.
+    const { dist: reach, blocked } = this.reachToFixture();
     L.push(
       `  ${pad('Stream on arrival')}breaks up at ${(bu.breakupLength * 100).toFixed(0)} cm, ` +
-        `wall at ${(reach * 100).toFixed(0)} cm — ` +
+        `${blocked ? 'casing' : 'wall'} at ${(reach * 100).toFixed(0)} cm — ` +
         `${reach > bu.breakupLength ? 'a droplet train' : 'still a coherent jet'}`
     );
     L.push(
@@ -2286,8 +2416,7 @@ export class App {
     const s = this.sim.stats();
     const tPeak = this.sim.emitter.flow.peakFraction * this.sim.emitter.flow.duration;
     const bu = this.sim.emitter.breakupAt(Math.min(this.sim.time || tPeak, tPeak));
-    const dist = this.distanceToWall();
-    const coherentAtWall = dist > 0 && bu.breakupLength > dist;
+    const reach = this.reachToFixture();
     this.hudEl.innerHTML =
       `droplets <b>${s.particles}</b><br>` +
       `coherent <b>${s.coherent}</b> · splash <b>${s.secondaries}</b><br>` +
@@ -2296,53 +2425,96 @@ export class App {
       `drained <b>${(s.drained * 1e6).toFixed(1)} mL</b><br>` +
       `on user <b>${(s.userVolume * 1e9).toFixed(0)} µL</b><br>` +
       `breakup <b>${(bu.breakupLength * 100).toFixed(0)} cm</b> / reach ` +
-      `<b>${(dist * 100).toFixed(0)} cm</b>`;
-
-    // The single most actionable live hint in the tool.
-    if (coherentAtWall) {
-      this.noteEl.classList.add('show');
-      this.noteEl.textContent =
-        'The stream is still a coherent jet when it reaches the wall ' +
-        `(breakup at ${(bu.breakupLength * 100).toFixed(0)} cm, wall at ` +
-        `${(dist * 100).toFixed(0)} cm). A jet spreads into an attached sheet ` +
-        'instead of firing a corona, which is why standing closer helps.';
-    } else if (dist > 0) {
-      this.noteEl.classList.add('show');
-      this.noteEl.textContent =
-        `The stream has broken into droplets before it reaches the wall ` +
-        `(breakup at ${(bu.breakupLength * 100).toFixed(0)} cm, wall at ` +
-        `${(dist * 100).toFixed(0)} cm). Every droplet arrival throws its own ` +
-        'corona — this is the splash-prone regime.';
-    } else {
-      this.noteEl.classList.remove('show');
-    }
+      `<b>${reach.dist > 0 ? `${(reach.dist * 100).toFixed(0)} cm` : '—'}</b>` +
+      (reach.blocked ? ' <b>(casing)</b>' : '');
+    this.updateOverlayNote(bu.breakupLength, reach);
   }
 
-  /** Straight-line distance from the exit to the first contact with the fixture. */
-  private distanceToWall(): number {
-    const o = this.sim.emitter.position;
-    const tPeak = this.sim.emitter.flow.peakFraction * this.sim.emitter.flow.duration;
-    const speed = this.sim.emitter.speedAt(tPeak);
-    if (speed <= 1e-4) return 0;
-    const dir = this.sim.emitter.aimDirection();
-    let prev = v3(o.x, o.y, o.z);
-    let dist = 0;
-    for (let i = 1; i <= 300; i++) {
-      const t = i * 0.003;
-      const p = v3(
-        o.x + dir.x * speed * t,
-        o.y + dir.y * speed * t - 0.5 * GRAVITY * t * t,
-        o.z + dir.z * speed * t
-      );
-      const seg = v3(p.x - prev.x, p.y - prev.y, p.z - prev.z);
-      const segLen = Math.hypot(seg.x, seg.y, seg.z);
-      const hit = this.sim.surface.raycast(prev, seg, 1);
-      if (hit) return dist + segLen * hit.t;
-      dist += segLen;
-      prev = p;
-      if (p.y < this.sim.surface.floorY) break;
+  /**
+   * The one-line note over the viewport.
+   *
+   * One element, one message, chosen by priority. The geometry warning and the
+   * coherence hint used to write into it from two different update paths at two
+   * different rates, and the coherence hint runs at roughly 8 Hz — so "this
+   * profile self-intersects and is not manufacturable" was overwritten within a
+   * frame of appearing and was, in practice, unreachable. An aim that is stopped
+   * by the outside of the fixture now gets a line too: it is the worst outcome
+   * available, and it used to make the note disappear entirely.
+   */
+  private updateOverlayNote(
+    breakupLength: number,
+    reach: { dist: number; blocked: boolean }
+  ): void {
+    const cm = (m: number) => `${(m * 100).toFixed(0)} cm`;
+    let text = '';
+    let tone = '';
+
+    if (this.sim.surface.profile.info.selfIntersects) {
+      tone = 'bad';
+      text =
+        'Profile self-intersects — this shape is not manufacturable and the ' +
+        'surface parameterisation is invalid. Reduce the front lip height or the ' +
+        'wall overhang.';
+    } else if (reach.blocked) {
+      tone = 'bad';
+      text =
+        'The stream meets the outside of the fixture before it reaches the bowl. ' +
+        'That is the worst outcome available — it sprays straight back off the ' +
+        'ceramic. Aim higher, or stand closer.';
+    } else if (reach.dist <= 0 && this.sim.emitter.flow.rateAt(this.sim.time) > 0) {
+      // The tail. The stream is still running but too slow to carry to the
+      // fixture on the aim it left on, so it lands short — on the floor, or on
+      // the user. This is the mechanism behind the largest single effect in the
+      // model, and the note went blank for it because the old reach test used
+      // the *peak* exit speed and so always reported a wall in front of it.
+      tone = 'bad';
+      text =
+        'The stream is too weak to reach the fixture and is falling short — onto ' +
+        'the floor, or onto the user. This is the tail, and per litre it is the ' +
+        'worst part of the void.';
+    } else if (reach.dist > 0 && breakupLength > reach.dist) {
+      text =
+        'The stream is still a coherent jet when it reaches the wall ' +
+        `(breakup at ${cm(breakupLength)}, wall at ${cm(reach.dist)}). A jet ` +
+        'spreads into an attached sheet instead of firing a corona, which is why ' +
+        'standing closer helps.';
+    } else if (reach.dist > 0) {
+      text =
+        'The stream has broken into droplets before it reaches the wall ' +
+        `(breakup at ${cm(breakupLength)}, wall at ${cm(reach.dist)}). Every ` +
+        'droplet arrival throws its own corona — this is the splash-prone regime.';
     }
-    return 0;
+
+    this.noteEl.classList.toggle('show', text !== '');
+    this.noteEl.classList.toggle('bad', tone === 'bad');
+    this.noteEl.textContent = text;
+  }
+
+  /**
+   * Path length from the exit to the first contact with the fixture.
+   *
+   * Read off the aim trace, which tests the casting and the metalwork as well as
+   * the wetted interior. This used to raycast the interior alone — Trap 15, in a
+   * place that escaped the fix. It reported the distance to a point the liquid
+   * could never reach, and returned 0, i.e. "no wall at all", for precisely the
+   * aims that are stopped dead by the front rim: the HUD then read `reach 0 cm`
+   * and the note about coherence vanished, at the aim where it matters most.
+   */
+  private reachToFixture(): { dist: number; blocked: boolean } {
+    const tr = this.aimTrace;
+    if (!tr || !tr.point || tr.points.length < 2) {
+      return { dist: 0, blocked: false };
+    }
+    // Arc length along the traced path, not the chord: over half a metre gravity
+    // bends the trajectory enough for the two to differ by centimetres, and this
+    // number is compared against the breakup length.
+    let d = 0;
+    for (let i = 1; i < tr.points.length; i++) {
+      const a = tr.points[i - 1];
+      const b = tr.points[i];
+      d += Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+    }
+    return { dist: d, blocked: tr.blocked };
   }
 
   private updateTransport(): void {
@@ -2421,18 +2593,16 @@ export class App {
   private updateLegend(): void {
     const info: FieldInfo = this.view.fixture.info;
     this.legendEl.replaceChildren();
-    // The two appearance-only modes have no scale to show.
+    // The legend exists to decode a colour scale. The two appearance-only modes
+    // have none, so it had nothing to show but a paragraph restating the tab that
+    // is already highlighted a few centimetres away — a permanent block of prose
+    // over the default view, which is where most of the looking happens. The
+    // prose now lives on the tab as a tooltip, where it is readable before you
+    // switch instead of only after.
     if (
       this.view.fixture.mode === FieldMode.Liquid ||
       this.view.fixture.mode === FieldMode.Dry
     ) {
-      const t = document.createElement('div');
-      t.className = 'legend-title';
-      t.textContent = info.label;
-      const d = document.createElement('p');
-      d.className = 'legend-desc';
-      d.textContent = info.description;
-      this.legendEl.append(t, d);
       return;
     }
 
@@ -2511,14 +2681,4 @@ export class App {
     this.legendEl.append(title, bar, scale, desc);
   }
 
-  private updateGeometryNotes(): void {
-    const info = this.sim.surface.profile.info;
-    if (info.selfIntersects) {
-      this.noteEl.classList.add('show');
-      this.noteEl.textContent =
-        'Profile self-intersects — this shape is not manufacturable and the ' +
-        'surface parameterisation is invalid. Reduce the front lip height or the ' +
-        'wall overhang.';
-    }
-  }
 }
