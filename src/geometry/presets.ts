@@ -508,9 +508,14 @@ export const PRESETS: UrinalPreset[] = [
       // 0.02, already the smallest here -- shrinking it further would throttle the
       // one thing this model is supposed to win on.
       widthSump: 0.08,
-      // Trap 9: within 0.85-0.9 of the rim width. A waterless bowl is narrow at the
-      // sump, not at the mouth.
-      widthLip: 0.285,
+      // Trap 9: within 0.85-0.9 of the rim width -- 0.303 / 0.349 = 0.87. A waterless
+      // bowl is narrow at the SUMP, not at the mouth. This was momentarily 0.285,
+      // which is 0.82, because the rim was widened to the corrected 391 mm envelope
+      // and the lip was not moved with it. Trap 9 is a ratio, not a value, so any
+      // change to widthRim has to carry widthLip along: the gap it opens between the
+      // front rise and the back wall's side edges is where splash leaves sideways,
+      // and it multiplied splashback fivefold on the nautilus once.
+      widthLip: 0.303,
       taperExponent: 2.6,
       wrapDepth: 0.165,
       wrapExponent: 2.8,
