@@ -118,13 +118,27 @@ export interface SimConfig {
    * the tail from ~16 mL to ~5 mL. So the choice is worth a factor of three on the
    * dominant term.
    *
-   * `fixed` is the default and is what every published figure for this project was
-   * measured with. It is also the conservative reading of the anatomy: the exit
-   * angle is set by posture, not by a servo, and a real user gets feedback only
-   * from where the stream is already landing. `tracked` is the optimistic bound --
-   * a user who re-solves continuously and perfectly. The honest claim is that the
-   * truth is between them, which is why both are reachable and why the validation
-   * suite asserts that the tail dominates under *either*.
+   * **Does a real person track? For the rise, almost certainly yes.** Time to peak
+   * on the default flow curve is 6.8 s -- a quarter of the void, not a moment --
+   * and `traceAim` on the oval bowl at its own default aim reads *blocked* for the
+   * first ~0.6 s and again around t = 20 s, i.e. whenever exit speed is below
+   * roughly 1.2 m/s. Nobody watches their stream hit the front of the fixture for
+   * half a second and does not move. So `tracked` is the more realistic model of
+   * the rise, and `fixed` overstates the rim strike there.
+   *
+   * **`fixed` is nevertheless the default, for three reasons.** Every published
+   * figure for this project was measured with it. It errs pessimistic, and a
+   * design tool that flatters a fixture is worse than one that is harsh. And the
+   * truth is genuinely between the two bounds, so exposing both and reporting the
+   * gap is more honest than picking one and hiding the choice -- which is what was
+   * happening before, since nothing stated that the solve used peak speed.
+   *
+   * **The choice does not touch any comparison this tool exists to make.** During
+   * sustained flow the stream puts 0.00% of the void on the casing under *both*
+   * policies, and `sustainedMicrolitresPerLitre` reads 1041 against 1042. The
+   * policy moves only the tail -- weak-phase stream-on-casing 21.8% held against
+   * 8.6% tracked -- and Traps 16 and 42 already exclude the tail from the headline.
+   * So fixture ranking is unaffected either way.
    *
    * Tracking only applies when the aim was set as a point on the surface
    * (`aimTargetV`); an aim given as raw angles has no target to track.

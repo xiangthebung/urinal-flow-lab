@@ -27,6 +27,7 @@ import { UrinalSurface, defaultSurfaceParams } from '../geometry/surface';
 import { FlowCurve, solveBreakup } from '../sim/stream';
 import { FilmSolver, defaultFilmParams } from '../sim/film';
 import { ImpactResolver, defaultImpactParams } from '../sim/impact';
+import { FlowPhase } from '../sim/metrics';
 import { defaultStreamParams } from '../sim/stream';
 import { Simulation, defaultConfig } from '../sim/simulation';
 import { getPreset } from '../geometry/presets';
@@ -1556,6 +1557,93 @@ function endToEndTests(): TestResult[] {
         reference: 'Conservation of mass; re-aiming must not disturb the balance',
       })
     );
+
+    // Where the rim strike actually lives, per flow phase.
+    //
+    // `SplashbackReport.streamOnExteriorVolume` counts generation-0 liquid booked
+    // to the casting -- the stream missing the bowl, not splash coming back. It
+    // exists because "this fixture splashes" and "this fixture was being sprayed
+    // on its own outside for part of the run" are different failures with
+    // different remedies, and the headline µL/L mixes them.
+    //
+    // The split is stark and is the direct measurement of outstanding item 2b:
+    // during sustained flow the stream never touches the casing at all, and during
+    // the weak rise and tail better than a fifth of what is voided lands on it.
+    // That is Trap 14's mechanism, and it is entirely a weak-flow phenomenon.
+    //
+    // Written as fractions of each phase's own emitted volume, so it survives the
+    // fixture being reshaped: it asks where the liquid went, not how much.
+    {
+      const frac = (r: typeof held.rep, ph: FlowPhase) => {
+        const p = r.splash.perPhase[ph];
+        return p.emitted > 1e-12 ? p.exteriorDirectVolume / p.emitted : 0;
+      };
+      const sustained = frac(held.rep, FlowPhase.Sustained);
+      const weak = frac(held.rep, FlowPhase.Weak);
+      const weakTracked = frac(tracked.rep, FlowPhase.Weak);
+      out.push(
+        check({
+          name: 'The stream lands on the fixture’s casing only while flow is weak',
+          group: 'End to end',
+          expected: 'under 1% of sustained-flow volume, over 5% of weak-flow volume',
+          actual:
+            `sustained ${(100 * sustained).toFixed(2)}%, weak ${(100 * weak).toFixed(2)}% ` +
+            `(tracked aim ${(100 * weakTracked).toFixed(2)}%); ` +
+            `${(100 * held.rep.splash.streamOnExteriorFraction).toFixed(2)}% of the whole void`,
+          errValue: sustained < 0.01 && weak > 0.05 && weakTracked < weak ? 0 : 1,
+          tolValue: 0.5,
+          reference:
+            'Trap 14: the stream striking the casting is the worst outcome available, ' +
+            'and the aim is solved at peak exit speed so a slow stream falls short of it',
+          notes:
+            'The per-phase figure the fixture-comparison table wants. Measured rather ' +
+            'than predicted — it is what the swept-segment test booked, so it includes ' +
+            'tremor. traceAim().blocked answers the same question for one instant and is ' +
+            'the right thing for a live readout',
+        })
+      );
+    }
+
+    // Trap 18's premise, pinned. The wetted-patch physics in `FilmSolver.
+    // depositJet` belongs to the coherent-jet regime, and the trap's point is that
+    // at the default posture the regime is almost never entered: the stream breaks
+    // up well before it arrives, so a droplet train lands and the parabolic rim
+    // does not appear. Nothing checked that, which meant the *premise* of the trap
+    // was as unguarded as the physics it warns about.
+    //
+    // A ratio, not two distances, so a reshaped fixture does not break it.
+    {
+      const sim = held.sim;
+      const tPeak = sim.emitter.flow.peakFraction * sim.emitter.flow.duration;
+      const lb = sim.emitter.breakupAt(tPeak).breakupLength;
+      const path = sim.traceAim().points;
+      let reach = 0;
+      for (let i = 1; i < path.length; i++) {
+        reach += Math.hypot(
+          path[i].x - path[i - 1].x,
+          path[i].y - path[i - 1].y,
+          path[i].z - path[i - 1].z
+        );
+      }
+      out.push(
+        check({
+          name: 'At the default posture the stream arrives broken up, not as a jet',
+          group: 'End to end',
+          expected: 'breakup length well inside the distance to the wall',
+          actual:
+            `breaks up at ${(lb * 100).toFixed(0)} cm, wall is ${(reach * 100).toFixed(0)} cm ` +
+            `away along the traced path (ratio ${(lb / Math.max(1e-9, reach)).toFixed(2)})`,
+          errValue: reach > 1e-3 && lb < 0.7 * reach ? 0 : 1,
+          tolValue: 0.5,
+          reference:
+            'Trap 18: the parabolic wetted patch (Edwards, Howison, Ockendon & Ockendon, ' +
+            'JFM 2008) belongs to the coherent-jet regime and must not be forced',
+          notes:
+            'If this ever inverts, depositJet starts governing the deposition and the ' +
+            'Film thickness view is the one to check — not the Liquid view',
+        })
+      );
+    }
   }
   return out;
 }
