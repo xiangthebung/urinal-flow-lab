@@ -30,6 +30,20 @@ import { UrinalSurface } from './surface';
 export interface FittingsParams {
   /** Build the flushometer and its supply pipe. */
   flushValve: boolean;
+  /**
+   * Build a perforated sparge pipe along the length of the fixture.
+   *
+   * A trough is not flushed from a single valve over its middle -- that would rinse
+   * 150 mm of a 1500 mm channel. It is sparged: a small-bore pipe runs nearly the
+   * whole length just above the back panel, drilled with a row of holes angled at
+   * the wall, and gravity-fed from an auto-siphon cistern high above. The visible
+   * assembly *is* how you recognise a trough, in the same way that the absence of a
+   * flushometer is how you recognise a waterless bowl.
+   *
+   * Off by default: it is the trough's fitting, and every other fixture in the
+   * library takes a flushometer instead.
+   */
+  spargePipe: boolean;
   /** Build the outlet spud below the fixture. */
   outletSpud: boolean;
   /** Outside radius of the exposed supply pipe, m. */
@@ -54,6 +68,14 @@ export interface FittingsParams {
    * deck close behind it.
    */
   pipeStandoff: number;
+  /** Outside radius of the sparge pipe, m. */
+  spargeRadius: number;
+  /** Height of the sparge centreline above the top of the casting, m. */
+  spargeRise: number;
+  /** How far short of each end the sparge stops, m. */
+  spargeInset: number;
+  /** Number of clips holding the sparge off the back panel. */
+  spargeClips: number;
 }
 
 /**
@@ -83,6 +105,16 @@ export function defaultFittingsParams(): FittingsParams {
     spudRadius: 0.024,
     spudDrop: 0.09,
     pipeStandoff: 0.058,
+    spargePipe: false,
+    // 14 mm outside diameter, which is what Pland dimension on the Bruges drawing.
+    // The band across the industry is narrow -- 14-15 mm for a trough of this length,
+    // 22 mm only for 3 m slab runs -- so this is a slim tube, not a rail.
+    spargeRadius: 0.007,
+    spargeRise: 0.052,
+    // Pland dimension the pipe stopping 35 mm short at both ends.
+    spargeInset: 0.035,
+    // Four hospital clips on a 1200 mm unit, per the same drawing.
+    spargeClips: 4,
   };
 }
 
@@ -403,6 +435,65 @@ export function buildFittings(
       0.009,
       16
     );
+  }
+
+  if (p.spargePipe) {
+    // Runs along x, just above the top of the back panel and close to the wall.
+    const y = deckY + p.spargeRise;
+    const z = backZ + Math.max(p.pipeStandoff * 0.55, p.spargeRadius * 2.2);
+    const halfLen = Math.max(0.05, (casting.max.x - casting.min.x) / 2 - p.spargeInset);
+    const r = p.spargeRadius;
+
+    // The tube, with a domed blank at each end. A flat disc terminates as a
+    // broken-off rod at any size, the same reason the flushometer handle carries one.
+    b.cone(v3(-halfLen, y, z), v3(halfLen, y, z), r, r, 14);
+    for (const s of [-1, 1]) {
+      b.cone(v3(s * halfLen, y, z), v3(s * (halfLen + r * 0.7), y, z), r, r * 0.45, 12);
+    }
+
+    // Centre feed: a tee at the mid-point and a downpipe rising to the cistern.
+    // Every UK and Australian source feeds the sparge this way -- one vertical drop
+    // into the middle, splitting left and right -- rather than from an end, which is
+    // why 22 x 22 x 15 reduced tees are a stocked plumbing item.
+    b.cone(v3(-r * 2.1, y, z), v3(r * 2.1, y, z), r * 1.5, r * 1.5, 14);
+    const feedR = r * 1.55;
+    b.cone(v3(0, y, z), v3(0, y + 0.055, z), feedR, feedR, 14);
+    // Compression nut where the downpipe enters the tee.
+    b.cone(v3(0, y + 0.012, z), v3(0, y + 0.03, z), feedR * 1.35, feedR * 1.35, 12);
+    // The drop from the cistern. Left running off the top of the frame on purpose:
+    // the cistern sits 750-950 mm above the fixture, which is outside every view the
+    // tool frames, and drawing a stub that stops in mid-air reads as a broken pipe.
+    b.cone(v3(0, y + 0.055, z), v3(0, y + 0.42, z), feedR, feedR, 14);
+
+    // Hospital clips: a saddle round the pipe on a short post back to the panel.
+    const nClip = Math.max(2, Math.round(p.spargeClips));
+    for (let i = 0; i < nClip; i++) {
+      // Spread across the run, inset from the ends so no clip lands on a blank.
+      const f = nClip === 1 ? 0.5 : i / (nClip - 1);
+      const x = -halfLen * 0.86 + f * (halfLen * 1.72);
+      if (Math.abs(x) < r * 4) continue; // the tee occupies the middle
+      b.cone(v3(x, y, z), v3(x, y, backZ + 0.004), r * 1.45, r * 1.15, 10);
+      b.cone(v3(x, y, backZ + 0.004), v3(x, y, backZ), r * 2.1, r * 2.1, 10);
+    }
+
+    // Perforations, as short nipples angled down and back at the wall. They are the
+    // difference between a sparge and a handrail: the pipe discharges a curtain of
+    // water against the back panel, and the holes face it. Modelled as raised
+    // nipples rather than cut holes because the collider wants solid triangles and a
+    // subtractive hole would need a boolean the mesh builder does not do.
+    const pitch = 0.06;
+    const nHole = Math.max(2, Math.floor((halfLen * 2 - 0.05) / pitch));
+    for (let i = 0; i <= nHole; i++) {
+      const x = -halfLen + 0.025 + (i * (halfLen * 2 - 0.05)) / nHole;
+      if (Math.abs(x) < r * 4) continue;
+      b.cone(
+        v3(x, y - r * 0.45, z - r * 0.45),
+        v3(x, y - r * 1.35, z - r * 1.35),
+        r * 0.42,
+        r * 0.28,
+        6
+      );
+    }
   }
 
   if (p.outletSpud) {
