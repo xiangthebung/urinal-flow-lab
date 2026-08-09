@@ -451,8 +451,15 @@ bowl: **57 mL of a 300 mL void ran off the side edges — 17.8% of everything th
 landed** — and was released as tens of thousands of drips down the outside. On
 screen it read as a permanent waterfall fed by a trickle, which is what prompted
 "the fluid flow should be based on the amount". Applying `canAdvance` at the
-boundary halved it to 8.4%. The remaining 8.4% has not been chased; it is
-concentrated where the stream actually strikes, and may be legitimate.
+boundary halved it to 8.4%.
+
+> **The remaining 8.4% was not legitimate, and it was not the contact line.** It was
+> Trap 52: the interior had no side wall at the sump, so film reaching the boundary was
+> leaving at the bottom of the bowl through a hole in the geometry. It is now **0.00% on
+> all six presets** (`tools/sidespill.mts`), against 7.61% on `classic-bowl`, 3.64% on
+> the stall and 1.99% on compact. Two agents measured that residual independently, by
+> different methods, and agreed to 0.03 percentage points before either changed
+> anything — which is what made the prediction worth acting on.
 
 **24. Anything that removes liquid must be added to the closure sum.**
 `Metrics.escapedVolume` was declared, reset and *reported* — but never
@@ -734,6 +741,87 @@ above the Plateau limit, so breakup length rose linearly with speed for ever —
 at 30 m/s was claimed coherent for **2.08 m**. Real jets rise, peak, then break up
 *sooner*. Invisible at the default posture, where the gas Weber number is 0.63.
 
+**52. The wetted interior was a saddle, not a basin, and that was a physics bug.** Loft
+rows were horizontal — `y` came from the profile alone and never varied with `u` — so the
+patch was a back-wall sheet plus a separate curled front-lip ribbon with a free edge, and
+**no side wall joining them**. It rendered as a bright blade standing inside every bowl,
+which is what made it look like a shading fault for a long time. It was not cosmetic: it
+is the whole of Trap 23's undiagnosed residual, because film reaching the boundary at the
+sump was leaving through a hole in the geometry.
+
+Rows now run from their profile station out *and up* to a point on the rim, as a
+superellipse quadrant in a plane tilted back by `atan(lift/wrap)` — the same quadrant the
+model always used, stood up instead of laid flat. `wrap.ts` keeps its role as the single
+place the side-edge law lives (Trap 3) and returns two offsets, traced from a cubic Bézier
+rim curve walked at constant arclength. The lift is also what makes the Trap 3
+cancellation unhittable: where the profile runs horizontally the rim is still descending,
+and where it runs vertically the rim is still advancing.
+
+Consequences worth knowing. The notch is **0 mm on all six presets**, against 0–301 mm.
+`nautilus-tall` loses **135 mm of depth** (526 → 391) and keeps its result — flat 343 µL/L
+against constant-angle 0, 342.5× — so much of the depth Trap 13 records as a load-bearing
+trade was an artifact of how the wrap was measured, and its `openMouth` falls from 300 mm
+to 86. Ribbing rose on three presets and fell on three; the rise is *because* the casting
+is now more correct, shown by swapping the old `surface.ts`/`wrap.ts` into the new shell
+and reproducing the old figure exactly — the old envelope stayed flat above the lip only
+because the saddle swept full width there.
+
+**53. Three faults on the way, each of which looked like the one before it.** Worth
+reading together, because the pattern is the lesson: a change to row geometry breaks
+everything downstream that took a row's height from one column, and each break looks like
+the last.
+
+- **The casting paved the mouth.** `rowFloor` spiked a smooth, monotone `topY` back up at
+  scattered angles, and the three passes after it use `Math.max(topY, mean)`, which can
+  only push the edge *up* and so can never remove a spike. Correct by construction while
+  rows were level. Bounded to `marched + 4 mm` — its stated job is millimetre-scale glaze-
+  edge correction — and given the same 24 smoothing passes the march gets: 2418 cm² of
+  stray triangles down to 356, against a true baseline of 356.
+- **The rim came out serrated, and it was *not* the deck raycast.** That was the obvious
+  hypothesis and it was wrong: replacing the raycast with a constant width left the teeth
+  pixel-identical. **Trap 34's cull is a binary keep-or-drop per cell**, so the cut can
+  only land on a cell edge; while rows were level the cut plane ran parallel to them and
+  cell-wise agreed with exact, and once rows ran out and up to the rim the plane crossed
+  them diagonally and the boundary stair-stepped into 20–40 mm teeth. **Every vertex was
+  correct — only the decision was quantised.** Cells are now clipped against the plane,
+  with interpolated vertices cached per grid edge for watertightness.
+- **A guard that a commit message described and the file did not contain.** The zero-depth
+  case in `buildRimProfile` was claimed in a message and referenced by a comment in
+  `suite.ts`, and was never written. The branch sat at **56/60 while being reported as
+  59/60**, with three Nusselt checks failing unmentioned, because the flat-plate control
+  still had side walls. This is the project's own defect class — the comment and the code
+  disagree — applied to a commit message, and a commit message is the one place nobody
+  greps.
+
+**54. A sweep that changes two things at once is not a refinement study.** After the
+basin change the standing pool read 17% low and the `nu` sweep looked non-convergent:
+1.492 / 1.317 / 1.453 / 1.475 / 1.741. It was neither a solver fault nor the 4× over-
+spread it was first diagnosed as. **At matched *physical* resolution the two trees agree
+to 0.3%** — 3.75 mm cells read 1.746 before, 3.18 mm cells read 1.741 after. The new side
+walls take three quarters of the `u` range, so the sump row is **4.24× coarser at the same
+`nu`**, and four of the five sweep points were pre-asymptotic. The old tree was already
+inside the asymptotic regime at its *coarsest* setting, which is why nobody had ever seen
+this.
+
+Two lessons. Always report the cell size in **millimetres and in capillary lengths**, not
+the grid dimension — `nu` is not a resolution, it is a budget, and what it buys depends on
+what the row has to span. And the suite's blob is still sized in *cells* rather than
+millimetres, which is Trap 27 alive in this check: it is why `diag-pool`'s own sweep turns
+back down at the top end, as the blob shrinks below a few capillary lengths and goes
+volume-limited.
+
+Fixed with `uFloorFraction`, which gives the flat washout floor a stated share of the
+columns, solved per row from the floor's own arclength share and clamped to the identity
+where the floor already has it — so rows near the back rim, which are all floor and no
+wall, are untouched. 0.5 was chosen by measurement, not taste: it reads 96.4% of the
+capillary limit against 83.2% at equal arclength, and biasing harder is *worse* because
+the cell-sized blob then starves. The map is the same rational bias the rim curve uses —
+monotone, both ends fixed, finite slope at each. **A power law would have infinite slope
+at an end, which is Trap 2 moved into the parameterisation.** Nothing downstream needed
+changing: `cellDu`, `cellArea` and both face lengths are measured off the vertices, so the
+metric followed the spacing on its own, and volume closure at 0.0000% is the check that
+would have caught any disagreement instantly.
+
 ---
 
 ## Current measured state
@@ -792,12 +880,25 @@ Fixture envelopes and the notch, after the reshape. All six are 0 flipped normal
 
 | preset | W×D×H mm | notch | openMouth | protrude | ribbing |
 |---|---|---|---|---|---|
-| classic-bowl | 470×364×692 | 60 mm | 329 mm | 0.0 mm | 0.7–2.2 mm |
-| flat-wall | 392×371×548 | 52 mm | 300 mm | 0.0 mm | 39.9–40.3 mm |
-| stall-urinal | 458×382×974 | 0 mm | 313 mm | 0.0 mm | 22.4–23.0 mm |
-| trough | 1491×317×550 | 18 mm | 250 mm | 0.0 mm | 105.0 mm |
-| compact-waterless | 391×357×576 | 23 mm | 320 mm | 1.4–1.8 mm | 58.6–60.3 mm |
-| nautilus-tall | 365×526×627 | 299–301 mm | 299–301 mm | 1.1 mm | 0.6–0.8 mm |
+| classic-bowl | 480×364×692 | **0 mm** | 283 mm | 0.0 mm | 17.0–18.9 mm |
+| flat-wall | 394×371×548 | **0 mm** | 250 mm | 0.0 mm | 16.6 mm |
+| stall-urinal | 463×381×972 | **0 mm** | 254 mm | 0.0 mm | 40.7 mm |
+| trough | 1493×317×550 | **0 mm** | 158 mm | 0.0 mm | 24.9 mm |
+| compact-waterless | 397×356×575 | **0 mm** | 236 mm | ≤0.9 mm | 24.3 mm |
+| nautilus-tall | 352×391×627 | **0 mm** | 86 mm | 0.0 mm | 2.4–4.4 mm |
+
+**The notch is 0 mm on every preset**, against 0–301 mm before, and `openMouth` — which
+Trap 26 says no parameter moves and which is identically `bowlDepth` — has fallen with it,
+because closing the basin changed what the boundary loop *is*. A real fixture's mouth
+spreads 40–60 mm in z; the nautilus is now 86. Both of outstanding items 0 and 6 are
+closed by this, including the nautilus case the old text called "the one genuine remaining
+case" and "stuck there".
+
+Ribbing rose on three presets and fell on three (trough 105 → 24.9, compact 60.3 → 24.3,
+flat-wall 40.3 → 16.6; classic-bowl 2.2 → 18.9, stall 23.0 → 40.7, nautilus 0.8 → 4.4).
+The rises are not a regression — see Trap 52. Every preset's ribbing peak sits within a few
+millimetres of its own `lipY`, which is the front-lip step of Trap 29, and the old envelope
+only looked flat above the lip because the saddle swept full width there.
 
 Four of the six now fit their casting exactly (`protrude` 0.0 mm), against 0–95 mm before,
 and `classic-bowl`'s ribbing fell from 5.6–17.4 mm to under 2.2. Two shared-code fixes did
@@ -844,7 +945,16 @@ they are unaffected — but if that ever changes, Trap 12 applies.
 
 ## Outstanding work, in priority order
 
-**0. The opening is not a mouth (low now — addressed on all six, one model excepted).**
+**0. The opening is not a mouth — done, on all six.** Closed by Trap 52 rather than by
+the wrap tuning this item spent so long on: the side edge could not stop diving back to
+the mounting plane while the loft had no side wall to hold it. The notch is 0 mm on every
+preset, including `nautilus-tall`, which this item described as the one genuine remaining
+case and as "stuck there" at 299–301 mm. The hardcoded `z = min(maxWallRun/2, 0.02)` foot
+cap in `buildProfile` is no longer the binding constraint it was diagnosed as. The history
+below is kept because the reasoning about which lever works on which back wall is still
+correct, and because it records four rounds of tuning that a topology fix made moot.
+
+**0b. Historical (superseded).**
 
 Fixed across the library *without* touching the wrap law, using Traps 25 and 3
 together. Five of six are now 0–60 mm, against 90–368 before:
@@ -980,7 +1090,10 @@ floor level rather than 340 mm up — deliberately deferred, because the front r
 of that preset's enclosure and moving it in the same pass as the taper would confound
 which change moved the splash.
 
-**6. Interior side-wall seam artifact (low).** Visible in three-quarter shots of
+**6. Interior side-wall seam artifact — done.** It was Trap 52, and it was not a seam or
+a shading fault: the loft genuinely had no side wall in its front half. Diagnosed twice
+independently, both times by hiding the casting (`--overlays shell=0`) and finding the
+flap still there. Superseded text: Visible in three-quarter shots of
 `classic-bowl`. Not diagnosed. Related and larger: with `--overlays shell=0` the interior
 is visibly a *saddle*, not a basin — the loft's half width narrows at the sump, so the
 `u = ±1` edges pinch in and the bowl has no side walls in its front half. The casting
