@@ -243,6 +243,41 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // exactly an additive constant, and the result provably contains the interior,
   // so no correction pass is needed. It is also convex, which is what the outside
   // of a piece of sanitaryware is.
+  // -- Plan elongation ------------------------------------------------------
+  //
+  // The whole section fit lives in a polar frame about x = 0, and a polar frame is
+  // only an even sampling of a body that is roughly as wide as it is deep. On the
+  // trough it is not: 1.49 m wide against 0.42 m deep, and the consequences are not
+  // subtle. Measured on the old trough, the fitted radius ran 408 mm at theta = 0,
+  // peaked at 810 mm at 65 deg and came back to 745 mm at 90 deg -- non-monotonic,
+  // because the far corner of an elongated box is further from the origin than its
+  // end is, so the bins crowd the entire length of the fixture into the last few
+  // degrees. Two visible faults followed. `topY` sat at the front-lip height right
+  // out to 74 deg and then climbed 76 mm in the eight degrees to 82, which the 24
+  // smoothing passes drew as the swept-up wing at each end -- the "V-notch at the
+  // end caps". And the band-to-band ripple read 228 mm against 0.8 mm on the
+  // cleanest model.
+  //
+  // The fix is to do the fit in a plan frame where x is divided by the elongation,
+  // so a long shallow body is fitted as a roughly square one and the bins spread
+  // along it evenly. Everything downstream is a linear map away: an anisotropic
+  // scale is linear, so convexity and the support function's containment guarantee
+  // both survive it, and the only care needed is that normals transform by the
+  // inverse transpose (x component divided by `ex`, not multiplied).
+  //
+  // Clamped at 1, so this is *exactly* the identity for every fixture that is not
+  // wider than it is deep. All five compact presets sit at 0.35-0.60 and are
+  // untouched, bit for bit; only the trough moves.
+  let planHalfWidth = 0;
+  let planDepth = 1e-6;
+  for (let k = 0; k < nVert; k++) {
+    const ax = Math.abs(s.vertices[k * 3]);
+    const dz = s.vertices[k * 3 + 2] - zBack;
+    if (ax > planHalfWidth) planHalfWidth = ax;
+    if (dz > planDepth) planDepth = dz;
+  }
+  const ex = Math.max(1, planHalfWidth / planDepth);
+
   const dirS = new Float64Array(ABINS);
   const dirC = new Float64Array(ABINS);
   for (let a = 0; a < ABINS; a++) {
@@ -278,7 +313,9 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // guarantees containment: the envelope interpolates linearly in y between those
   // two bands, so if both are at least as far out as the vertex then so is every
   // height in between.
-  const sx = (k: number) => s.vertices[k * 3];
+  // `sx` is in the *scaled* plan frame, which is what puts the whole support-function
+  // fit -- vertices and spanned edges alike -- into that frame in one place.
+  const sx = (k: number) => s.vertices[k * 3] / ex;
   const sy = (k: number) => s.vertices[k * 3 + 1];
   const sz = (k: number) => Math.max(0, s.vertices[k * 3 + 2] - zBack);
 
@@ -299,6 +336,32 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // -- the front lip tip, the top of the rim, the bottom of the sump -- that no edge
   // reaches the extremum, and those are the few places it is needed. `fit.protrusion`
   // is the check that this reasoning is right rather than merely plausible.
+  // A run that is FLAT in y needs the spread for the same reason a turning point
+  // does: no edge along it crosses a band line, so the argument that the
+  // neighbouring edges already cover the vertex does not hold there either.
+  //
+  // This is the sump floor, and it is why the bowl was poking through its own
+  // casting. `sumpSlope` 0.005 on the trough puts the whole sump inside a third of
+  // one 5 mm band, so the only point on it that ever reached the fit was the drain
+  // -- a turning point, being the profile's minimum -- and the 65 mm of floor
+  // running forward from the drain to the foot of the front rise was simply absent
+  // from the envelope. Measured protrusion tracked sump slope across the library
+  // almost monotonically: trough 0.005 rad and 30 mm through, compact 0.34 rad and
+  // 11 mm, stall 0.09 and 7 mm, classic-bowl 0.12 and 4 mm.
+  //
+  // Deliberately narrower than "spread every vertex", which is the thing Trap 29(b)
+  // warns about: spreading a vertex part-way above a band line raises that band to a
+  // reach the surface does not have there, and consecutive vertices alternate
+  // between the true slice and an overshoot. On a genuinely flat run there is no
+  // overshoot to alternate with -- every vertex on it is at the same height -- so
+  // the mechanism that produces the ripple is absent.
+  const flatInY = (j: number, i: number): boolean => {
+    if (j === 0 || j === nv) return false;
+    const t = bandCoord(sy(j * stride + i));
+    const tUp = bandCoord(sy((j + 1) * stride + i));
+    const tDn = bandCoord(sy((j - 1) * stride + i));
+    return Math.floor(t) === Math.floor(tUp) && Math.floor(t) === Math.floor(tDn);
+  };
   const turnsInY = (j: number, i: number): boolean => {
     if (j === 0 || j === nv) return true;
     const y = sy(j * stride + i);
@@ -308,7 +371,7 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   };
   for (let j = 0; j <= nv; j++) {
     for (let i = 0; i <= nu; i++) {
-      if (!turnsInY(j, i)) continue;
+      if (!turnsInY(j, i) && !flatInY(j, i)) continue;
       const k = j * stride + i;
       const tb = bandCoord(sy(k));
       raiseAt(clampBand(Math.floor(tb)), sx(k), sz(k));
@@ -375,11 +438,23 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
 
   // Offsetting a convex body outward is exactly adding a constant to its support
   // function, so clearance and the mid-height fullness go straight on.
+  //
+  // The offset is a REAL distance, and in the scaled frame that is not a constant.
+  // Moving the supporting line out by `d` along the real outward normal shifts the
+  // scaled support function by `d * hypot(sin/ex, cos)`: unchanged at theta = 0,
+  // and `d/ex` at the ends. Adding `d` flat instead offsets the ends by `d * ex` --
+  // on the trough that turned a 22 mm clearance into a 58 mm one per side and made
+  // the casting 54 mm longer than the product it is dimensioned to.
+  const offsetGain = new Float64Array(ABINS);
+  for (let a = 0; a < ABINS; a++) offsetGain[a] = Math.hypot(dirS[a] / ex, dirC[a]);
+
   const rawH = Float64Array.from(H);
   for (let b = 0; b < BANDS; b++) {
     const sN = b / (BANDS - 1);
     const fullness = p.bulge * Math.sin(Math.PI * sN);
-    for (let a = 0; a < ABINS; a++) H[b * ABINS + a] += p.clearance + fullness;
+    for (let a = 0; a < ABINS; a++) {
+      H[b * ABINS + a] += (p.clearance + fullness) * offsetGain[a];
+    }
   }
 
   // Relax the section: angular smoothing rounds off the plan shape, vertical
@@ -418,7 +493,7 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // was already in `rawH`. Now that the fit is sampled per edge, `rawH` is smooth
   // in y and the floor costs nothing.
   for (let i = 0; i < H.length; i++) {
-    const floorH = rawH[i] + p.clearance * 0.5;
+    const floorH = rawH[i] + p.clearance * 0.5 * offsetGain[i % ABINS];
     if (H[i] < floorH) H[i] = floorH;
   }
 
@@ -488,19 +563,29 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     if (y > yTop) return (y - yTop) * 50;
     const dz = z - zBack;
     if (dz < 0) return -dz * 50;
-    const r = Math.hypot(x, dz);
-    return r / radiusAt(y, Math.atan2(x, dz)) - 1;
+    const sxq = x / ex;
+    const r = Math.hypot(sxq, dz);
+    return r / radiusAt(y, Math.atan2(sxq, dz)) - 1;
   };
 
   // Containment, measured rather than asserted. See ShellMesh.fit.
+  //
+  // Reported as a REAL distance, not a scaled one. The comparison happens in the
+  // scaled frame, but a scaled overshoot of d along direction theta is a real
+  // overshoot of d * hypot(ex sin, cos) -- so on an elongated body the two differ by
+  // up to `ex`, and quoting the scaled figure in millimetres would under-report the
+  // very case this metric exists to catch.
   let protrusion = 0;
   for (let k = 0; k < nVert; k++) {
     const x = s.vertices[k * 3];
     const y = s.vertices[k * 3 + 1];
     const dz = s.vertices[k * 3 + 2] - zBack;
     if (dz < 0 || y < yBot || y > yTop) continue;
-    const r = Math.hypot(x, dz);
-    const over = r - radiusAt(y, Math.atan2(x, dz));
+    const sxq = x / ex;
+    const th = Math.atan2(sxq, dz);
+    const r = Math.hypot(sxq, dz);
+    const over =
+      (r - radiusAt(y, th)) * Math.hypot(ex * Math.sin(th), Math.cos(th));
     if (over > protrusion) protrusion = over;
   }
 
@@ -676,7 +761,7 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // sharp instead of averaging its normal into the outer surface.
   const bandBase = nVert;
   const bodyBase = nVert + L * 2;
-  const body = buildBody(s, p, zBack, yBot, radiusAt);
+  const body = buildBody(s, p, zBack, yBot, radiusAt, ex);
   const totalVerts = bodyBase + body.count;
   const positions = new Float32Array(totalVerts * 3);
   const normals = new Float32Array(totalVerts * 3);
@@ -929,7 +1014,13 @@ function buildBody(
   p: ShellParams,
   zBack: number,
   yBot: number,
-  radiusAt: (y: number, th: number) => number
+  radiusAt: (y: number, th: number) => number,
+  /**
+   * Plan elongation of the fitted frame. Every radius here is in the scaled plan
+   * frame, so an x coordinate is `r * sin(theta) * ex` and an x direction carries
+   * the reciprocal. 1 for every fixture that is not wider than it is deep.
+   */
+  ex: number
 ): { positions: Float32Array; normals: Float32Array; indices: number[]; count: number } {
   const pos: number[] = [];
   const nrm: number[] = [];
@@ -950,6 +1041,15 @@ function buildBody(
   // wherever it is not thinned for the rim, and coincident surfaces flicker.
   const rOf = (y: number, t: number) => radiusAt(y, t) * 1.004;
   const HALF = Math.PI / 2;
+  /**
+   * Real distance covered by one unit of scaled radius, in direction `t`.
+   *
+   * Needed wherever a thickness in metres meets a radius in scaled units -- the deck
+   * width and the rowFloor tolerance are both real dimensions of the ceramic, and
+   * subtracting them straight off a scaled radius would make them `ex` times too
+   * generous toward the ends of an elongated body. 1 everywhere when `ex` is 1.
+   */
+  const radialScale = (t: number) => Math.hypot(ex * Math.sin(t), Math.cos(t));
 
   const stride = s.nu + 1;
   let yMin = Infinity;
@@ -1000,7 +1100,7 @@ function buildBody(
       let top = yFloorTop;
       for (let y = yCeil; y >= yFloorTop; y -= dyStep) {
         const r = rOf(y, t);
-        probe.x = r * st;
+        probe.x = r * st * ex;
         probe.y = y;
         probe.z = zBack + r * ct;
         const hit = s.raycast(probe, down, y - yBot);
@@ -1044,11 +1144,13 @@ function buildBody(
         const dz = s.vertices[k + 2] - zBack;
         if (dz <= 1e-6) continue;
         const y = s.vertices[k + 1];
-        const th = Math.atan2(s.vertices[k], dz);
+        const sxq = s.vertices[k] / ex;
+        const th = Math.atan2(sxq, dz);
         const a = Math.round(((th + Math.PI / 2) / Math.PI) * NA);
         if (a < 0 || a > NA) continue;
-        const r = Math.hypot(s.vertices[k], dz);
-        if (r < rOf(y, th) - (p.wallThickness + p.clearance + 0.02)) continue;
+        const r = Math.hypot(sxq, dz);
+        if (r < rOf(y, th) - (p.wallThickness + p.clearance + 0.02) / radialScale(th))
+          continue;
         if (y > topY[a]) topY[a] = Math.min(yCeil, y);
       }
     };
@@ -1071,7 +1173,12 @@ function buildBody(
   const normalAt = (y: number, t: number): [number, number, number] => {
     const dy = 0.004;
     const drdy = (rOf(y + dy, t) - rOf(Math.max(yBot, y - dy), t)) / (2 * dy);
-    let nx = Math.sin(t);
+    // Normals transform by the inverse transpose of the plan scaling, so the x
+    // component is DIVIDED by `ex` where a position is multiplied by it. Getting
+    // this backwards is not a subtle error -- it tilts the shading of the long
+    // faces the wrong way and the body reads as if it were pinched rather than
+    // stretched.
+    let nx = Math.sin(t) / ex;
     let nz = Math.cos(t);
     let ny = -drdy;
     const m = Math.hypot(nx, ny, nz) || 1;
@@ -1087,7 +1194,7 @@ function buildBody(
         const y = yOf(a, l);
         const r = rOf(y, t);
         const n = normalAt(y, t);
-        row.push(push(r * Math.sin(t), y, zBack + r * Math.cos(t), n[0], n[1], n[2]));
+        row.push(push(r * Math.sin(t) * ex, y, zBack + r * Math.cos(t), n[0], n[1], n[2]));
       }
       rows.push(row);
     }
@@ -1108,8 +1215,8 @@ function buildBody(
   for (let l = 0; l <= BODY_V; l++) {
     const yl = yOf(0, l);
     const yr = yOf(NA, l);
-    backL.push(push(-Math.abs(rOf(yl, -HALF)), yl, zBack, 0, 0, -1));
-    backR.push(push(Math.abs(rOf(yr, HALF)), yr, zBack, 0, 0, -1));
+    backL.push(push(-Math.abs(rOf(yl, -HALF)) * ex, yl, zBack, 0, 0, -1));
+    backR.push(push(Math.abs(rOf(yr, HALF)) * ex, yr, zBack, 0, 0, -1));
   }
   for (let l = 0; l < BODY_V; l++) {
     idx.push(backL[l], backR[l], backL[l + 1], backL[l + 1], backR[l], backR[l + 1]);
@@ -1122,11 +1229,11 @@ function buildBody(
   for (let a = 0; a <= NB; a++) {
     const t = -HALF + (a / NB) * Math.PI;
     const r = rOf(yBot, t);
-    bottom.push(push(r * Math.sin(t), yBot, zBack + r * Math.cos(t), 0, -1, 0));
+    bottom.push(push(r * Math.sin(t) * ex, yBot, zBack + r * Math.cos(t), 0, -1, 0));
   }
   for (let a = 0; a < NB; a++) idx.push(bc, bottom[a + 1], bottom[a]);
-  idx.push(bc, bottom[0], push(-Math.abs(rOf(yBot, -HALF)), yBot, zBack, 0, -1, 0));
-  idx.push(bc, push(Math.abs(rOf(yBot, HALF)), yBot, zBack, 0, -1, 0), bottom[NB]);
+  idx.push(bc, bottom[0], push(-Math.abs(rOf(yBot, -HALF)) * ex, yBot, zBack, 0, -1, 0));
+  idx.push(bc, push(Math.abs(rOf(yBot, HALF)) * ex, yBot, zBack, 0, -1, 0), bottom[NB]);
 
   // -- Horizontal decks: the top of the lip, and the top of the rim ---------
   // Both are found by shooting a ray inward at the bowl, so the deck stops exactly
@@ -1147,14 +1254,19 @@ function buildBody(
     const rOut = rOf(y, t);
     const sx = Math.sin(t);
     const sz = Math.cos(t);
-    origin.x = rOut * sx;
+    // The ray has to travel in real space -- the interior it is querying lives
+    // there -- while the radius it returns is in the scaled frame the deck is laid
+    // out in. `m` is the conversion, so the direction is normalised after scaling
+    // and the hit distance is divided back out of it.
+    const m = radialScale(t);
+    origin.x = rOut * sx * ex;
     origin.y = y - probeDrop;
     origin.z = zBack + rOut * sz;
-    dir.x = -sx;
+    dir.x = (-sx * ex) / m;
     dir.y = 0;
-    dir.z = -sz;
-    const hit = s.raycast(origin, dir, rOut);
-    return hit ? Math.max(0, rOut - hit.t) : null;
+    dir.z = -sz / m;
+    const hit = s.raycast(origin, dir, rOut * m);
+    return hit ? Math.max(0, rOut - hit.t / m) : null;
   };
   const quad = (a0: number, a1: number, b0: number, b1: number): void => {
     idx.push(a0, b0, a1, a1, b0, b1);
@@ -1188,14 +1300,21 @@ function buildBody(
       const y = topY[a];
       const rOut = rOf(y, t);
       const hit = cavityRadius(y, t, 0.004);
+      // `maxDeck` is a real thickness of ceramic, so it converts into the scaled
+      // frame before being taken off a scaled radius. Left unconverted it would be
+      // up to `ex` times too generous along the length of an elongated body, which
+      // is where the deck is most visible.
       const rIn = Math.max(
         0,
-        Math.max(rOut - maxDeck, hit === null ? 0 : Math.min(hit, rOut - 0.001))
+        Math.max(
+          rOut - maxDeck / radialScale(t),
+          hit === null ? 0 : Math.min(hit, rOut - 0.001)
+        )
       );
       const sx = Math.sin(t);
       const sz = Math.cos(t);
-      outs.push(push(rOut * sx, y, zBack + rOut * sz, 0, 1, 0));
-      ins.push(push(rIn * sx, y, zBack + rIn * sz, 0, 1, 0));
+      outs.push(push(rOut * sx * ex, y, zBack + rOut * sz, 0, 1, 0));
+      ins.push(push(rIn * sx * ex, y, zBack + rIn * sz, 0, 1, 0));
     }
     for (let a = 0; a < NA; a++) quad(outs[a], outs[a + 1], ins[a], ins[a + 1]);
   }
