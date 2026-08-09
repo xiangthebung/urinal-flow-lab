@@ -812,17 +812,109 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // rest of the skin, which renders as a bright flap curling out of the front of the
   // bowl. The lip does not lose its edge -- the rim band runs round the whole opening
   // loop and is what draws the visible thickness there.
+  //
+  // Tested per cell, at all four of its corners, rather than per row at the
+  // centreline. Those were the same test while every row of the interior was
+  // level, and they stopped being the same when the loft gained side walls: a row
+  // now runs from the profile out and *up* to the rim, so its ends can be 400 mm
+  // above its middle. Asking only the centre column then answers for the wrong
+  // part of the row, and the rows just below the back rim -- whose ends have
+  // already swung forward and up onto the rim while their centres are still on the
+  // back wall -- were emitted whole. The strip between them swept right across the
+  // opening, and the casting rendered with a fan of long triangles paving its
+  // mouth over. Trap 34's rule is unchanged in spirit: every corner must clear the
+  // cut, not just one of them.
+  //
+  // TRIMMED at the cut, not culled by it. A binary keep-or-drop per cell can only
+  // ever put the boundary on a cell edge, so the cut follows the grid instead of
+  // the plane -- and once the loft's rows ran out and up to the rim, the plane
+  // stopped being parallel to the rows and started crossing them diagonally. The
+  // boundary then stair-stepped one cell at a time, which on the default bowl in
+  // the default view is a row of teeth down the rim like a saw blade: the single
+  // most visible thing on the fixture. It is worth being precise about why the
+  // cull looked safe: while every row was level, a row was either wholly above the
+  // cut or wholly below it, so cell-wise and exact agreed to the millimetre and
+  // there was nothing to choose between them.
+  //
+  // The teeth are the height of one cell where the row is climbing to the rim,
+  // which is 20-40 mm on this bowl -- not a shading artifact and not fixable by
+  // smoothing anything, because the vertices are all exactly where they should be.
+  // Only the *decision* was quantised. So clip the cell polygon against the plane
+  // and emit what is left of it.
+  //
+  // Interpolated vertices are cached per grid edge, so the two cells sharing an
+  // edge get the same point and the trimmed boundary stays watertight. That is not
+  // an optimisation: computing it twice would leave a hairline crack along the cut
+  // wherever the two evaluations differed in the last bit.
   const yCut = s.lipY - 0.004;
-  const aboveCut = (j: number) => s.vertices[(j * stride + Math.floor(nu / 2)) * 3 + 1] > yCut;
+  const above = (k: number) => s.vertices[k * 3 + 1] > yCut;
+  /** Vertices created by the trim, appended after every pre-sized block. */
+  const cutPos: number[] = [];
+  const cutNrm: number[] = [];
+  const cutOf = new Map<number, number>();
+  const onCut = (k0: number, k1: number): number => {
+    const lo = Math.min(k0, k1);
+    const hi = Math.max(k0, k1);
+    const key = lo * nVert + hi;
+    const seen = cutOf.get(key);
+    if (seen !== undefined) return seen;
+    const y0 = s.vertices[lo * 3 + 1];
+    const y1 = s.vertices[hi * 3 + 1];
+    const f = Math.min(1, Math.max(0, (yCut - y0) / (y1 - y0 || 1)));
+    const id = totalVerts + cutPos.length / 3;
+    for (let a = 0; a < 3; a++) {
+      cutPos.push(outer[lo * 3 + a] + (outer[hi * 3 + a] - outer[lo * 3 + a]) * f);
+    }
+    let nx = outerNormal[lo * 3] + (outerNormal[hi * 3] - outerNormal[lo * 3]) * f;
+    let ny = outerNormal[lo * 3 + 1] + (outerNormal[hi * 3 + 1] - outerNormal[lo * 3 + 1]) * f;
+    let nz = outerNormal[lo * 3 + 2] + (outerNormal[hi * 3 + 2] - outerNormal[lo * 3 + 2]) * f;
+    const m = Math.hypot(nx, ny, nz) || 1;
+    nx /= m;
+    ny /= m;
+    nz /= m;
+    cutNrm.push(nx, ny, nz);
+    cutOf.set(key, id);
+    return id;
+  };
+  const ring: number[] = [];
+  const clipped: number[] = [];
   for (let j = 0; j < nv; j++) {
-    if (!aboveCut(j) || !aboveCut(j + 1)) continue;
     for (let i = 0; i < nu; i++) {
       const a = j * stride + i;
       const b = a + 1;
       const c = a + stride;
       const d = c + 1;
-      if (flip) idx.push(a, c, b, b, c, d);
-      else idx.push(a, b, c, b, d, c);
+      // Ring order round the cell, so the clip walks a closed polygon.
+      ring.length = 0;
+      ring.push(a, b, d, c);
+      let nAbove = 0;
+      for (const k of ring) if (above(k)) nAbove++;
+      if (nAbove === 0) continue;
+      let poly: number[];
+      if (nAbove === 4) poly = ring;
+      else {
+        // Sutherland-Hodgman against the single half-space y > yCut. A convex
+        // quad against one plane, so the result is a triangle, a quad or a
+        // pentagon and a fan triangulation of it is always valid.
+        clipped.length = 0;
+        for (let e = 0; e < 4; e++) {
+          const k0 = ring[e];
+          const k1 = ring[(e + 1) % 4];
+          const in0 = above(k0);
+          const in1 = above(k1);
+          if (in0) clipped.push(k0);
+          if (in0 !== in1) clipped.push(onCut(k0, k1));
+        }
+        if (clipped.length < 3) continue;
+        poly = clipped;
+      }
+      for (let e = 1; e + 1 < poly.length; e++) {
+        const p0 = poly[0];
+        const p1 = poly[e];
+        const p2 = poly[e + 1];
+        if (flip) idx.push(p0, p2, p1);
+        else idx.push(p0, p1, p2);
+      }
     }
   }
 
@@ -850,6 +942,7 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     positions[vi + 4] = outer[src + 1];
     positions[vi + 5] = outer[src + 2];
   }
+
   // Band normal at each loop point: perpendicular to both the loop tangent and
   // the wall thickness direction, pointed away from the middle of the opening.
   for (let m = 0; m < L; m++) {
@@ -933,12 +1026,21 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     else idx.push(a0, a1, b0, a1, b1, b0);
   }
 
+  // The trim's own vertices sit after every pre-sized block, so the three blocks
+  // keep the index ranges the rest of this function was written against.
+  const allPos = new Float32Array(totalVerts * 3 + cutPos.length);
+  const allNrm = new Float32Array(totalVerts * 3 + cutNrm.length);
+  allPos.set(positions);
+  allNrm.set(normals);
+  allPos.set(cutPos, totalVerts * 3);
+  allNrm.set(cutNrm, totalVerts * 3);
+
   const min = v3(Infinity, Infinity, Infinity);
   const max = v3(-Infinity, -Infinity, -Infinity);
-  for (let k = 0; k < totalVerts; k++) {
-    const x = positions[k * 3];
-    const y = positions[k * 3 + 1];
-    const z = positions[k * 3 + 2];
+  for (let k = 0; k < allPos.length / 3; k++) {
+    const x = allPos[k * 3];
+    const y = allPos[k * 3 + 1];
+    const z = allPos[k * 3 + 2];
     if (x < min.x) min.x = x;
     if (y < min.y) min.y = y;
     if (z < min.z) min.z = z;
@@ -948,8 +1050,8 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   }
 
   return {
-    positions,
-    normals,
+    positions: allPos,
+    normals: allNrm,
     indices: new Uint32Array(idx),
     min,
     max,
@@ -1154,16 +1256,51 @@ function buildBody(
         if (y > topY[a]) topY[a] = Math.min(yCeil, y);
       }
     };
+    // Bounded to what it is for. The floor exists to close a *millimetre*-scale
+    // undershoot -- "a millimetre short and the glaze edge stands out of the
+    // casting as a thin bright fin". It is not a second opinion about how high the
+    // solid goes, and letting it act as one is a real failure rather than a
+    // cosmetic one.
+    //
+    // The march above returns a smooth, monotone top edge: 374 mm at the front,
+    // which is the lip, rising to 515 mm at the sides, which is the rim. The floor
+    // then raised scattered angles in the middle of that run back to 515, so the
+    // finished edge oscillated 375 / 474 / 515 / 439 / 375 between neighbouring
+    // angular columns. Three smoothing passes cannot take out a 140 mm spike, and
+    // the strip capping the wall then had to span that gap -- which it did as a
+    // fan of long triangles lying straight across the open mouth. Measured: 1054
+    // triangles and 2418 cm2 of ceramic inside the opening, against 296 with the
+    // floor off.
+    //
+    // Why it started spiking is the same reason the skin cull did. Both were
+    // written when every row of the interior was level, so a row's height was one
+    // number and flooring to it was safe anywhere the row met the outer wall. The
+    // v = 0 and v = 1 rows are still level, but the loft's rows now run out and UP
+    // to the rim, so those two rows sit quite differently against the fitted
+    // envelope and the radius test now admits them at angles whose ceramic ends
+    // 140 mm lower.
+    const marched = Float64Array.from(topY);
     rowFloor(0);
     rowFloor(s.nv);
-    // Re-smoothed lightly, so the floor does not put back a one-column spike.
-    for (let pass = 0; pass < 3; pass++) {
+    // 4 mm. Millimetre scale is the whole point: at that value the ceramic sitting
+    // inside the opening measures 356 cm2, which is what the fixture measured before
+    // the interior was reparameterised at all. Anything larger is the floor
+    // overruling the march rather than tidying after it -- 36 mm reads 564 cm2.
+    const headroom = 0.004;
+    for (let a = 0; a <= NA; a++) {
+      topY[a] = Math.min(topY[a], marched[a] + headroom);
+    }
+    // Re-smoothed as hard as the march itself, and *not* with a max. Taking the
+    // larger of the height and its neighbourhood mean cannot remove a spike -- it
+    // can only ever push the edge up -- so three passes of it left the oscillation
+    // untouched. What the top edge needs here is the same treatment the raw march
+    // gets a few lines above: spread any step over 20-odd degrees so the strip
+    // capping the wall becomes the sloping top edge a real casting has, rather
+    // than a ribbon trying to climb 140 mm between two angular columns.
+    for (let pass = 0; pass < 24; pass++) {
       tmpT.set(topY);
       for (let a = 1; a < NA; a++) {
-        topY[a] = Math.max(
-          topY[a],
-          0.25 * tmpT[a - 1] + 0.5 * tmpT[a] + 0.25 * tmpT[a + 1]
-        );
+        topY[a] = 0.25 * tmpT[a - 1] + 0.5 * tmpT[a] + 0.25 * tmpT[a + 1];
       }
     }
   }
@@ -1293,24 +1430,69 @@ function buildBody(
     // a strip 52 mm wide climbing steeply is a flange sticking out of the fixture.
     // The rim of a real casting is a few millimetres of glaze.
     const maxDeck = p.rimThickness + p.clearance;
+    // Bounded, then smoothed -- the same two-step this file applies to `topY`, and
+    // for the same reason. The bound alone leaves the *width* free to take any
+    // value in [0, maxDeck] from one angular column to the next, and the raw
+    // raycast does exactly that: measured on the oval bowl, it reads 8-18 mm
+    // across the columns where the rim is under the probe and 190-300 mm across
+    // the columns where the ray clears the near rim and stops on the far side of
+    // the bowl, with the changeover inside a single 2-degree column. Clamping
+    // turns that into a square wave between about 10 mm and the full ceramic
+    // thickness, which draws a notch out of the top edge exactly where the
+    // silhouette is.
+    //
+    // Neither reading is wrong. The cavity genuinely is a few millimetres in at
+    // the sides, where the interior's side wall comes up to the rim, and there
+    // genuinely is no cavity at that height a few degrees forward of it, where the
+    // rim curve has already dropped below the probe. What is wrong is the *step*:
+    // the top edge of a cast fixture does not change width discontinuously, and
+    // Trap 32 records the same finding for the height of this edge.
+    //
+    // Smoothing the width rather than the radius. The outer radius swings from
+    // 225 mm at the sides to 337 mm at the front on this bowl and is already
+    // smooth; relaxing the radius would blend that real variation away, while the
+    // width is the quantity that is actually noisy.
+    //
+    // Trap 7(c) survives intact where it counts. The clamp is re-applied after
+    // the smoothing, so nothing can widen the deck past the thickness of the
+    // ceramic -- that bound is what the trap is about, and it is still hard.
+    // Smoothing does let the inner edge reach over the cavity by up to 18.8 mm on
+    // the stall and 14.2 mm on the oval bowl at the one or two columns where the
+    // raw signal steps, so it is worth saying plainly what that costs. Measured
+    // with `tools/diag-pave.mts`, which is the quantity the trap exists to
+    // protect: ceramic standing in the open mouth went *down* on five of the six
+    // presets (oval bowl 448 -> 435 cm2, flat-wall 480 -> 465, stall 1152 -> 1133,
+    // compact 518 -> 508, nautilus 421 -> 416) and moved 0.04% on the trough.
+    // The step it removes was costing more mouth than the blend it adds.
+    const width = new Float64Array(NA + 1);
+    const cap = new Float64Array(NA + 1);
+    const rOuts = new Float64Array(NA + 1);
+    for (let a = 0; a <= NA; a++) {
+      const t = angOf(a);
+      const rOut = rOf(topY[a], t);
+      const hit = cavityRadius(topY[a], t, 0.004);
+      // `maxDeck` is a real thickness of ceramic, so it converts into the scaled
+      // frame before being taken off a scaled radius. Left unconverted it would be
+      // up to `ex` times too generous along the length of an elongated body, which
+      // is where the deck is most visible.
+      rOuts[a] = rOut;
+      cap[a] = Math.min(maxDeck / radialScale(t), rOut - 0.001);
+      width[a] = Math.min(cap[a], hit === null ? cap[a] : Math.max(0.001, rOut - hit));
+    }
+    const tmpW = new Float64Array(NA + 1);
+    for (let pass = 0; pass < 24; pass++) {
+      tmpW.set(width);
+      for (let a = 1; a < NA; a++) {
+        width[a] = 0.25 * tmpW[a - 1] + 0.5 * tmpW[a] + 0.25 * tmpW[a + 1];
+      }
+    }
     const outs: number[] = [];
     const ins: number[] = [];
     for (let a = 0; a <= NA; a++) {
       const t = angOf(a);
       const y = topY[a];
-      const rOut = rOf(y, t);
-      const hit = cavityRadius(y, t, 0.004);
-      // `maxDeck` is a real thickness of ceramic, so it converts into the scaled
-      // frame before being taken off a scaled radius. Left unconverted it would be
-      // up to `ex` times too generous along the length of an elongated body, which
-      // is where the deck is most visible.
-      const rIn = Math.max(
-        0,
-        Math.max(
-          rOut - maxDeck / radialScale(t),
-          hit === null ? 0 : Math.min(hit, rOut - 0.001)
-        )
-      );
+      const rOut = rOuts[a];
+      const rIn = Math.max(0, rOut - Math.min(width[a], cap[a]));
       const sx = Math.sin(t);
       const sz = Math.cos(t);
       outs.push(push(rOut * sx * ex, y, zBack + rOut * sz, 0, 1, 0));
