@@ -102,6 +102,23 @@ interface RunRecord {
   allIn: number;
   /** Sustained flow only. The figure the fixture actually governs. */
   sustained: number;
+  /**
+   * The fraction of the *weak*-flow void that the stream itself put on the
+   * outside of the fixture, 0..1.
+   *
+   * Weak-phase rather than all-in on purpose. Trap 14's rim strike is entirely a
+   * weak-flow phenomenon -- measured across the library it is 0.00% of sustained
+   * volume against up to 23.7% of weak volume -- so a whole-run figure divides a
+   * number that only ever accrues in one phase by the volume of both, and reads
+   * as a small percentage for a fixture that is spraying its own front for a
+   * quarter of the run. That is the mixing the phase split exists to prevent.
+   *
+   * This separates "this fixture splashes" from "this fixture was being sprayed
+   * on its own outside", which are different failures with different remedies and
+   * wildly different magnitudes. Measured from the swept-segment test rather than
+   * predicted by `traceAim`, so it includes tremor and the real trajectory.
+   */
+  casingWeak: number;
   score: number;
   aimV: number;
   aimU: number;
@@ -514,6 +531,14 @@ export class App {
     const ib = this.sim.surface.bounds();
     const cb = this.view.castingBounds;
     const e = this.sim.emitter.position;
+    // At the current instant, not at peak. Trap 44's whole mechanism was that a
+    // preset could not be aimed into at its own default and nothing said so, and
+    // Trap 45 that a reachable aim flanked by blocked ones grazes and reads 0
+    // degrees. Both are re-checks that must run after any casting or posture
+    // change, and until now the automation surface could not answer either -- it
+    // reported degenerate cells and self-intersection, which are properties of the
+    // interior alone, and said nothing about whether the stream can get there.
+    const aim = this.sim.traceAim(this.sim.time);
     return {
       model: this.presetId,
       time: this.sim.time,
@@ -530,6 +555,9 @@ export class App {
       floorY: this.sim.surface.floorY,
       degenerateCells: this.sim.surface.degenerateCells,
       selfIntersects: this.sim.surface.profile.info.selfIntersects,
+      aimBlocked: aim.blocked,
+      aimReached: aim.reached,
+      aimAngleDeg: radToDeg(aim.angle),
     };
   }
 
@@ -1612,6 +1640,10 @@ export class App {
       modelName: p.name,
       allIn: r.splash.userMicrolitresPerLitre,
       sustained: r.splash.sustainedMicrolitresPerLitre,
+      casingWeak: (() => {
+        const w = r.splash.perPhase[FlowPhase.Weak];
+        return w && w.emitted > 0 ? w.exteriorDirectVolume / w.emitted : 0;
+      })(),
       score: r.score.total,
       aimV: c.aimTargetV ?? 0,
       aimU: c.aimTargetU,
@@ -1655,7 +1687,7 @@ export class App {
     const table = document.createElement('table');
     table.className = 'compare-table';
     const head = document.createElement('tr');
-    for (const h of ['fixture', 'sustained', 'all-in', 'score', '']) {
+    for (const h of ['fixture', 'sustained', 'all-in', 'on casing', 'score', '']) {
       const th = document.createElement('th');
       th.textContent = h;
       head.append(th);
@@ -1693,6 +1725,17 @@ export class App {
       sus.textContent = rec.sustained.toFixed(0);
       const all = document.createElement('td');
       all.textContent = rec.allIn.toFixed(0);
+      // Blank rather than "0%" when nothing hit the casing: a zero here is the
+      // ordinary case, and a column of zeroes reads as noise rather than as the
+      // absence of a specific failure.
+      const cas = document.createElement('td');
+      cas.textContent = rec.casingWeak > 0.005 ? `${(rec.casingWeak * 100).toFixed(0)}%` : '';
+      cas.title =
+        'Share of the weak-flow void that the stream itself put on the outside of ' +
+        'the fixture. Trap 14: this is the worst outcome available, and it is a ' +
+        'different failure from splashing off the wall. Weak flow only, because ' +
+        'that is the only phase it happens in.';
+      if (rec.casingWeak > 0.05) cas.classList.add('compare-warn');
       const sco = document.createElement('td');
       sco.textContent = rec.score.toFixed(0);
 
@@ -1708,7 +1751,7 @@ export class App {
       });
       del.append(x);
 
-      tr.append(name, sus, all, sco, del);
+      tr.append(name, sus, all, cas, sco, del);
       table.append(tr);
     }
     this.compareEl.append(table);

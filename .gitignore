@@ -18,3 +18,6 @@ tools/out.png
 # .kiro/steering/project-knowledge.md, which is tracked, or in a comment beside the
 # code.
 ai/
+
+# Scratch git worktrees used to run agents in parallel. Never part of the project.
+.claude/worktrees/

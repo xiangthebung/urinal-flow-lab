@@ -501,6 +501,12 @@ input[type="checkbox"] {
   color: var(--text-dim);
   border-bottom: 1px solid rgba(34, 48, 64, 0.5);
 }
+/* The stream landing on the fixture's own outside, which Trap 14 records as the
+   single worst outcome available. Coloured because it is a different failure
+   from the two µL/L columns beside it, not a larger amount of the same one. */
+.compare-table td.compare-warn {
+  color: var(--bad, #ff5a3c);
+}
 .compare-table td:first-child {
   max-width: 96px;
   overflow: hidden;

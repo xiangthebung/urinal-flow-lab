@@ -85,6 +85,22 @@ export interface LabProbe {
   floorY: number;
   degenerateCells: number;
   selfIntersects: boolean;
+  /**
+   * Whether the stream, at the aim and the instant now set, is stopped by the
+   * casting or the metalwork before it reaches the wetted interior.
+   *
+   * Here because Traps 44 and 45 both require a re-check after any casting or
+   * posture change, and neither could be answered from outside the browser. The
+   * fault they describe is not visible in a screenshot: `compact-waterless` spent
+   * its whole life with a default aim inside the band its own casting blocked, and
+   * it survived because the readouts raycast the interior alone and answered "no
+   * wall" rather than "the casting is in the way".
+   */
+  aimBlocked: boolean;
+  /** Whether it reached the interior at all. Blocked and short are different. */
+  aimReached: boolean;
+  /** Impingement angle where it lands, degrees. Near zero on a grazing hit. */
+  aimAngleDeg: number;
 }
 
 const FIELD_MODES: Record<string, FieldMode> = {
