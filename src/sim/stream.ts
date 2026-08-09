@@ -1,4 +1,5 @@
-import { GRAVITY } from '../core/constants';
+import { AIR_DENSITY, GRAVITY, JET_AERO_ATTENUATION } from '../core/constants';
+import { besselI0, besselI1, besselK0, besselK1 } from '../core/bessel';
 import { FluidProperties, kinematicViscosity } from '../core/fluid';
 import { Rng } from '../core/rng';
 import { Vec3, v3 } from '../core/vec3';
@@ -216,59 +217,116 @@ export interface BreakupSolution {
 }
 
 /**
- * Growth rate of an axisymmetric disturbance of dimensionless wavenumber x on a
- * viscous liquid cylinder of radius r.
+ * Growth rate of an axisymmetric disturbance of dimensionless wavenumber x = k r
+ * on a viscous liquid cylinder of radius r moving at `jetSpeed` through still air.
  *
- * Long-wave dispersion relation:
+ * Three effects, and the third one used to be missing:
  *
- *   omega = sqrt( sigma x^2 (1 - x^2) / (2 rho r^3) + 9 nu^2 x^4 / (4 r^4) )
- *           - 3 nu x^2 / (2 r^2)
+ *   omega = sqrt(D^2 + omega_inv^2) - D,      D = 3 nu x^2 / (2 r^2)
  *
- * Only x < 1 grows: disturbances shorter than the circumference increase surface
- * area and decay, which is the whole content of the Plateau argument. The
- * inviscid limit peaks at x = 1/sqrt(2), within 3% of Rayleigh's exact Bessel
- * result, and the viscous term matters little for urine at millimetre scale
- * (Oh ~ 2e-3) but is kept so the model stays honest for thicker fluids.
+ *   omega_inv^2 = (sigma x / (rho_l r^3)) * (I1(x)/I0(x)) * [ (1 - x^2)
+ *                 + C * (We_gas / 2) * x * K0(x)/K1(x) ]
+ *
+ * **Capillarity**, the `1 - x^2`: only disturbances longer than the circumference
+ * reduce surface area, which is the whole content of the Plateau argument.
+ *
+ * **Liquid inertia**, the `I1(x)/I0(x)`. This is Rayleigh's exact result, not its
+ * small-argument limit x/2. The limit is cheap and costs 1.4%: it moves the most
+ * unstable wavenumber from 0.697 to 1/sqrt(2) = 0.7071 and correspondingly
+ * mis-sizes every droplet the stream makes. With real Bessel functions available
+ * for the gas term there is no reason to keep the approximation on the liquid one.
+ *
+ * **Air**, the `We_gas` term, and this is the part that was absent. The relation
+ * without it says breakup length rises linearly with jet speed and never stops:
+ * at 20 m/s through a 3 mm orifice it claimed a coherent jet 1.35 m long, which
+ * is not a small extrapolation error but the wrong regime entirely. Real jets
+ * rise, reach a maximum, and then break up *sooner* as they go faster -- the
+ * falling branch is the defining characteristic of the first wind-induced regime
+ * (Grant & Middleman 1966), and including gas inertia is what reproduces it
+ * (Weber 1931). The term also moves the fastest-growing mode to shorter waves, so
+ * a fast jet makes smaller drops, which is both observed and consequential here:
+ * the Mundo splash group goes as d^0.75.
+ *
+ * The gas factor is derived rather than fitted. Matching the perturbation
+ * pressure of an inviscid outer stream on a cylinder gives K0(x)/K1(x) as the
+ * geometric factor -- it tends to zero for long waves, which do not feel the air
+ * at all, and to one for short waves, which feel it fully. `C` is Sterling &
+ * Sleicher's 0.175; see `JET_AERO_ATTENUATION`.
+ *
+ * Returns a signed rate. Outside the unstable band the value is negative, which
+ * the mode search needs in order to find the band edge; the old form returned a
+ * flat zero for every x >= 1 and so could not represent a band that air had
+ * widened past the Plateau limit.
  */
-export function rayleighGrowthRate(
+export function jetGrowthRate(
   fluid: FluidProperties,
   radius: number,
-  x: number
+  jetSpeed: number,
+  x: number,
+  ambientDensity = AIR_DENSITY
 ): number {
-  if (x <= 0 || x >= 1) return 0;
+  if (x <= 0) return 0;
   const nu = kinematicViscosity(fluid);
   const r2 = radius * radius;
   const r3 = r2 * radius;
-  const inertial = (fluid.surfaceTension * x * x * (1 - x * x)) / (2 * fluid.density * r3);
-  const viscous = (9 * nu * nu * x * x * x * x) / (4 * r2 * r2);
+
+  let drive = 1 - x * x;
+  if (ambientDensity > 0 && jetSpeed > 0) {
+    // We_gas on the jet *diameter*, the convention the regime diagram uses.
+    const weGas =
+      (ambientDensity * jetSpeed * jetSpeed * 2 * radius) / fluid.surfaceTension;
+    drive +=
+      JET_AERO_ATTENUATION * 0.5 * weGas * x * (besselK0(x) / besselK1(x));
+  }
+
+  const inertial =
+    ((fluid.surfaceTension * x * (besselI1(x) / besselI0(x))) / (fluid.density * r3)) *
+    drive;
   const damping = (3 * nu * x * x) / (2 * r2);
-  return Math.sqrt(Math.max(0, inertial + viscous)) - damping;
+  return Math.sqrt(Math.max(0, damping * damping + inertial)) - damping;
 }
 
 /**
  * Solve for the fastest-growing mode and the resulting breakup geometry.
  *
  * The maximum is found by a coarse scan plus golden-section refinement rather
- * than by using the textbook x = 0.697. That constant is the inviscid answer;
- * solving the actual dispersion relation keeps the model correct if a designer
- * switches to a more viscous fluid, and costs microseconds.
+ * than by using the textbook x = 0.697. That constant is the inviscid, still-air
+ * answer; solving the actual dispersion relation keeps the model correct if a
+ * designer switches to a more viscous fluid or drives the jet hard enough for the
+ * air to matter, and costs microseconds.
+ *
+ * `ambientDensity` defaults to air. Passing 0 recovers the pure capillary
+ * (Rayleigh/Weber) limit, which is how the validation suite checks the classical
+ * results without having to allow for an aerodynamic shift in its tolerances.
  */
 export function solveBreakup(
   fluid: FluidProperties,
   jetDiameter: number,
   jetSpeed: number,
   disturbanceRatio: number,
-  satelliteFraction: number
+  satelliteFraction: number,
+  ambientDensity = AIR_DENSITY
 ): BreakupSolution {
   const r = Math.max(1e-5, jetDiameter * 0.5);
 
+  // Air widens the unstable band past the Plateau limit x = 1, so the search
+  // cannot stop there. The band edge sits a little above C * We_gas / 2; scanning
+  // to 1 + C * We_gas covers it with room to spare, and collapses to a search over
+  // (0, 1.5] in still air.
+  const weGas =
+    ambientDensity > 0 && jetSpeed > 0
+      ? (ambientDensity * jetSpeed * jetSpeed * 2 * r) / fluid.surfaceTension
+      : 0;
+  const xHi = Math.max(1.5, 1 + JET_AERO_ATTENUATION * weGas);
+  const rate = (xx: number) => jetGrowthRate(fluid, r, jetSpeed, xx, ambientDensity);
+
   // Coarse scan for a bracket.
-  let bestX = 0.7071;
+  let bestX = 0.697;
   let bestW = -Infinity;
-  const N = 160;
-  for (let i = 1; i < N; i++) {
-    const x = i / N;
-    const w = rayleighGrowthRate(fluid, r, x);
+  const N = 400;
+  for (let i = 1; i <= N; i++) {
+    const x = (i / N) * xHi;
+    const w = rate(x);
     if (w > bestW) {
       bestW = w;
       bestX = x;
@@ -276,18 +334,19 @@ export function solveBreakup(
   }
   // Golden-section refinement in the neighbouring interval.
   const gr = 0.6180339887;
-  let lo = Math.max(1e-4, bestX - 1 / N);
-  let hi = Math.min(0.9999, bestX + 1 / N);
+  const step = xHi / N;
+  let lo = Math.max(1e-4, bestX - step);
+  let hi = Math.min(xHi, bestX + step);
   let c = hi - gr * (hi - lo);
   let d = lo + gr * (hi - lo);
   for (let i = 0; i < 60; i++) {
-    if (rayleighGrowthRate(fluid, r, c) > rayleighGrowthRate(fluid, r, d)) hi = d;
+    if (rate(c) > rate(d)) hi = d;
     else lo = c;
     c = hi - gr * (hi - lo);
     d = lo + gr * (hi - lo);
   }
   const x = 0.5 * (lo + hi);
-  const omega = Math.max(1e-9, rayleighGrowthRate(fluid, r, x));
+  const omega = Math.max(1e-9, rate(x));
   const wavelength = (2 * Math.PI * r) / x;
 
   // Linear growth from eps0 to pinch-off at eps ~ r.
@@ -336,6 +395,14 @@ export interface EmittedParcel {
   timeToBreakup: number;
   /** Droplet diameter this parcel will adopt at breakup, m. */
   breakupDiameter: number;
+  /**
+   * Volume that leaves as a satellite drop at pinch-off, m^3.
+   *
+   * A wavelength of jet does not become one sphere. The ligament between two
+   * forming drops pinches at both ends and the thread collapses into a smaller
+   * satellite, and this is the parcel's share of it.
+   */
+  satelliteVolume: number;
 }
 
 /**
@@ -506,6 +573,18 @@ export class StreamEmitter {
         breakup.mainDropletDiameter,
         this.params.dropletSizeSpread
       );
+      // The satellite's share of this wavelength, carried so that the parcel can
+      // actually split at pinch-off. `solveBreakup` has always computed the split
+      // and the validation suite has always checked that it conserves volume, but
+      // nothing downstream ever acted on it: every parcel stayed whole and adopted
+      // the *main* drop's diameter while keeping the *whole* wavelength's volume,
+      // so `satelliteFraction` did nothing but mis-size the drop by (1-phi)^(1/3)
+      // and not one particle in a run ever carried `PFlag.Satellite` -- a flag the
+      // droplet renderer has a distinct style for.
+      const satVolume =
+        breakup.satelliteDiameter > 0
+          ? volume * Math.max(0, Math.min(0.4, this.params.satelliteFraction))
+          : 0;
       emit({
         position: pos,
         velocity: v3(dir.x * speed, dir.y * speed, dir.z * speed),
@@ -514,6 +593,7 @@ export class StreamEmitter {
         jetDiameter: dia,
         timeToBreakup: breakup.breakupTime,
         breakupDiameter: dDrop,
+        satelliteVolume: satVolume,
       });
       this.emittedVolume += volume;
       this.emittedParcels++;

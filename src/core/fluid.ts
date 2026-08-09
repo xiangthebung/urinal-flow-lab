@@ -248,34 +248,87 @@ export const nusseltFilmThickness = (
 
 /**
  * Terminal velocity of a droplet falling in still air, m/s.
- * Solved by fixed-point iteration on the Schiller-Naumann drag law because
- * Cd depends on Re which depends on the velocity we are solving for.
- * Converges in a handful of iterations for the 0.1-5 mm range we care about.
+ *
+ * Solved by fixed-point iteration because Cd depends on Re, which depends on the
+ * velocity being solved for, and now also on the deformation, which depends on
+ * both. Converges in a handful of iterations over the 0.02-6 mm range used here.
+ *
+ * Uses the *deformed* drag law, because a millimetric drop at terminal velocity
+ * genuinely is flattened and that is what the measurements see. Checked against
+ * Gunn & Kinzer's 1949 measured raindrop terminal velocities in the validation
+ * suite -- the first non-circular test of the drag law in this project. The
+ * checks that were there before assert only that drag balances weight using the
+ * same Cd the solver used, which proves the iteration converges and nothing else.
  */
 export const terminalVelocity = (f: FluidProperties, diameter: number): number => {
   const buoyantWeight = ((f.density - AIR_DENSITY) * GRAVITY * Math.PI * diameter ** 3) / 6;
+  const area = (Math.PI * diameter * diameter) / 4;
   let v = 1;
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 200; i++) {
     const re = Math.max(1e-6, (AIR_DENSITY * v * diameter) / AIR_VISCOSITY);
-    const cd = dragCoefficient(re);
-    const area = (Math.PI * diameter * diameter) / 4;
+    const weGas = (AIR_DENSITY * v * v * diameter) / f.surfaceTension;
+    const cd = dropletDragCoefficient(re, weGas);
     // drag = 0.5 rho_air Cd A v^2  ==  weight  ->  solve for v
     const vNew = Math.sqrt((2 * buoyantWeight) / (AIR_DENSITY * cd * area));
-    if (Math.abs(vNew - v) < 1e-9) return vNew;
-    v = 0.5 * v + 0.5 * vNew; // damped, keeps it stable across the Re jump
+    if (Math.abs(vNew - v) < 1e-10) return vNew;
+    v = 0.7 * v + 0.3 * vNew; // damped, because Cd now feeds back through We too
   }
   return v;
 };
 
 /**
- * Sphere drag coefficient.
- * Schiller-Naumann below Re = 1000 (accurate to a few percent there), then
- * the Newton-regime plateau. Splash droplets sit at Re ~ 50-500, right in
- * the Schiller-Naumann sweet spot, and drag decides whether they reach the
- * user's trousers or fall short -- so this is not a detail we can skip.
+ * Rigid-sphere drag coefficient, Clift & Gauvin (1970):
+ *     Cd = (24/Re)(1 + 0.15 Re^0.687) + 0.42 / (1 + 42500 Re^-1.16)
+ *
+ * Reduces to Schiller-Naumann below Re ~ 1000 and carries the Newton plateau
+ * above it in one continuous expression.
+ *
+ * The previous form was Schiller-Naumann below Re = 1000 and a flat 0.44 above.
+ * The seam itself was a minor complaint -- 0.4383 against 0.44, a 0.39% step --
+ * but the flat 0.44 was not: the real coefficient keeps falling past Re = 1000
+ * and bottoms out near 0.387, so the old value was **9-14% high through
+ * Re = 2000-5000**, which is exactly where the 5-6 mm drops off a urine stream
+ * sit. Measured against Gunn & Kinzer's raindrop data, that error was partly
+ * cancelling the *absence* of the deformation correction below, and the two
+ * together are why the old pair looked tolerable: rigid-sphere drag alone with a
+ * correct Cd is 30.6% out at 5 mm, worse than the old law's 22%. Fixing either
+ * one on its own makes the model worse, which is the reason they were changed
+ * together and the reason a non-circular check was needed to see it at all.
  */
 export const dragCoefficient = (re: number): number => {
   if (re < 1e-8) return 1e8;
-  if (re < 1000) return (24 / re) * (1 + 0.15 * Math.pow(re, 0.687));
-  return 0.44;
+  return (
+    (24 / re) * (1 + 0.15 * Math.pow(re, 0.687)) +
+    0.42 / (1 + 42500 * Math.pow(re, -1.16))
+  );
+};
+
+/**
+ * Drag coefficient of a *droplet*, which is not a rigid sphere.
+ *
+ * Aerodynamic pressure flattens a drop into an oblate shape, which presents more
+ * frontal area and a worse wake, and the effect is not small at the sizes this
+ * model works in: Rayleigh breakup of a 3 mm stream makes 5.5 mm drops, and a
+ * 5.8 mm raindrop at terminal velocity carries about 95% more drag than a sphere
+ * of the same volume.
+ *
+ * Liu, Mather & Reitz (SAE 930072, 1993) scale the sphere value by the TAB
+ * distortion parameter y of O'Rourke & Amsden (1987):
+ *     Cd = Cd_sphere * (1 + 2.632 y),   0 <= y <= 1
+ * The 2.632 is not fitted: it is the interpolation between a sphere (0.424) and a
+ * disk (1.54), since 1.54/0.424 - 1 = 2.632. `y` is taken at its quasi-steady
+ * value, y = We_gas / 24 on the drop diameter, capped at the disk limit.
+ *
+ * Deformation only; there is deliberately no secondary breakup. The bag-breakup
+ * threshold is We_gas ~ 11-13 (Pilch & Erdman 1987; Guildenbecher et al. 2009,
+ * We_crit = 11 +/- 2) and the largest We_gas reachable here is about 3.6 -- a
+ * 6 mm drop at 6 m/s, which is already beyond anything a urinal produces. So the
+ * airborne liquid in this model never breaks up aerodynamically, and modelling it
+ * would be inventing a regime the problem does not enter. The Ohnesorge
+ * correction to that threshold, 12(1 + 1.077 Oh^1.6), is likewise pointless here:
+ * at Oh ~ 0.002 it moves 12 to 12.003.
+ */
+export const dropletDragCoefficient = (re: number, weberGas: number): number => {
+  const y = Math.min(1, Math.max(0, weberGas / 24));
+  return dragCoefficient(re) * (1 + 2.632 * y);
 };

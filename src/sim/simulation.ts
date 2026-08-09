@@ -100,6 +100,50 @@ export interface SimConfig {
    * behaviour exactly.
    */
   aimTargetU: number;
+  /**
+   * Whether the user re-aims as the stream weakens.
+   *
+   * This was a modelling choice made implicitly, by *when* the aim happened to be
+   * solved. `StreamEmitter.aimAt` uses the exit speed at peak flow, so the launch
+   * angles are fixed at the strongest part of the void and then held; as the
+   * stream decays, range falls roughly as the square of speed and it lands
+   * progressively shorter, eventually on the fixture's own front rim. Nothing
+   * stated that, and it is not a detail: the weak rise and tail produce 5-20x more
+   * splashback per litre than sustained flow (Trap 17), so whatever governs where
+   * the tail lands governs most of the all-in figure.
+   *
+   * Measured, oval bowl and flat slab, 300 mL, two seeds: letting the user track
+   * the target perfectly takes weak-phase splashback to **0.30-0.37x** of the
+   * held-aim figure and the liquid thrown onto the outside of the fixture during
+   * the tail from ~16 mL to ~5 mL. So the choice is worth a factor of three on the
+   * dominant term.
+   *
+   * **Does a real person track? For the rise, almost certainly yes.** Time to peak
+   * on the default flow curve is 6.8 s -- a quarter of the void, not a moment --
+   * and `traceAim` on the oval bowl at its own default aim reads *blocked* for the
+   * first ~0.6 s and again around t = 20 s, i.e. whenever exit speed is below
+   * roughly 1.2 m/s. Nobody watches their stream hit the front of the fixture for
+   * half a second and does not move. So `tracked` is the more realistic model of
+   * the rise, and `fixed` overstates the rim strike there.
+   *
+   * **`fixed` is nevertheless the default, for three reasons.** Every published
+   * figure for this project was measured with it. It errs pessimistic, and a
+   * design tool that flatters a fixture is worse than one that is harsh. And the
+   * truth is genuinely between the two bounds, so exposing both and reporting the
+   * gap is more honest than picking one and hiding the choice -- which is what was
+   * happening before, since nothing stated that the solve used peak speed.
+   *
+   * **The choice does not touch any comparison this tool exists to make.** During
+   * sustained flow the stream puts 0.00% of the void on the casing under *both*
+   * policies, and `sustainedMicrolitresPerLitre` reads 1041 against 1042. The
+   * policy moves only the tail -- weak-phase stream-on-casing 21.8% held against
+   * 8.6% tracked -- and Traps 16 and 42 already exclude the tail from the headline.
+   * So fixture ranking is unaffected either way.
+   *
+   * Tracking only applies when the aim was set as a point on the surface
+   * (`aimTargetV`); an aim given as raw angles has no target to track.
+   */
+  aimTracking: 'fixed' | 'tracked';
   /** Seed, so a comparison between two designs is a controlled experiment. */
   seed: number;
   /** Particle buffer size. */
@@ -129,6 +173,7 @@ export function defaultConfig(): SimConfig {
     // most sensitive input in the whole model.
     aimTargetV: 0.18,
     aimTargetU: 0,
+    aimTracking: 'fixed',
     seed: 12345,
     particleCapacity: 200000,
   };
@@ -337,6 +382,7 @@ export class Simulation {
     this.metrics.reset();
     this.time = 0;
     this.phase = SimPhase.Voiding;
+    this.unreachableSteps = 0;
     if (c.aimTargetV !== null) this.aimAtProfileFraction(c.aimTargetV);
     this.refreshImpingement();
   }
@@ -367,12 +413,30 @@ export class Simulation {
     const target = this.surface.getCellPos(cell, v3());
     const ok = this.emitter.aimAt(target, GRAVITY);
     if (ok) {
+      // Kept so `aimTracking: 'tracked'` has something to re-solve against. The
+      // aim is a point on the fixture, not a pair of angles -- the angles are only
+      // the answer at one particular exit speed.
+      this.aimTarget = target;
       this.config.stream.aimElevation = this.emitter.params.aimElevation;
       this.config.stream.aimAzimuth = this.emitter.params.aimAzimuth;
       this.refreshImpingement();
     }
     return ok;
   }
+
+  /**
+   * The point on the surface the aim was last solved for, if it was set as a
+   * point rather than as raw angles.
+   */
+  aimTarget: Vec3 | null = null;
+
+  /**
+   * Steps during the void where the target was out of ballistic range at any
+   * elevation. Meaningful under `aimTracking: 'tracked'`: it is the part of the
+   * tail no amount of re-aiming can fix, because the stream simply cannot get
+   * there any more.
+   */
+  unreachableSteps = 0;
 
   /**
    * Fly the current aim ballistically and report the first thing it actually
@@ -492,6 +556,25 @@ export class Simulation {
     const rateNow = this.emitter.flow.rateAt(this.time);
     this.metrics.currentPhase =
       rateNow >= 0.5 * this.emitter.flow.peakFlowRate ? FlowPhase.Sustained : FlowPhase.Weak;
+    // 0. Re-aim, if the user is modelled as tracking the target as the stream
+    //    weakens. Solved at the *current* exit speed rather than at peak, which is
+    //    the whole difference between the two policies. Where the solve fails the
+    //    target is out of ballistic range at any elevation, so the aim is left
+    //    where it was and the step is counted: that is the part of the tail no
+    //    re-aiming can reach.
+    if (
+      this.phase === SimPhase.Voiding &&
+      this.config.aimTracking === 'tracked' &&
+      this.aimTarget
+    ) {
+      const sol = this.emitter.solveAimForTarget(this.aimTarget, this.time, GRAVITY);
+      if (sol) {
+        this.emitter.params.aimElevation = sol.elevation;
+        this.emitter.params.aimAzimuth = sol.azimuth;
+      } else if (rateNow > 0) {
+        this.unreachableSteps++;
+      }
+    }
     if (this.phase === SimPhase.Voiding) {
       this.emitter.step(this.time, dt, (p) => {
         this.particles.spawnFromEmitter(p);
@@ -514,6 +597,16 @@ export class Simulation {
       this.stepResult,
       null
     );
+
+    // 2b. Release the satellite drops from any parcel that pinched off this step.
+    //     Spawned here rather than inside the sweep so that claiming a slot
+    //     cannot change how many particles the sweep itself visits. Generation
+    //     stays 0: a satellite comes straight from the stream and has never
+    //     touched the fixture, so if it reaches the user it is a direct miss and
+    //     not splashback, which is a distinction the report depends on.
+    for (const s of this.stepResult.satellites) {
+      this.particles.spawnDroplet(s.position, s.velocity, s.diameter, s.volume, 0, true);
+    }
 
     // 3. Resolve wall impacts. Each one either wets the wall, throws
     //    secondaries, or both.
@@ -601,6 +694,12 @@ export class Simulation {
     const t0 = performance.now();
     this.restart();
     const total = this.totalDuration;
+    // Under `tracked` the run walks the launch angles as it goes, and those angles
+    // live on the shared stream params. Restored afterwards so a completed run
+    // leaves the aim where the caller set it rather than at whatever the dribble
+    // needed, which is what the aim readouts and `traceAim` would otherwise show.
+    const aimEl = this.config.stream.aimElevation;
+    const aimAz = this.config.stream.aimAzimuth;
     let n = 0;
     while (this.phase !== SimPhase.Finished) {
       this.step();
@@ -611,6 +710,10 @@ export class Simulation {
       n++;
     }
     this.sample();
+    if (this.config.aimTracking === 'tracked') {
+      this.config.stream.aimElevation = aimEl;
+      this.config.stream.aimAzimuth = aimAz;
+    }
     return this.report(performance.now() - t0);
   }
 
