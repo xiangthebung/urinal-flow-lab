@@ -36,7 +36,13 @@ export interface LabAutomation {
   /** Surface data overlay, or 'liquid' / 'dry' for the realistic views. */
   setFieldMode(mode: string): void;
   setCamera(preset: string): void;
-  /** Aim at a fraction along the sagittal profile, on the centreline. */
+  /**
+   * Aim at a fraction along the sagittal profile, keeping the current `u`.
+   *
+   * Not "on the centreline", which is what this used to claim: it writes
+   * `aimTargetV` only, and the solve then runs at whatever `aimTargetU` is set to.
+   * Use `setAimUv(0, v)` when the centreline is what you actually want.
+   */
   setAim(v: number): void;
   /** Aim at a parametric point: u across the width (-1..1), v down the profile. */
   setAimUv(u: number, v: number): void;
@@ -47,6 +53,8 @@ export interface LabAutomation {
     streamPath?: boolean;
     wireframe?: boolean;
     shell?: boolean;
+    /** The flushometer and its pipework. Additive: every existing key is unchanged. */
+    fittings?: boolean;
   }): void;
   /** Numbers worth asserting on without reading pixels. */
   probe(): LabProbe;
@@ -59,7 +67,11 @@ export interface LabProbe {
   phase: number;
   /** Live droplet count. */
   droplets: number;
-  /** Where the emitter is, and where its aim ray first meets the fixture. */
+  /**
+   * Where the emitter is. The contact point is *not* here — ask `traceAim` for
+   * that. The comment used to promise both and the probe only ever carried the
+   * exit position.
+   */
   emitter: [number, number, number];
   /** Interior bounds, min then max. */
   interior: [number, number, number, number, number, number];

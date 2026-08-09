@@ -31,13 +31,30 @@ body {
 
 #app {
   display: grid;
-  grid-template-columns: 306px 1fr 322px;
+  grid-template-columns: 292px 1fr 308px;
   grid-template-rows: 46px 1fr 46px;
   grid-template-areas:
     "top top top"
     "left stage right"
     "bottom bottom bottom";
   height: 100%;
+}
+
+/* Focus: both panels away, the whole window to the viewport.
+   Two sidebars plus a top bar plus a footer left the 3-D view — the thing anyone
+   using this actually looks at — with 61% of a 1600 px window and 51% of a
+   1280 px one. Rather than litigate which panel deserves its width, this hands
+   the window over in one click (or F) and gives it back the same way. */
+#app.focus {
+  grid-template-columns: 0 1fr 0;
+}
+#app.focus .sidebar {
+  display: none;
+}
+
+/* Anything that should not take part in layout at all. */
+.hidden {
+  display: none !important;
 }
 
 /* ---------- top bar ---------- */
@@ -178,10 +195,16 @@ body {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* Square, and never wider than its column. Every fixture is taller than it is
+   wide -- the stall is 2.7x -- and the thumbnail is framed to the card, so a
+   landscape card spends its area on background either side. `aspect-ratio` holds
+   the square while the width tracks the panel. */
 .model-thumb {
   display: block;
   width: 100%;
+  max-width: 126px;
   height: auto;
+  aspect-ratio: 1;
   border-radius: 3px;
   background: #0d1218;
 }
@@ -197,13 +220,12 @@ body {
 .model-card.active .model-dims {
   color: #8fd4e6;
 }
-.model-blurb {
-  margin: 10px 0 0;
-  color: var(--text-dim);
-}
-.model-expect {
-  margin: 7px 0 0;
-}
+/* `.model-blurb` and `.model-expect` were here. The blurb printed the fixture
+   summary directly under the picker while the top bar printed the identical
+   sentence a few centimetres above it, and the expectation paragraph put a
+   five-line prediction about the outcome among the inputs. The summary now lives
+   in the top bar only; the expectation moved to the results panel, next to the
+   measurement it predicts, as `.expect-note`. */
 
 /* ---------- controls ---------- */
 .ctl {
@@ -361,6 +383,163 @@ input[type="checkbox"] {
   color: var(--warn);
 }
 
+/* ---------- the verdict ----------
+   The answer, at the top of the results panel. This used to be reachable only by
+   running a full analysis and then expanding a collapsed <pre> at the bottom of a
+   forty-row scroll; everything above it was the raw material the verdict is made
+   from. */
+.verdict {
+  padding: 12px 12px 13px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+}
+.verdict-band {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font: 600 10.5px/1.6 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.09em;
+  border: 1px solid;
+}
+.verdict-band.tone-good {
+  color: var(--good);
+  border-color: #2f7a55;
+  background: rgba(74, 222, 155, 0.08);
+}
+.verdict-band.tone-ok {
+  color: var(--accent);
+  border-color: #17708a;
+  background: rgba(53, 224, 255, 0.08);
+}
+.verdict-band.tone-warn {
+  color: var(--warn);
+  border-color: #8a6a17;
+  background: rgba(255, 160, 60, 0.08);
+}
+.verdict-band.tone-bad {
+  color: var(--bad);
+  border-color: #8a3320;
+  background: rgba(255, 90, 60, 0.1);
+}
+.verdict-band.tone-none {
+  color: var(--text-faint);
+  border-color: var(--line);
+}
+.verdict-value {
+  margin-top: 7px;
+  font: 600 26px/1.05 ui-sans-serif, system-ui, sans-serif;
+  color: var(--accent-2);
+  letter-spacing: -0.5px;
+}
+.verdict-sub {
+  margin-top: 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.verdict-phase {
+  margin-top: 9px;
+  padding-left: 8px;
+  border-left: 2px solid var(--line);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+.verdict-phase.bad {
+  border-left-color: var(--bad);
+  color: var(--text);
+}
+.verdict-foot {
+  margin-top: 8px;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.4;
+}
+/* The fixture's own prediction, under the measured result. */
+.expect-note {
+  margin: 10px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  font-style: italic;
+}
+
+.advice-list {
+  margin: 0;
+  padding-left: 15px;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.advice-list li {
+  margin-bottom: 6px;
+}
+.advice-list li:last-child {
+  margin-bottom: 0;
+}
+
+/* ---------- comparison ---------- */
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 10.5px var(--mono);
+  margin-bottom: 8px;
+}
+.compare-table th {
+  text-align: right;
+  color: var(--text-faint);
+  font-weight: 500;
+  padding: 2px 3px;
+  border-bottom: 1px solid var(--line);
+}
+.compare-table th:first-child,
+.compare-table td:first-child {
+  text-align: left;
+}
+.compare-table td {
+  text-align: right;
+  padding: 3px;
+  color: var(--text-dim);
+  border-bottom: 1px solid rgba(34, 48, 64, 0.5);
+}
+.compare-table td:first-child {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Lowest sustained figure among the rows that share the newest run's
+   conditions. Never highlighted across mismatched conditions — that is exactly
+   the comparison the conditions column exists to stop. */
+.compare-table tr.best td {
+  color: var(--good);
+  font-weight: 600;
+}
+/* Ran under different conditions from the newest row, so it is not comparable
+   with it however close the numbers look. */
+.compare-table tr.mismatch td {
+  color: var(--text-faint);
+  font-style: italic;
+}
+.compare-table tr.mismatch td:first-child::before {
+  content: "≠ ";
+  color: var(--warn);
+  font-style: normal;
+}
+.row-x {
+  background: none;
+  border: 0;
+  color: var(--text-faint);
+  cursor: pointer;
+  font: 13px/1 var(--mono);
+  padding: 0 2px;
+}
+.row-x:hover {
+  color: var(--bad);
+}
+.warn-text {
+  color: var(--warn);
+}
+
 /* ---------- stage ---------- */
 #stage {
   grid-area: stage;
@@ -376,6 +555,12 @@ input[type="checkbox"] {
   display: block;
 }
 
+/* The tab strip stops short of the HUD instead of running under it.
+   With the long labels and `max-width: calc(100% - 20px)` the eight tabs wrapped
+   onto a second row below about 1400 px, and that second row passed beneath the
+   HUD in the opposite corner — so on a 1280-wide laptop two of the eight surface
+   views could not be clicked at all. The labels are shorter now and the strip is
+   bounded by the HUD's column, so a wrap can never reach it. */
 .tabs {
   position: absolute;
   top: 10px;
@@ -384,7 +569,7 @@ input[type="checkbox"] {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
-  max-width: calc(100% - 20px);
+  max-width: calc(100% - 210px);
 }
 .tab {
   padding: 5px 10px;
@@ -454,19 +639,22 @@ input[type="checkbox"] {
   line-height: 1.4;
 }
 
+/* Two lines, not seven. Four of the old ones — film, airborne, drained, on user —
+   were copied verbatim from the right-hand panel and sat over the fixture. */
 .hud {
   position: absolute;
   top: 10px;
   right: 10px;
   z-index: 3;
-  padding: 8px 11px;
+  padding: 7px 10px;
   background: rgba(15, 21, 28, 0.9);
   border: 1px solid var(--line);
   border-radius: 5px;
   font: 11px/1.6 var(--mono);
   color: var(--text-dim);
   backdrop-filter: blur(6px);
-  min-width: 150px;
+  max-width: 190px;
+  text-align: right;
 }
 .hud b {
   color: var(--text);
@@ -542,8 +730,16 @@ input[type="checkbox"] {
   background: var(--panel);
   border-top: 1px solid var(--line);
 }
-#transport .spacer {
-  flex: 1;
+/* The Panel root inside the footer. The class was being set and then every rule
+   it should have carried was applied inline from TypeScript, one property at a
+   time. `#transport .spacer` used to be here too and matched nothing: no element
+   with that class is created anywhere, and the time bar's own `flex: 1` does the
+   job it was written for. */
+.transport-inner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
 }
 .timebar {
   flex: 1;
@@ -723,10 +919,60 @@ input[type="checkbox"] {
   color: var(--bad);
 }
 
-@media (max-width: 1180px) {
-  #app {
-    grid-template-columns: 268px 1fr 280px;
-  }
+/* Sticky aim is armed. It suspends orbit for as long as it is on, so a user who
+   hit `A` by accident finds dragging silently doing nothing — the crosshair
+   cursor was the only sign, and a cursor is invisible in a screenshot. */
+#stage.aim-locked::after {
+  content: "AIM LOCKED — A or Esc to release";
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  z-index: 4;
+  padding: 4px 10px;
+  border: 1px solid #17708a;
+  border-radius: 999px;
+  background: rgba(15, 61, 77, 0.92);
+  color: #d6f7ff;
+  font: 10.5px/1.6 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+#stage.aim-locked {
+  outline: 1px solid rgba(53, 224, 255, 0.35);
+  outline-offset: -1px;
+}
+
+/* One-time invitation. Aiming by clicking the bowl is the tool's main gesture and
+   it was invisible until you happened to try it: the sentence describing it lived
+   in the left panel, below the fold at every window size. */
+/* Bottom-left, in the legend's slot. The legend is empty on the two
+   appearance-only views and `Liquid` is the default, so on start-up nothing is
+   there; the overlay note owns the opposite corner and a bottom-centre chip
+   collided with it at 1280 px, where the stage is only 655 px wide. Switching
+   view dismisses this anyway. */
+.first-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 4;
+  padding: 6px 13px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(15, 21, 28, 0.92);
+  backdrop-filter: blur(6px);
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: opacity 0.5s ease;
+}
+.first-hint kbd {
+  font: 10.5px var(--mono);
+  color: var(--accent);
+}
+.first-hint.gone {
+  opacity: 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -815,4 +1061,82 @@ input[type="checkbox"] {
   font-size: 10.5px;
   color: #9fd4e8;
   text-align: right;
+}
+
+/* ---------------------------------------------------------------------------
+   Width breakpoints
+   ---------------------------------------------------------------------------
+   Last in the file on purpose. These were sitting in the middle of it and every
+   override they made to a stage overlay was being undone a few dozen lines later
+   by that overlay's own rule -- same specificity, later wins. The camera bar in
+   particular went on sitting at `right: 12px`, i.e. underneath the floating
+   results panel, while the HUD and the note beside it in the same declaration
+   moved correctly, because those two happen to be declared earlier. Nothing about
+   it was visible in a screenshot; it took measuring the boxes.
+
+   Two sidebars, a top bar and a footer left the viewport 61% of a 1600 px window
+   and 51% of a 1280 px one. The panels give ground first, then the results panel
+   stops being a column and floats. `F` clears both at any size. */
+@media (max-width: 1500px) {
+  #app {
+    grid-template-columns: 274px 1fr 286px;
+  }
+}
+
+@media (max-width: 1240px) {
+  #app {
+    grid-template-columns: 252px 1fr 264px;
+  }
+  .tabs {
+    max-width: calc(100% - 210px);
+  }
+}
+
+/* Below 1080 the results panel floats over the viewport instead of taking a
+   column from it. Dropping it -- which is what a plain `display: none` would do --
+   would hide the verdict, the advice and the comparison table, i.e. every answer
+   the tool has, and leave only the controls for producing answers you then cannot
+   read. */
+@media (max-width: 1080px) {
+  #app {
+    grid-template-columns: 236px 1fr;
+    grid-template-areas:
+      "top top"
+      "left stage"
+      "bottom bottom";
+  }
+  #right {
+    position: fixed;
+    top: 46px;
+    bottom: 46px;
+    right: 0;
+    width: 274px;
+    z-index: 5;
+    background: rgba(19, 27, 36, 0.94);
+    backdrop-filter: blur(8px);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+  }
+  /* Out from under the floating panel. */
+  .cam-bar,
+  .hud,
+  .overlay-note {
+    right: 286px;
+  }
+  .shortcuts {
+    right: 336px;
+  }
+  /* The tabs need two rows at this width, so the HUD drops below them rather
+     than being something they have to stop short of. */
+  .hud {
+    top: 124px;
+  }
+  .tabs {
+    max-width: calc(100% - 300px);
+  }
+  /* The start-up chip and the overlay note both want the bottom strip and there
+     is no longer room for both. The note is about this run; the chip is a
+     one-time nicety, and `?` still carries the same information. */
+  .first-hint {
+    display: none;
+  }
 }
