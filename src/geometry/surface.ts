@@ -58,6 +58,22 @@ export interface SurfaceParams extends ProfileParams {
    */
   wrapExponent: number;
   /**
+   * Share of the `u` columns given to the flat washout floor, per row.
+   *
+   * A grid quantity, not a shape one -- it moves where the cells are, not where
+   * the surface is. Equal-arclength `u` spends the grid in proportion to how much
+   * surface there is rather than to how much happens on it, and once the loft
+   * gained side walls the floor fell to about a quarter of the row: a sump cell
+   * went from 3.75 mm to 15.89 mm at the same `nu`. That is the part of the
+   * fixture the drainage outputs are computed from, and it is where the film
+   * pins, so it is the part that must be resolved.
+   *
+   * 0 restores equal arclength exactly. Values at or below the floor's own
+   * arclength share are also the identity, so rows near the back rim -- which are
+   * all floor and no wall -- are untouched whatever this says.
+   */
+  uFloorFraction: number;
+  /**
    * How quickly the wrap dies away along the profile. The side walls are tallest
    * at the rim and have to vanish by the front lip, otherwise the lip would bow
    * forward at its ends instead of being a clean edge.
@@ -451,6 +467,47 @@ export class UrinalSurface {
       }
 
       const len = arc[SAMPLES];
+      // Columns biased onto the washout floor.
+      //
+      // `u` used to advance by equal arclength, which spends the grid in
+      // proportion to how much *surface* there is rather than to how much
+      // happens on it. Once the loft gained side walls the floor stopped being
+      // the whole row and became about a quarter of it, so at the same `nu` a
+      // cell at the sump went from 3.75 mm to 15.89 mm -- 4.24x coarser on the
+      // one part of the fixture where liquid pools, drains and pins, and which
+      // the residual-volume and clear-time outputs are computed from. The
+      // standing-pool check reads the capillary depth off cells several
+      // capillary lengths wide and lands pre-asymptotic; the sweep across `nu`
+      // that looked like a solver failing to converge is that, and nothing else.
+      //
+      // Raising `resolutionU` fixes it by brute force and costs about 4x the
+      // film solve on every frame, almost all of it spent resolving side walls
+      // where very little happens. This puts the cells where the physics is
+      // instead.
+      //
+      // The map is the rational bias this project already uses for the rim
+      // curve: monotone, fixes both ends, and finite slope at each. A power law
+      // arrives at an end with infinite slope, which is Trap 2's failure moved
+      // into the parameterisation, and a piecewise-linear grading would put a
+      // step in cell width exactly at the floor-to-wall corner, where the
+      // geometry already has a curvature discontinuity and can least afford one.
+      //
+      // `b` is solved per row so the floor receives `uFloorFraction` of the
+      // columns whatever fraction of the arclength it happens to be, and it is
+      // clamped to 1 wherever the floor already has at least that share -- which
+      // is every row near the back rim, where there is no wall yet and the map
+      // is exactly the identity.
+      //
+      // Nothing downstream needed changing: `cellDu`, `cellArea` and both face
+      // lengths are all measured off the vertices, so the metric follows the
+      // spacing automatically. Volume closure stays at 0.0000%, which is the
+      // check that the metric and the geometry still agree.
+      const f0 = len > 1e-12 ? hw / len : 1;
+      const F = Math.min(0.95, Math.max(0, this.params.uFloorFraction));
+      const bias =
+        f0 > 1e-6 && f0 < 1 - 1e-6 && F > f0
+          ? Math.max(1, (F * (1 - f0)) / (f0 * (1 - F)))
+          : 1;
       for (let i = 0; i <= this.nu; i++) {
         const u = (i / this.nu) * 2 - 1;
         const au = Math.abs(u);
@@ -461,7 +518,8 @@ export class UrinalSurface {
           this.sectionZ[o] = 0;
           continue;
         }
-        const target = au * len;
+        const su = bias === 1 ? au : au / (au + (1 - au) * bias);
+        const target = su * len;
         let k = 0;
         while (k < SAMPLES - 1 && arc[k + 1] < target) k++;
         const seg = arc[k + 1] - arc[k];
@@ -1098,6 +1156,7 @@ export function defaultSurfaceParams(): SurfaceParams {
     // closed U and splash has to leave through the front opening.
     wrapDepth: 0.24,
     wrapExponent: 3.0,
+    uFloorFraction: 0.5,
     wrapDecay: 1.2,
     drainRadius: 0.025,
     ribMode: 'none',
