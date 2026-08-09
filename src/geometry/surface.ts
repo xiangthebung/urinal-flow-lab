@@ -7,7 +7,7 @@ import {
 } from './profile';
 import { Vec3, v3 } from '../core/vec3';
 import { Bvh } from './bvh';
-import { buildWrapProfile as computeWrapProfile, defaultWrapOptions } from './wrap';
+import { buildRimProfile, defaultWrapOptions } from './wrap';
 
 /**
  * The urinal as a parametric lofted surface S(u, v).
@@ -260,12 +260,18 @@ export class UrinalSurface {
   }
 
   /**
-   * Half width of the interior at profile fraction v.
+   * Half width of the flat part of the interior at profile fraction v.
    *
    * Wide at the rim, narrow at the sump, wide again at the lip. The taper is
    * the funnel: concentrating the drainage cross-section raises the film
    * velocity near the outlet, which is what stops the last few millilitres
    * from lingering.
+   *
+   * This is the *floor* of the basin at each station, not the whole row. Beyond
+   * it the row turns up into the side wall and climbs to the rim, so `widthSump`
+   * now states how wide the washout floor is rather than how wide the fixture is
+   * down there -- which is what it was always meant to describe, and what a
+   * drainage cross-section actually is.
    */
   private halfWidthAt(v: number): number {
     const p = this.params;
@@ -295,76 +301,112 @@ export class UrinalSurface {
   }
 
   /**
-   * Forward stand-off of the side edges relative to the centreline at v.
+   * Half width of the mouth at profile fraction v, before the steepness floor.
    *
-   * Maximum at the rim and zero at the front lip. That ordering is what makes the
-   * patch boundary trace the real rim of a urinal: across the top of the back
-   * wall, forward and down along the two side edges, then across the front lip.
-   * The whole rim is the boundary of one patch, which is why the interior needs no
-   * separate side-wall pieces.
-   *
-   * The third factor is the important one. The wrap displaces the surface in +z,
-   * and so does the profile wherever it runs horizontally -- across the sump
-   * floor. Where the two coincide, the u and v tangent vectors become nearly
-   * parallel, cells collapse to a fraction of their nominal area, and the normal
-   * degenerates into numerical noise that flips direction between neighbours. That
-   * corrupts the gravity projection and every impact angle in the sump, which is
-   * precisely where drainage is decided. Scaling by the vertical component of the
-   * profile tangent removes it at the source: the section curls forward only where
-   * the wall is steep, and flattens into a plain channel across the sump floor --
-   * which is also what a real fixture looks like there.
+   * The plan outline of the opening: `widthRim` across the back, `widthLip`
+   * across the front, and a smooth sweep between. Deliberately independent of the
+   * funnel -- the bowl narrows toward its outlet, the mouth above it does not,
+   * and tying the two together is what used to give the opening a waist.
    */
-  private wrapProfile!: Float64Array;
+  private mouthHalfWidthAt(v: number): number {
+    const p = this.params;
+    const a = p.widthRim * 0.5;
+    const b = p.widthLip * 0.5;
+    const t = Math.min(1, Math.max(0, v));
+    return a + (b - a) * (t * t * (3 - 2 * t));
+  }
 
-  /** Side-edge stand-off along the profile. See geometry/wrap.ts for the why. */
+  /** Where the rim sits relative to the profile. See geometry/wrap.ts. */
+  private rimWrap!: Float64Array;
+  private rimLift!: Float64Array;
+
   private buildWrapProfile(): void {
     const p = this.params;
-    this.wrapProfile = computeWrapProfile(this.profile, this.sumpIndex(), this.nv + 1, {
+    const rim = buildRimProfile(this.profile, this.nv + 1, {
       ...defaultWrapOptions(),
       depth: p.wrapDepth,
       decay: p.wrapDecay,
     });
+    this.rimWrap = rim.wrap;
+    this.rimLift = rim.lift;
   }
 
   /**
-   * Lateral and forward offset of every vertex in every horizontal section,
-   * indexed the same way as the vertex grid.
+   * Plan width of the side wall at profile fraction v, m.
    *
-   * The section used to be written directly as x = halfWidth * u and
-   * z = profile.z + wrap * |u|^exponent. That is compact and it has a defect that
-   * cost this project a great deal: it displaces depth but never builds a side
-   * wall. Near |u| = 1 the surface runs almost entirely in z while dx/du stays
-   * constant, so cells there are stretched along one axis, the two parametric
-   * tangents come close to parallel, the cell area collapses and the normal is
-   * decided by rounding noise -- which flips it against its neighbours and inverts
-   * gravity and the impact angle in those cells.
+   * The row runs flat out to `halfWidthAt` and then climbs to the rim, so this is
+   * the horizontal distance it has to do the climbing in. Ordinarily it is
+   * whatever the mouth outline asks for. The floor underneath it is the part that
+   * matters:
    *
-   * The practical consequence was worse than a few bad cells. Deepening the wrap
-   * to enclose the bowl made the skew worse, and reducing it to keep the grid
-   * clean left an open scoop that neither looked like a urinal nor contained any
-   * splash. Enclosure and grid quality were in direct conflict, and no value of
-   * the parameter was good.
+   * just below the back rim the funnel has barely started, so the mouth and the
+   * floor are still the same width and the plan span between them is nearly zero
+   * -- while the profile has already dropped away, so the rim is well above it.
+   * A wall with height and no plan width is a vertical fin, and a fin's cells have
+   * their u tangent pointing straight up the same line the v tangent runs down.
+   * That is a collapse of exactly the kind Trap 3 describes, arriving from the
+   * other direction. Holding the wall no steeper than `MAX_WALL_SLOPE` costs a few
+   * millimetres of width near the rim and removes the failure at the source.
    *
-   * So the section is now a superellipse quadrant walked at constant arclength.
-   * It leaves the centreline heading straight across and arrives at the side edge
-   * heading straight forward, which is a genuine wall whose normal is +-x, and
-   * because u advances by equal arclength rather than equal width the cells stay
-   * near-square however deep the wrap goes. Enclosure and conditioning stop
-   * fighting: both improve together.
+   * Smoothed rather than clamped, because a hard `max` puts a crease along the
+   * line where the two terms cross and the curvature term in the film solver reads
+   * that crease as a capillary ridge.
+   */
+  private wallSpanAt(v: number, j: number): number {
+    const wanted = this.mouthHalfWidthAt(v) - this.halfWidthAt(v);
+    const floor = Math.abs(this.rimLift[j]) / WALL_SHAPE.maxSlope;
+    return smoothMax(wanted, floor, 0.004);
+  }
+
+  /**
+   * Offset of every vertex from its profile station, indexed the same way as the
+   * vertex grid.
+   *
+   * Rows are not horizontal. `sectionY` is the reason this class stopped being a
+   * saddle and became a basin, and it is worth being explicit about why it had to
+   * exist. The row used to be a curve in the horizontal plane through its profile
+   * station -- x across, z forward, y whatever the profile said. Every point on a
+   * row was therefore at the same height, so the surface at any height was the one
+   * or two rows that happened to be there: a sheet across the back and a separate
+   * strip across the front lip, with an open slot 85-300 mm wide down each side
+   * where a side wall should be. The bowl had no sides in its front half, which
+   * is what a saddle is, and the free edge of the front strip is what read on
+   * screen as a bright ribbon standing inside every fixture.
+   *
+   * Now a row runs from its profile station out *and up* to the rim, so the
+   * surface climbs in y as |u| goes to 1 and every horizontal section of the bowl
+   * is a closed ring. Walking from the drain in any direction now climbs to a rim,
+   * which is the definition of a basin and was not true before.
+   *
+   * Two properties are load-bearing and easy to lose:
+   *
+   *   - u advances by equal arclength along the row, measured in three dimensions
+   *     now rather than in plan. That is what keeps cells near-square where the
+   *     wall is steep; without it the outer cells carry the entire climb.
+   *   - the row is a *plane* curve, tilted back rather than twisted, because the
+   *     height and the depth share one shape function. A twisted row puts a
+   *     lateral component into the v tangent and costs skew for nothing.
    */
   private sectionX!: Float64Array;
+  private sectionY!: Float64Array;
   private sectionZ!: Float64Array;
 
   private buildSections(): void {
     const stride = this.nu + 1;
     const total = stride * (this.nv + 1);
     this.sectionX = new Float64Array(total);
+    this.sectionY = new Float64Array(total);
     this.sectionZ = new Float64Array(total);
 
-    // Resolution of the traced quadrant. Independent of nu so the arclength
-    // measure does not change when the solver grid changes.
-    const SAMPLES = 128;
+    // Resolution of the traced row. Independent of nu so the arclength measure
+    // does not change when the solver grid changes. The first sample is the
+    // centreline and the second the outer end of the flat floor; the rest walk
+    // the quadrant that climbs to the rim.
+    const CORNER = 1;
+    const QUAD = 192;
+    const SAMPLES = CORNER + QUAD;
     const xs = new Float64Array(SAMPLES + 1);
+    const ys = new Float64Array(SAMPLES + 1);
     const zs = new Float64Array(SAMPLES + 1);
     const arc = new Float64Array(SAMPLES + 1);
     // 2 is a circular quarter arc, higher is squarer in plan. Clamped low so the
@@ -372,18 +414,42 @@ export class UrinalSurface {
     const n = Math.min(8, Math.max(1.4, this.params.wrapExponent));
 
     for (let j = 0; j <= this.nv; j++) {
-      const hw = this.halfWidthAt(j / this.nv);
-      const wrap = this.wrapProfile[j];
-      for (let k = 0; k <= SAMPLES; k++) {
-        // phi runs from the centreline to the side edge.
-        const phi = (Math.PI / 2) * (k / SAMPLES);
+      const v = j / this.nv;
+      const hw = this.halfWidthAt(v);
+      const span = this.wallSpanAt(v, j);
+      const lift = this.rimLift[j];
+      const wrap = this.rimWrap[j];
+
+      // Flat floor, out to the funnel's half width at this station.
+      xs[0] = 0;
+      ys[0] = 0;
+      zs[0] = 0;
+      arc[0] = 0;
+      xs[1] = hw;
+      ys[1] = 0;
+      zs[1] = 0;
+      arc[1] = hw;
+      // Then a superellipse quadrant, drawn in the plane spanned by +x and the
+      // direction from the profile to the rim. Because the height and the depth
+      // share one shape function, the row is a plane curve tilted back by
+      // atan(lift / wrap) rather than a twisted one -- the same quadrant this
+      // model has always used, stood up instead of laid flat. That is what makes
+      // the side wall a genuine wall whose normal is +-x, and it costs nothing in
+      // conditioning: the quadrant leaves the floor heading straight across and
+      // arrives at the rim heading straight up the wall.
+      for (let k = 1; k <= QUAD; k++) {
+        const phi = (Math.PI / 2) * (k / QUAD);
         const xi = Math.pow(Math.max(0, Math.sin(phi)), 2 / n);
         const zeta = 1 - Math.pow(Math.max(0, Math.cos(phi)), 2 / n);
-        xs[k] = hw * xi;
-        zs[k] = wrap * zeta;
-        arc[k] =
-          k === 0 ? 0 : arc[k - 1] + Math.hypot(xs[k] - xs[k - 1], zs[k] - zs[k - 1]);
+        const m = CORNER + k;
+        xs[m] = hw + span * xi;
+        ys[m] = lift * zeta;
+        zs[m] = wrap * zeta;
+        arc[m] =
+          arc[m - 1] +
+          Math.hypot(xs[m] - xs[m - 1], ys[m] - ys[m - 1], zs[m] - zs[m - 1]);
       }
+
       const len = arc[SAMPLES];
       for (let i = 0; i <= this.nu; i++) {
         const u = (i / this.nu) * 2 - 1;
@@ -391,6 +457,7 @@ export class UrinalSurface {
         const o = j * stride + i;
         if (len <= 1e-12) {
           this.sectionX[o] = hw * u;
+          this.sectionY[o] = 0;
           this.sectionZ[o] = 0;
           continue;
         }
@@ -400,8 +467,10 @@ export class UrinalSurface {
         const seg = arc[k + 1] - arc[k];
         const f = seg > 1e-12 ? (target - arc[k]) / seg : 0;
         const x = xs[k] + (xs[k + 1] - xs[k]) * f;
+        const y = ys[k] + (ys[k + 1] - ys[k]) * f;
         const z = zs[k] + (zs[k + 1] - zs[k]) * f;
         this.sectionX[o] = u < 0 ? -x : x;
+        this.sectionY[o] = y;
         this.sectionZ[o] = z;
       }
     }
@@ -442,7 +511,7 @@ export class UrinalSurface {
   private basePoint(i: number, j: number): Vec3 {
     const pr = this.profile.points[j];
     const o = j * (this.nu + 1) + i;
-    return v3(this.sectionX[o], pr.y, pr.z + this.sectionZ[o]);
+    return v3(this.sectionX[o], pr.y + this.sectionY[o], pr.z + this.sectionZ[o]);
   }
 
   /**
@@ -964,6 +1033,43 @@ export class UrinalSurface {
     const cosFromNormal = -(dir.x * nx + dir.y * ny + dir.z * nz) / m;
     return Math.asin(Math.min(1, Math.max(0, cosFromNormal)));
   }
+}
+
+/**
+ * Steepest the side wall is allowed to be, as rise over plan run.
+ *
+ * 25 is a little over 87 degrees, and it is not a styling choice -- it is a floor
+ * under the wall's plan width, and it binds only in the few centimetres just below
+ * the back rim and just above the lip, where the funnel has not started narrowing
+ * yet but the profile has already dropped away from the rim. There the mouth and
+ * the floor are still the same width, so the span between them is nearly zero
+ * while the rim is already well above: a wall with height and no plan width is a
+ * vertical fin, and a fin's u tangent runs up the same line its v tangent runs
+ * down. Removing the floor entirely costs 22 flipped normals; 100 costs 2; the
+ * band from 14 to 50 is clean and 25 is its middle.
+ *
+ * It must not be set low "for safety". At 2 -- 63 degrees, which sounds harmless --
+ * the floor stops being a floor and becomes the binding term over the whole bowl,
+ * because the lift reaches half a metre and half a metre over a slope of 2 is a
+ * quarter-metre of plan span. That flares the mouth to twice its design width: the
+ * oval bowl came out 736 mm wide against 422, the exterior fitter dutifully wrapped
+ * a casting round it, and 69% of the stream then struck the casing. The grid was
+ * spotless throughout. Grid quality alone cannot see this -- the envelope has to be
+ * checked too.
+ */
+export const WALL_SHAPE = { maxSlope: 25 };
+
+/**
+ * Larger of two values, rounded off over a width of `k`.
+ *
+ * A hard max leaves a crease along the line where the two arguments cross. The
+ * film solver differentiates the substrate normal to get its capillary term, so a
+ * crease there is read as a ridge liquid should run off -- a shape artefact
+ * turning into a physics artefact. Exact outside the blend width.
+ */
+function smoothMax(a: number, b: number, k: number): number {
+  const h = Math.min(1, Math.max(0, 0.5 + (0.5 * (a - b)) / k));
+  return b + (a - b) * h + k * h * (1 - h);
 }
 
 /** Area of the triangle abc. */

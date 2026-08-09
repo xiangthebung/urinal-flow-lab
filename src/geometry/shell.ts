@@ -812,15 +812,27 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
   // rest of the skin, which renders as a bright flap curling out of the front of the
   // bowl. The lip does not lose its edge -- the rim band runs round the whole opening
   // loop and is what draws the visible thickness there.
+  //
+  // Tested per cell, at all four of its corners, rather than per row at the
+  // centreline. Those were the same test while every row of the interior was
+  // level, and they stopped being the same when the loft gained side walls: a row
+  // now runs from the profile out and *up* to the rim, so its ends can be 400 mm
+  // above its middle. Asking only the centre column then answers for the wrong
+  // part of the row, and the rows just below the back rim -- whose ends have
+  // already swung forward and up onto the rim while their centres are still on the
+  // back wall -- were emitted whole. The strip between them swept right across the
+  // opening, and the casting rendered with a fan of long triangles paving its
+  // mouth over. Trap 34's rule is unchanged in spirit: every corner must clear the
+  // cut, not just one of them.
   const yCut = s.lipY - 0.004;
-  const aboveCut = (j: number) => s.vertices[(j * stride + Math.floor(nu / 2)) * 3 + 1] > yCut;
+  const above = (k: number) => s.vertices[k * 3 + 1] > yCut;
   for (let j = 0; j < nv; j++) {
-    if (!aboveCut(j) || !aboveCut(j + 1)) continue;
     for (let i = 0; i < nu; i++) {
       const a = j * stride + i;
       const b = a + 1;
       const c = a + stride;
       const d = c + 1;
+      if (!above(a) || !above(b) || !above(c) || !above(d)) continue;
       if (flip) idx.push(a, c, b, b, c, d);
       else idx.push(a, b, c, b, d, c);
     }
@@ -850,6 +862,7 @@ export function buildShell(s: UrinalSurface, over: Partial<ShellParams> = {}): S
     positions[vi + 4] = outer[src + 1];
     positions[vi + 5] = outer[src + 2];
   }
+
   // Band normal at each loop point: perpendicular to both the loop tangent and
   // the wall thickness direction, pointed away from the middle of the opening.
   for (let m = 0; m < L; m++) {
