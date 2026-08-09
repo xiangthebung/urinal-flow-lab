@@ -124,3 +124,54 @@ for (const nu of [64, 96, 128, 160, 224, 320, 448]) {
       `${((wetVol / wetArea) * 1000).toFixed(3).padStart(6)}`
   );
 }
+
+// Is the contact line holding, or creeping?
+//
+// `canAdvance` gates flow into a neighbour only while that neighbour is *dry*.
+// Once a cell has taken any liquid at all it is wet, and every later step moves
+// liquid into it ungated -- so the gate is a test on first wetting, not a standing
+// condition. If that is what is happening, the wetted area should keep growing
+// with settling time instead of stopping, and the pool should keep thinning.
+// The area the capillary limit permits for this volume is printed alongside, so
+// over-spreading can be read off directly rather than inferred.
+console.log('\nSettling time at nu = 128, same blob:');
+console.log('   seconds   wet cm2   mean mm   max mm   permitted cm2');
+{
+  const s = new UrinalSurface(base, { nu: 128, nv: 128 });
+  const row = sumpRowOf(s);
+  const cMid = row * s.nu + s.nu / 2;
+  const fp = defaultFilmParams();
+  fp.drainCoefficient = 0;
+  const film = new FilmSolver(s, URINE_37C, wall, fp);
+  const x0 = s.cellPos[cMid * 3];
+  let vol = 0;
+  for (let j = row - 2; j <= row + 2; j++) {
+    for (let i = 0; i < s.nu; i++) {
+      const c = j * s.nu + i;
+      if (Math.abs(s.cellPos[c * 3] - x0) > HALF_W) continue;
+      film.deposit(c, hRef * s.cellArea[c], 0, 0);
+      vol += hRef * s.cellArea[c];
+    }
+  }
+  const dt = 1 / 2000;
+  let done = 0;
+  for (const secs of [2.5, 5, 10, 20, 40]) {
+    const want = Math.round(secs / dt);
+    for (; done < want; done++) film.step(dt);
+    let maxH = 0;
+    let wetArea = 0;
+    let wetVol = 0;
+    for (let c = 0; c < film.h.length; c++) {
+      maxH = Math.max(maxH, film.h[c]);
+      if (film.h[c] > 1e-5) {
+        wetArea += s.cellArea[c];
+        wetVol += film.h[c] * s.cellArea[c];
+      }
+    }
+    console.log(
+      `  ${secs.toFixed(1).padStart(8)}   ${(wetArea * 1e4).toFixed(1).padStart(7)}   ` +
+        `${((wetVol / wetArea) * 1000).toFixed(3).padStart(7)}   ` +
+        `${(maxH * 1000).toFixed(3).padStart(6)}   ${((vol / hRef) * 1e4).toFixed(1).padStart(13)}`
+    );
+  }
+}
