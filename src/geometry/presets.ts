@@ -285,12 +285,55 @@ export const PRESETS: UrinalPreset[] = [
       'here than on any conventional bowl — sweep it before drawing conclusions. ' +
       'Reaching the floor makes it accessible without a low mount, but it also puts ' +
       'a large wetted area in play and the residual film has a long way to travel.',
-    // Dimensioned against an American Standard Stallbrook 6400 / Kohler Branham
+    // Dimensioned against an American Standard Stallbrook 6400.001 / Kohler Branham
     // K-25039-T: 458 x 382 x 974 mm against a 457 x 381 x 972 nominal. The rim sits
     // 960 mm above the floor, far above the 430 mm ADA cap, because this is the
     // non-accessible tall variant -- that is what a full stall urinal is. The base
     // finishes 14 mm below finished floor, matching Kohler's note that the lip
     // installs below floor level for easier cleaning around the fixture.
+    //
+    // IT IS A SLOPING FRONT, AND IT USED TO BE A STRAIGHT-SIDED COLUMN. Both
+    // reference sheets dimension the side elevation with TWO projections, not one,
+    // and they differ by nearly 2:1 -- that taper is the silhouette, and American
+    // Standard's own name for the product is a "sloping front stall urinal":
+    //
+    //   product                              at the base   at the top
+    //   AS Stallbrook 6400.001               381 mm (15")  203 mm (8")
+    //   Kohler Branham K-25039-T             414 mm        205 mm
+    //   Kohler K-4920-T (its predecessor)    410 mm        203 mm
+    //
+    // Measured with `tools/silhouette.mts`, which walks the body in height bands
+    // and reports the furthest-forward point of interior union casting in each --
+    // the quantity the sheets actually dimension. A single `W x D x H` envelope
+    // cannot express a taper, which is how this survived: the fixture measured
+    // 382 mm deep and the nominal said 381, so it looked dimensioned.
+    //
+    // WHICH END WAS WRONG IS NOT THE OBVIOUS ONE. `bowlDepth` is measured from the
+    // profile datum, and the datum is not the finished wall: `backSetback` puts the
+    // flat back face 45 mm behind it, and the casting adds ~43 mm of skin at the
+    // lip. So projection from the wall is `bowlDepth + 88 mm`, and the old
+    // bowlDepth of 0.294 was already giving 382 mm at the base -- correct to 1 mm.
+    // Reading the 294 as if it were the projection and raising it to the published
+    // 381 was measured at 463 mm from the wall, deeper than any stall urinal made.
+    //
+    // The defect was at the TOP, which stood 277 mm out against a published 203.
+    // The top of the fixture's forward reach is the side shields, which stand
+    // `wrapDepth` ahead of the back wall, so that is the lever: projection at the
+    // top is very nearly `wrapDepth + 56 mm`. 0.22 -> 0.152 puts it at 199 mm.
+    //
+    // ONE LIMIT WORTH RECORDING. The real fixture ramps continuously from 205 at
+    // the top to 414 at the lip. This model cannot: `buildWrapProfile` makes the
+    // wrap maximal at the rim and decays it downward, so the shields are deepest
+    // at the top by construction, and the back wall only sweeps `backWallRun`
+    // (125 mm, capped at `drainZ * 0.75`) forward over the whole height. Both
+    // published endpoints are now right and the silhouette does slope -- 199 mm at
+    // the rim to 362 at the lip -- but most of the forward reach still arrives as a
+    // step at the lip rather than as a straight bevel. Closing that needs a wrap
+    // that can grow downward, which is a change to the wrap law and runs straight
+    // into Trap 3. `wrapDecay` 0.6 -> 0.15 buys back most of what the thinner
+    // shields cost: it holds the wrap open further down, which both lengthens the
+    // slope and shrinks the step, taking the casting-fit ribbing from 39.7 mm back
+    // to 25.1 and the notch to 0.
     params: P({
       rimHeight: 0.92,
       bowlDepth: 0.294,
@@ -304,16 +347,36 @@ export const PRESETS: UrinalPreset[] = [
       widthSump: 0.32,
       widthLip: 0.36,
       taperExponent: 3.0,
-      // Generous stand-off held well down the profile: these are the full-length
-      // sidewalls the reference product advertises for privacy.
-      wrapDepth: 0.22,
+      // The full-length sidewalls both reference products advertise for privacy --
+      // but dimensioned to the sheets rather than generously. These stand
+      // `wrapDepth` ahead of the back wall and they ARE the fixture's forward reach
+      // at the top, where the published projection is 203 mm (AS) and 205 (Kohler).
+      // Projection from the finished wall works out at `wrapDepth + 56 mm`, so this
+      // measures 199 mm. It was 0.22, i.e. 277 mm, which is 74 mm of shield the
+      // product does not have and it is what made the silhouette a column.
+      //
+      // A real physical consequence, not only a cosmetic one: the wrap is what
+      // stops splash leaving sideways, so this fixture is now genuinely less
+      // enclosed than it was. That is the correct direction -- it was over-enclosed
+      // against its own reference -- but its splashback figures move with it.
+      wrapDepth: 0.152,
       wrapExponent: 5.0,
-      wrapDecay: 0.6,
+      // Held open much further down, which is doing two jobs. It lengthens the
+      // sloping front instead of letting the shields pinch back in above the bowl,
+      // and it shrinks the discontinuity at the front-lip step that the casting's
+      // support function has to ring around -- ribbing 39.7 -> 25.1 mm, protrusion
+      // 3.6 -> 2.4, notch 6 -> 0. Not taken to the 0.1 floor `buildWrapProfile`
+      // clamps at: sitting exactly on a clamp is a state the tools reject.
+      wrapDecay: 0.15,
       throatHeight: 0.1,
       sumpDepth: 0.03,
       sumpSlope: 0.09,
       // Forward outlet, with the front rise near-vertical. Together these cut the
-      // notch from 91-105 mm to 34-48 mm. See Trap 25.
+      // notch from 91-105 mm to 34-48 mm. See Trap 25. The taper above then took it
+      // the rest of the way to 0 at every resolution, which Trap 25 predicts
+      // exactly: the notch is very nearly `wrapDepth - drainZ`, and the shields are
+      // now shallower than the outlet is forward, so there is nothing to dive back
+      // to. This preset's mouth is no longer slit open at the sides at all.
       drainZ: 0.185,
       drainRadius: 0.028,
       frontLipHeight: 0.3,
@@ -327,6 +390,15 @@ export const PRESETS: UrinalPreset[] = [
       wallThickness: 0.036,
       rimThickness: 0.024,
       rimBandWidth: 0.03,
+      // 0.016 rather than the 0.012 default, and it is worth the four millimetres.
+      // Thinning the shields left the interior poking 2.4 mm through its own
+      // casting -- Trap 29's protrusion, the check that the per-edge envelope fit
+      // is containing the bowl. Standing the casting off by 4 mm more takes it to
+      // 0.00 mm at every resolution, which is better than this preset managed
+      // before the reshape (0.05-0.93), and drops the ribbing 25.2 -> 23.0 as well.
+      // It also lands the top projection on 203 mm, which is the Stallbrook figure
+      // exactly.
+      clearance: 0.016,
       bottomTaper: 0.94,
       bottomExtension: 0.02,
     },
