@@ -379,6 +379,26 @@ export const PRESETS: UrinalPreset[] = [
       // to. This preset's mouth is no longer slit open at the sides at all.
       drainZ: 0.185,
       drainRadius: 0.028,
+      // KNOWN WRONG, AND DELIBERATELY LEFT -- read this before tuning it.
+      //
+      // American Standard's installation instructions for this fixture say to provide
+      // "a pit ... of sufficient depth to allow the lip of the urinal to set flush
+      // with the finished floor", and that the "finished floor should be sloped to
+      // drain into the lip of the stall". So on the real product the bowl's opening
+      // runs all the way down to floor level and the floor drains into it -- that is
+      // what makes it a *stall* rather than a bowl, and Kohler says the same thing
+      // from the other side ("lip of urinal installs below floor level"). This builds
+      // the lip 300 mm above the datum, i.e. 340 mm above the floor, with solid
+      // casting below it. The real fixture has no front wall there at all.
+      //
+      // Not corrected here because it is not a tuning value, it is a different
+      // fixture: the front rise IS most of this preset's enclosure, and the wrap and
+      // the front rise together are what stop splash leaving. Dropping the lip to the
+      // datum removes ~300 mm of front wall, which will move the splashback figures
+      // by much more than the taper did and needs the seed and stand-off sweeps
+      // re-run, not a nudge. It also costs depth: measured, frontLipHeight 0.24 takes
+      // the base projection 382 -> 375 mm and 0.20 takes it to 371, away from the
+      // published 381, so the front rise is currently carrying part of the envelope.
       frontLipHeight: 0.3,
       frontLipInturn: 0.014,
       sumpFrontFraction: 0.9,
