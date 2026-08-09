@@ -14,7 +14,7 @@ because each item in them cost real time to find, and most of them look correct.
 |---|---|
 | `npm run dev` | Vite dev server |
 | `npm run build` | `tsc --noEmit && vite build` |
-| `npm run validate` | 46 physics checks against published references. ~105 s. **Authoritative.** |
+| `npm run validate` | 60 physics checks against published references. ~395 s. **Authoritative.** |
 | `npm run shoot` | Screenshot the **running app** headlessly. See below. |
 | `npm run render` | Offline render of the fixture **meshes only**. Fast, but not the product. |
 | `npx tsx tools/fixture-lab.mts <id> [--full] [--out x.png]` | **Shape a fixture.** Merges `tools/tuned/<id>.json` over a preset, prints the admissibility metrics, writes a 4-view PNG. `--full` runs all four grid resolutions. |
@@ -45,7 +45,7 @@ splash flying straight through the fixture body.
 
 Rules:
 
-1. **`npm run validate` passing is not visual verification.** None of its 46 checks
+1. **`npm run validate` passing is not visual verification.** None of its 60 checks
    look at whether anything is coherent on screen.
 2. **`npm run render` is not visual verification either.** It shows meshes, not the app.
 3. To claim the product looks right, use `npm run shoot` and *look at the image*.
@@ -93,7 +93,7 @@ sim/        simulation  owns surface + casting + castingCollider; SimConfig
 render/     sceneView, fixtureView, dropletView, streamView, colormap
             softRaster  software rasteriser shared by thumbnails and tools/preview
 ui/         app, controls, charts, thumbnail, automation
-validation/ suite (46 checks), runCli
+validation/ suite (60 checks), runCli
 tools/      shoot.mts      headless screenshots of the running app
             thumbsheet.mts contact sheet of the picker's own thumbnails
             fixture-lab.mts shape bench: metrics + 4-view render, no browser
@@ -162,15 +162,39 @@ tools/      shoot.mts      headless screenshots of the running app
 Four of them are now dimensioned against named real products, and the reference is
 recorded in the preset's comment so it can be checked rather than trusted:
 
-| preset | reference product | envelope W×D×H mm | nominal |
+| preset | reference product | envelope W×D×H mm | published |
 |---|---|---|---|
-| `classic-bowl` | American Standard Washbrook 6501 wall-hung washout | 358×388×640 | 356×356×~650 |
-| `stall-urinal` | American Standard Stallbrook 6400 / Kohler Branham K-25039-T | 458×382×974 | 457×381×972 |
-| `trough` | Pland Bremen 1500 / Acorn 5-foot stainless | 1485×417×290 | 1200–1500 × 400–500 × 170–300 |
-| `compact-waterless` | Sloan WES-1000 waterfree | 362×497×681 | 365×498×679 |
+| `classic-bowl` | American Standard Washbrook 6501.010 wall-hung washout | 470×364×692 | 470×355×692 |
+| `stall-urinal` | American Standard Stallbrook 6400.001 / Kohler Branham K-25039-T | 458×382×972 | 457×381×972 |
+| `trough` | Pland Bruges TR1500P wall-hung stainless | 1491×317×550 | 1500 × 220–300 × 440–593 |
+| `compact-waterless` | Falcon Waterfree F-4000 (= Sloan WES-1000 body) | 391×357×576 | 492×657×366 as W×H×D |
 
 `flat-wall` is a deliberate control rather than a product, and `nautilus-tall` is
 generated, so neither is dimensioned to a catalogue.
+
+**The library is the North American commercial range, on purpose.** That decision used
+to be implicit and was therefore made wrongly: US bowls carry integral privacy sides and
+run wide (Washbrook 470×355, Lynbrook 470×356, Zurn Z5755-U 470×362, Kohler Bardon
+457×359), while European bowls have no shields and run narrow (V&B Subway 285×315,
+V&B O.novo 290×245, Duravit Starck 3 330×350, Geberit Selva 340×370). `classic-bowl` at
+its old 358×388 was, by accident, a credible *European* bowl wearing an American spec
+sheet's name. It has been re-dimensioned to the Washbrook it always claimed rather than
+re-attributed, because the rest of the set is North American and because the wide
+shielded bowl is the more interesting object here — those shields are enclosure, and
+Trap 9 is the reason enclosure governs how much splash leaves sideways. A European range
+would be a legitimate second library, not an entry in this one.
+
+Worth knowing before adding a fixture: **rimless is now common** (Geberit Selva, both
+Armitage Shanks models), which falsifies the "chunky rolled rim flange every real fixture
+has" claim in the casting-style notes below. The library has no rimless entry.
+
+The stall's front lip is a known, deliberate deviation. American Standard's *installation*
+sheet calls for a pit so the lip sets flush with the finished floor, with the floor sloped
+to drain into it — so a real full stall urinal's bowl opens at floor level, where the model
+puts its front lip 340 mm up with solid casting below. That is a different fixture rather
+than a tuning value: the front rise is most of this preset's enclosure and is entangled
+with the envelope, so changing it in the same pass as the taper would have made it
+impossible to say which change moved the splash.
 
 Two per-preset fields carry things that genuinely differ by model:
 
@@ -567,6 +591,20 @@ of ~33. It now smoothsteps between `DRY_SPLASH_K_SMOOTH` and `DRY_SPLASH_K_ROUGH
 Ra/d, so both ends land where the measurements are and the second constant is no
 longer declared-and-unread.
 
+> **Open, and the largest unresolved question in the model.** A later audit of the
+> splash correlations found that **Mundo's 57.7 is the rough asymptote of Cossali's own
+> dry correlation, not the smooth-glaze value this trap took it for.** If that reading is
+> right, the fix above anchors the smooth end of the interpolation to a number that
+> belongs at the rough end, and every splashback figure in the project moves with it —
+> hardest on the casting exterior, which is where the largest absolute numbers are. It was
+> deliberately left unchanged rather than fixed in the same pass that raised the suite to
+> 60 checks, because changing it re-baselines every reference figure here at once and the
+> change should be made on its own, with the seed and stand-off sweeps re-run. Resolve
+> this before trusting any absolute µL/L number; the ratios are unaffected, which is one
+> more reason every check in the suite is written as one. The related pinning is done:
+> `constants.ts` claimed Cossali's K used Mundo's grouping, and it is that group raised to
+> exactly 1.6, now asserted.
+
 **41. Resolve a swept segment by distance, not by category.** `ParticleSystem.step`
 tested the interior, then the casting, then the capture zones — so a droplet that
 crossed a shin panel on its way to the fixture was booked to the fixture. Small at the
@@ -622,6 +660,80 @@ that most of the flow goes past, and below it the stream enters the bowl. It fai
 fixture, and requires the hit to be at or below `casting.max.y`. This is the same lesson
 as Trap 27, found again in the same check.
 
+**46. Manufacturers do not agree on axis order, and many sheets print the triple
+unlabelled.** American Standard and Sloan print D × W × H, Kohler prints H × W × D,
+Falcon spells out W × H × D. A dimension copied from a catalogue without checking which
+axis is which is a coin flip, and it does not look like an error afterwards, because all
+three numbers are real dimensions of the real product. Two presets carried transposed
+axes for the whole life of the project:
+
+- `classic-bowl` claimed a Washbrook 6501 against a "356 × 356" nominal. The sheet says
+  **470 W × 355 D**, and the 14 in on it is the *elongated rim from finished wall*, i.e.
+  the projection — it had been copied into the width slot as well. The preset built
+  W/D = 0.92 where the product is 1.32: **112 mm too narrow and 33 mm too deep, on the
+  fixture every run opens on.**
+- `compact-waterless` claimed a Sloan WES-1000, whose sheet prints 365 × 498 × 679 with
+  no labels. Falcon publish the identical fixture as W × H × D 492 × 657 × 366, so 498 is
+  the **width** and 366 the depth — it had been built **497 mm deep**. That single
+  transposition is the whole of Trap 44: a bowl that deep stands its own rim so far
+  forward that it shadows the wall behind it, which is exactly why the casting blocked
+  every aim past v = 0.15. Rebuilt as a Falcon F-4000, it is aimable from v = 0.02 to 0.42.
+
+The check that catches this is a *ratio*, not a dimension: a wall-hung bowl is wider than
+it is deep, and W/D under 1 should have been read as a contradiction of the "extended
+sides for privacy" bullet on the same sheet. Cross-check every triple against a second
+manufacturer publishing the same fixture, and prefer sheets that label their axes.
+
+**47. `bowlDepth` is measured from the profile datum, not the finished wall.**
+`backSetback` puts the back face ~45 mm behind the datum and the casting adds ~43 mm of
+skin, so **projection from the wall is `bowlDepth + ~88 mm`**. A published projection
+dropped straight into `bowlDepth` overshoots by that much. This cost a round trip: the
+stall was diagnosed as needing `bowlDepth` 0.294 → 0.381 to match a published 381 mm base
+projection, and the existing 0.294 was **already giving 382 mm and was right to a
+millimetre**; 0.381 would have made it 463 mm, deeper than any stall urinal made. The
+defect was at the *other end* — 277 mm of projection at the top against a published 203 —
+and the lever was `wrapDepth`. Measure the silhouette before changing a depth.
+
+**48. A `W × D × H` envelope cannot express a taper, which is how a wrong one survives.**
+Every stall urinal in production slopes: American Standard Stallbrook 381 mm at the base
+to 203 at the top, Kohler Branham 414 to 205. American Standard's own name for the
+product is a "sloping front stall urinal" — the taper *is* the silhouette. The preset was
+a straight-sided column at a constant 294 mm and its comment recorded a correct-looking
+"458 × 382 × 974", because the envelope numbers a bounding box reports are the extremes
+and both extremes were right. `tools/silhouette.mts` prints projection against height,
+which is the measurement that can see this.
+
+**49. Grid quality alone cannot see an envelope error.** While closing the interior into
+a basin, `MAX_WALL_SLOPE` was chosen as 2 because it minimised flipped normals — and at
+that value the steepness floor becomes the binding term everywhere and the oval bowl came
+out **736 mm wide against 422, with a spotless grid at every resolution**. Flipped
+normals, degenerate cells and skew are all *local* measures; none of them can tell you
+the object is the wrong size. Any tuning decision made on grid metrics must have the
+envelope checked alongside it. (The admissible band was 14–50; 25 is the value.)
+
+**50. A model can be computed, validated, rendered — and never emitted.** Satellite
+droplets had a size law, a `satelliteFraction` parameter, a validation check and a
+dedicated pale-blue style in `dropletView.ts` that could never appear. **Zero particles
+carried the satellite flag over a full run**, and `satelliteFraction` did nothing but
+mis-size the parent drop. It is now 6.00% of the void against a stated 0.06. The lesson
+generalises past this one bug: a quantity being present in the parameters, in the tests
+and in the renderer is not evidence that it is present in the simulation. Assert on a
+*count* of the thing having happened, which is also how Trap 38's inert energy guard was
+finally caught — 21 853 splash events and zero clampings.
+
+**51. A law tested only against itself is untested.** The droplet drag law's only checks
+were self-consistent — they evaluated the law and compared it with the law. Against Gunn
+& Kinzer's 1949 terminal-velocity measurements it was **22.0% out at 5 mm**, and
+substituting Clift & Gauvin alone made it **worse** (30.6%); it needs Liu–Reitz
+deformation to reach 6.5%, because a 5 mm drop is not a sphere. Two errors had been
+cancelling: a flat C_d = 0.44 above Re = 1000 was 9–14% high where those drops sit, and
+rigid-sphere was ~25% low. **Every correlation in this model needs at least one check
+against an external measurement**, not against its own output. The same audit found the
+jet-breakup dispersion relation had no aerodynamic term at all and hard-returned zero
+above the Plateau limit, so breakup length rose linearly with speed for ever — a 3 mm jet
+at 30 m/s was claimed coherent for **2.08 m**. Real jets rise, peak, then break up
+*sooner*. Invisible at the default posture, where the gas Weber number is 0.63.
+
 ---
 
 ## Current measured state
@@ -637,7 +749,11 @@ Re-measure with a throwaway script over `PRESETS` × resolutions if you touch
 `surface.ts`, `wrap.ts` or any preset's `wrapDepth` / `taperExponent` / `widthSump`.
 Those three quantities are what move it.
 
-`npm run validate` → **46/46** (~180 s). `npm run build` clean.
+`npm run validate` → **60/60** (~395 s). `npm run build` clean. The count rose from 46
+when the solver audit added 14 checks, and three existing tolerances were *tightened* from
+3%/3%/2% to 1% at the same time, because the corrected jet-breakup wavenumber lands closer
+to Rayleigh's published 0.697 than the old one did. `tools/labsheet.mts` reports all six
+presets clean at all four grid resolutions.
 
 > **The absolute µL/L figures below moved on 2026-08-08** and the older ones are kept
 > only for the shape of the argument. Three changes account for it, all of them making
@@ -676,12 +792,28 @@ Fixture envelopes and the notch, after the reshape. All six are 0 flipped normal
 
 | preset | W×D×H mm | notch | openMouth | protrude | ribbing |
 |---|---|---|---|---|---|
-| classic-bowl | 358×388×640 | 47–60 mm | 350 mm | 0–4.1 mm | 5.6–17.4 mm |
-| flat-wall | 392×371×548 | 52 mm | 300 mm | 0 mm | 39.9–40.3 mm |
-| stall-urinal | 458×382×974 | 34–48 mm | 313 mm | 5.0–7.4 mm | 16.6–17.1 mm |
-| trough | 1490×419×290 | 0 mm | 350 mm | 93–95 mm | 228 mm |
-| compact-waterless | 359×497×681 | 48–57 mm | 430 mm | 8.2–11.4 mm | 64–70 mm |
-| nautilus-tall | 365×526×627 | 299–301 mm | 299–301 mm | 1.1 mm | 0.7–0.8 mm |
+| classic-bowl | 470×364×692 | 60 mm | 329 mm | 0.0 mm | 0.7–2.2 mm |
+| flat-wall | 392×371×548 | 52 mm | 300 mm | 0.0 mm | 39.9–40.3 mm |
+| stall-urinal | 458×382×974 | 0 mm | 313 mm | 0.0 mm | 22.4–23.0 mm |
+| trough | 1491×317×550 | 18 mm | 250 mm | 0.0 mm | 105.0 mm |
+| compact-waterless | 391×357×576 | 23 mm | 320 mm | 1.4–1.8 mm | 58.6–60.3 mm |
+| nautilus-tall | 365×526×627 | 299–301 mm | 299–301 mm | 1.1 mm | 0.6–0.8 mm |
+
+Four of the six now fit their casting exactly (`protrude` 0.0 mm), against 0–95 mm before,
+and `classic-bowl`'s ribbing fell from 5.6–17.4 mm to under 2.2. Two shared-code fixes did
+most of that. The casting section is now fitted in a plan frame **normalised by
+elongation** — a polar fit about `x = 0` is only an even sampling of a body about as wide
+as it is deep, and on the old 1.49 m trough the fitted radius peaked at 810 mm at 65° and
+fell to 745 at 90°, crowding the whole length into a few angular bins and drawing the
+V-notches at the end caps. It is clamped at 1, so it is exactly the identity for the five
+compact presets, verified unchanged to the digit. And the **sump floor was missing from
+the fit**: Trap 29 spreads a vertex into both bracketing bands only where its column turns
+in height, on the argument that a monotone run is covered by its edges — but that fails on
+a run that is *flat*, where no edge crosses a band line either. Protrusion had been
+tracking sump slope almost monotonically across the library.
+
+The trough's remaining 105 mm of ribbing is down from 228 and is the same structural
+limit: it is 1.49 m wide and the envelope is still a polar `radius(y, θ)`.
 
 `protrude` and `ribbing` are the two casting-fit numbers `fixture-lab` prints; see
 Traps 29 and 30 for what they mean and why the ribbing one counts alternation. `nautilus`
@@ -831,13 +963,22 @@ march step, `smoothstep(0.35, 0.85)` for backness, the 24 smoothing passes on `t
 `THUMB_RES` in `ui/thumbnail.ts`; card size in `app.ts`, which `tools/thumbsheet.mts`
 duplicates and must be kept in step with.
 
-**5. Per-model shape work still outstanding (medium).** The casting construction is sound
-now; two presets are still not their reference product. `compact-waterless` is bulbous and
-497 mm deep with a 430 mm openMouth — a real waterless unit (Falcon, Sloan) is a compact
-~360 × 350 × 470 with a narrow bowl and a cartridge at the bottom, so its profile wants
-much less forward lean. `trough` has small V-notches at its end caps and hits the polar
-envelope's limit (Trap 29 table). `trough` should also have a sparge pipe along its length
-rather than a single flushometer in the middle.
+**5. Per-model shape work — done.** All four catalogue presets are now their reference
+product, and the two that were not turned out to be Trap 46 rather than tuning:
+`compact-waterless` was 497 mm *deep* because 498 was the width, and is now a Falcon
+F-4000 at 391 × 357 × 576 that can be aimed into across v = 0.02–0.42 instead of being
+blocked past 0.15. `trough` was the wrong *kind* of object rather than the wrong size —
+290 mm tall and 419 deep, where every trough in production is tall and shallow because
+the back panel is the splashback and the gutter only collects — and is now a Pland Bruges
+TR1500P, **sparged along its length** rather than flushed from a single valve over the
+middle. Its V-notches went with the elongation-normalised section fit. `stall-urinal`
+gained the sloping front its reference advertises (Trap 48).
+
+What remains here is smaller and named: the trough's 105 mm of ribbing is the polar
+envelope's structural limit at 1.49 m of width, and the stall's front lip belongs at
+floor level rather than 340 mm up — deliberately deferred, because the front rise is most
+of that preset's enclosure and moving it in the same pass as the taper would confound
+which change moved the splash.
 
 **6. Interior side-wall seam artifact (low).** Visible in three-quarter shots of
 `classic-bowl`. Not diagnosed. Related and larger: with `--overlays shell=0` the interior
