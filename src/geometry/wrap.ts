@@ -160,6 +160,28 @@ export function buildRimProfile(
   const lift = new Float64Array(count);
   if (count < 2 || last < 1) return { wrap, lift };
 
+  // Zero depth is "not a bowl", and it has to be said explicitly here.
+  //
+  // Under the old law this fell out for free: one stand-off was multiplied by
+  // `depth`, so zero gave zero. This law does not scale anything by `depth` -- it
+  // anchors a rim curve on the profile's own two ends and only *positions* one
+  // control point with it. At zero depth the curve is still a curve, still runs
+  // from the top of the back wall down to `endReach` past the lip tip, and still
+  // returns offsets of a hundred millimetres in the middle. So the one caller that
+  // asks for zero, `flatPlateSurface()` in the validation suite, quietly got a
+  // shallow basin with side walls instead of the flat vertical plate it is the
+  // control for -- and the injected row ran down into walls that are not supposed
+  // to exist. That cost three checks in the Nusselt group: film thickness 216
+  // against 265 um, mean velocity 0.184 against 0.276 m/s, and a flux 5.6% over
+  // the injected value because the row is longer than the 0.3 m plate the
+  // reference assumes.
+  //
+  // Traps 27 and 37 a third time: a test must not silently inherit a dimension it
+  // does not own. No fixture in the library uses zero -- the smallest is the
+  // trough at 0.05 -- so this branch is reachable only from the control, which is
+  // exactly the point of it.
+  if (!(opts.depth > 0)) return { wrap, lift };
+
   // Start anchor: the top of the back wall, which is a genuine edge of the
   // ceramic. Pinning the rim to it is what makes the v = 0 row come out flat with
   // no special case.
