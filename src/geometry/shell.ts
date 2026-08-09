@@ -1167,16 +1167,51 @@ function buildBody(
         if (y > topY[a]) topY[a] = Math.min(yCeil, y);
       }
     };
+    // Bounded to what it is for. The floor exists to close a *millimetre*-scale
+    // undershoot -- "a millimetre short and the glaze edge stands out of the
+    // casting as a thin bright fin". It is not a second opinion about how high the
+    // solid goes, and letting it act as one is a real failure rather than a
+    // cosmetic one.
+    //
+    // The march above returns a smooth, monotone top edge: 374 mm at the front,
+    // which is the lip, rising to 515 mm at the sides, which is the rim. The floor
+    // then raised scattered angles in the middle of that run back to 515, so the
+    // finished edge oscillated 375 / 474 / 515 / 439 / 375 between neighbouring
+    // angular columns. Three smoothing passes cannot take out a 140 mm spike, and
+    // the strip capping the wall then had to span that gap -- which it did as a
+    // fan of long triangles lying straight across the open mouth. Measured: 1054
+    // triangles and 2418 cm2 of ceramic inside the opening, against 296 with the
+    // floor off.
+    //
+    // Why it started spiking is the same reason the skin cull did. Both were
+    // written when every row of the interior was level, so a row's height was one
+    // number and flooring to it was safe anywhere the row met the outer wall. The
+    // v = 0 and v = 1 rows are still level, but the loft's rows now run out and UP
+    // to the rim, so those two rows sit quite differently against the fitted
+    // envelope and the radius test now admits them at angles whose ceramic ends
+    // 140 mm lower.
+    const marched = Float64Array.from(topY);
     rowFloor(0);
     rowFloor(s.nv);
-    // Re-smoothed lightly, so the floor does not put back a one-column spike.
-    for (let pass = 0; pass < 3; pass++) {
+    // 4 mm. Millimetre scale is the whole point: at that value the ceramic sitting
+    // inside the opening measures 356 cm2, which is what the fixture measured before
+    // the interior was reparameterised at all. Anything larger is the floor
+    // overruling the march rather than tidying after it -- 36 mm reads 564 cm2.
+    const headroom = 0.004;
+    for (let a = 0; a <= NA; a++) {
+      topY[a] = Math.min(topY[a], marched[a] + headroom);
+    }
+    // Re-smoothed as hard as the march itself, and *not* with a max. Taking the
+    // larger of the height and its neighbourhood mean cannot remove a spike -- it
+    // can only ever push the edge up -- so three passes of it left the oscillation
+    // untouched. What the top edge needs here is the same treatment the raw march
+    // gets a few lines above: spread any step over 20-odd degrees so the strip
+    // capping the wall becomes the sloping top edge a real casting has, rather
+    // than a ribbon trying to climb 140 mm between two angular columns.
+    for (let pass = 0; pass < 24; pass++) {
       tmpT.set(topY);
       for (let a = 1; a < NA; a++) {
-        topY[a] = Math.max(
-          topY[a],
-          0.25 * tmpT[a - 1] + 0.5 * tmpT[a] + 0.25 * tmpT[a + 1]
-        );
+        topY[a] = 0.25 * tmpT[a - 1] + 0.5 * tmpT[a] + 0.25 * tmpT[a + 1];
       }
     }
   }

@@ -504,6 +504,12 @@ function flatPlateSurface(): UrinalSurface {
   p.backWallMode = 'planar';
   p.backWallTilt = 0;
   p.backWallRun = 0;
+  // Zero forward reach for the rim, which is what makes this a plate rather than a
+  // bowl. It matters more than it used to: the loft's rows now run out AND UP to
+  // the rim, so a fixture with any reach at all has real side walls and a row
+  // injected across the top of this control would run down into them instead of
+  // falling straight. `buildRimProfile` treats zero as the explicit degenerate
+  // case for exactly this reason -- see the note there.
   p.wrapDepth = 0;
   p.widthRim = 0.3;
   p.widthSump = 0.3;
