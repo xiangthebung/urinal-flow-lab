@@ -16,7 +16,7 @@
  * Usage: npx tsx tools/sidespill.mts [--void 300] [--seed 12345]
  */
 import { PRESETS, getPreset } from '../src/geometry/presets';
-import { Simulation, defaultConfig } from '../src/sim/simulation';
+import { applyPreset, Simulation, defaultConfig } from '../src/sim/simulation';
 
 const args = process.argv.slice(2);
 const arg = (k: string, d: number): number => {
@@ -30,8 +30,12 @@ console.log(`void ${voidMl} mL, seed ${seed}, 48x96\n`);
 console.log('preset               deposited   side    top    lip   side%  closure%');
 for (const p of PRESETS) {
   const cfg = defaultConfig();
-  cfg.surface = { ...getPreset(p.id).params };
-  cfg.casting = { ...(getPreset(p.id).shell ?? {}) };
+  applyPreset(cfg, getPreset(p.id));
+  // One aim for every fixture, on purpose: this bench compares presets, and the
+  // steering file's rule is that a comparison holds aim, stand-off and seed. The
+  // per-preset default aim that `applyPreset` brings with it is the right thing
+  // everywhere else and the wrong thing here.
+  cfg.aimTargetV = 0.18;
   cfg.stream.voidVolume = voidMl * 1e-6;
   cfg.seed = seed;
   cfg.drainTime = 8;

@@ -14,7 +14,7 @@ import {
   Metrics,
   SplashbackReport,
 } from '../sim/metrics';
-import {
+import { applyPreset,
   AimTrace,
   RunReport,
   SimPhase,
@@ -188,10 +188,7 @@ export class App {
   constructor() {
     const cfg = defaultConfig();
     const p0 = getPreset(this.presetId);
-    cfg.surface = { ...p0.params };
-    cfg.casting = { ...(p0.shell ?? {}) };
-    cfg.fittings = { ...(p0.fittings ?? {}) };
-    if (p0.defaultAimV !== undefined) cfg.aimTargetV = p0.defaultAimV;
+    applyPreset(cfg, p0);
     // Interactive resolution is lower than the analysis resolution. Playback at
     // anything near real time needs a thousand physics steps a second, and the
     // film solver cost scales with the cell count; the full-resolution grid is
@@ -210,6 +207,11 @@ export class App {
       this.sim.fittings
     );
     this.view.applyCameraPreset(CameraPreset.ThreeQuarter, this.sim.surface, this.sim.capture);
+    // The opening tab is Liquid, so the droplets start on the liquid's own colour
+    // rather than on provenance. `setFieldMode` keeps the two in step afterwards.
+    this.view.droplets.colorMode = DropletColorMode.Liquid;
+    this.view.droplets.liquidTint = this.sim.config.fluid.tint;
+    this.view.stains.setTint(this.sim.config.fluid.tint);
 
     this.legendEl = document.getElementById('legend')!;
     this.hudEl = document.getElementById('hud')!;
@@ -229,6 +231,8 @@ export class App {
     window.addEventListener('resize', () => this.resize());
     this.resize();
     this.sim.restart();
+    // Marks on the outside of the fixture belong to the run that made them.
+    this.view.stains.clear();
     this.refreshGeometryDependent();
     requestAnimationFrame(this.frame);
   }
@@ -258,11 +262,15 @@ export class App {
       this.sim.fittings
     );
         this.sim.restart();
+        // Marks on the outside of the fixture belong to the run that made them.
+        this.view.stains.clear();
         this.report = null;
         this.refreshGeometryDependent();
         break;
       case 'restart':
         this.sim.restart();
+        // Marks on the outside of the fixture belong to the run that made them.
+        this.view.stains.clear();
         this.report = null;
         this.refreshGeometryDependent();
         break;
@@ -272,6 +280,8 @@ export class App {
         }
         this.sim.refreshImpingement();
         this.sim.restart();
+        // Marks on the outside of the fixture belong to the run that made them.
+        this.view.stains.clear();
         this.report = null;
         this.refreshGeometryDependent();
         break;
@@ -649,15 +659,7 @@ export class App {
   selectPreset(id: string): void {
     if (id === this.presetId) return;
     this.presetId = id;
-    const p = getPreset(id);
-    // Copied, never aliased: presets are shared objects and the config is mutated
-    // by the controls.
-    this.sim.config.surface = { ...p.params };
-    this.sim.config.casting = { ...(p.shell ?? {}) };
-    this.sim.config.fittings = { ...(p.fittings ?? {}) };
-    // Aim belongs to the model. A profile fraction that lands mid-wall on a bowl
-    // lands in the throat of a stall, so each fixture carries its own default.
-    if (p.defaultAimV !== undefined) this.sim.config.aimTargetV = p.defaultAimV;
+    applyPreset(this.sim.config, getPreset(id));
     this.paintTopbarModel();
     this.paintModelCards();
     this.apply('rebuild');
@@ -1268,9 +1270,13 @@ export class App {
         { value: '0', label: 'Provenance (jet / drops / splash)' },
         { value: '1', label: 'Speed' },
         { value: '2', label: 'Diameter' },
+        { value: '3', label: 'Liquid (no data colouring)' },
       ],
       get: () => String(this.view.droplets.colorMode),
-      set: (v) => (this.view.droplets.colorMode = Number(v) as DropletColorMode),
+      set: (v) => {
+        this.dropletColorOverride = Number(v) as DropletColorMode;
+        this.view.droplets.colorMode = this.dropletColorOverride;
+      },
       effect: 'none',
     });
     md.slider({
@@ -1881,6 +1887,8 @@ export class App {
     this.playBtn = this.transport.button('▶ Play', () => this.togglePlay(), 'primary');
     this.transport.button('Restart', () => {
       this.sim.restart();
+      // Marks on the outside of the fixture belong to the run that made them.
+      this.view.stains.clear();
       this.report = null;
       this.refreshGeometryDependent();
       this.refreshViews();
@@ -2003,6 +2011,8 @@ export class App {
         case 'r':
         case 'R':
           this.sim.restart();
+          // Marks on the outside of the fixture belong to the run that made them.
+          this.view.stains.clear();
           this.report = null;
           this.refreshGeometryDependent();
           this.refreshViews();
@@ -2094,6 +2104,8 @@ export class App {
     add('Side', CameraPreset.Side, 2);
     add('Top', CameraPreset.Top, 3);
     add('Eye', CameraPreset.UserEye, 4);
+    // The contact point, which is the subject of the tool and had no view.
+    add('Jet', CameraPreset.Contact, 5);
 
     const help = document.createElement('button');
     help.type = 'button';
@@ -2215,6 +2227,7 @@ export class App {
     CameraPreset.Side,
     CameraPreset.Top,
     CameraPreset.UserEye,
+    CameraPreset.Contact,
   ];
   private cameraIndex = 0;
 
@@ -2233,6 +2246,8 @@ export class App {
   private togglePlay(): void {
     if (this.sim.phase === SimPhase.Finished) {
       this.sim.restart();
+      // Marks on the outside of the fixture belong to the run that made them.
+      this.view.stains.clear();
       this.report = null;
       this.refreshGeometryDependent();
     }
@@ -2450,6 +2465,8 @@ export class App {
       this.sim.fittings
     );
     this.sim.restart();
+    // Marks on the outside of the fixture belong to the run that made them.
+    this.view.stains.clear();
 
     const total = this.sim.totalDuration;
     let n = 0;
@@ -2768,8 +2785,10 @@ export class App {
     this.view.updateLiquid(
       this.sim.particles,
       this.sim.emitter.position,
-      this.sim.emitter.diameterAt(this.sim.time)
+      this.sim.emitter.diameterAt(this.sim.time),
+      this.breakupForDrawing()
     );
+    this.view.drainExteriorDeposits(this.sim.exteriorDeposits);
 
     // Field and heat map updates are the expensive part of drawing; 12 Hz is
     // fast enough to read and leaves the budget to the physics.
@@ -2858,13 +2877,36 @@ export class App {
   }
 
   /** Force every throttled overlay to catch up, then draw one frame. */
+  /**
+   * The breakup solution the tube is drawn from.
+   *
+   * Passed in rather than recomputed in the renderer: the wavelength and the
+   * growth time that shape the varicose necking are the *solver's*, and a second
+   * copy of a calibrated number is this project's most-repeated defect. Cached by
+   * the emitter, so this is a field read at the frame rate.
+   */
+  private breakupForDrawing(): {
+    wavelength: number;
+    breakupTime: number;
+    disturbanceRatio: number;
+  } {
+    const b = this.sim.emitter.breakupAt(this.sim.time);
+    return {
+      wavelength: b.wavelength,
+      breakupTime: b.breakupTime,
+      disturbanceRatio: this.sim.config.stream.disturbanceRatio,
+    };
+  }
+
   refreshViews(): void {
     this.flushAimSweep();
     this.view.updateLiquid(
       this.sim.particles,
       this.sim.emitter.position,
-      this.sim.emitter.diameterAt(this.sim.time)
+      this.sim.emitter.diameterAt(this.sim.time),
+      this.breakupForDrawing()
     );
+    this.view.drainExteriorDeposits(this.sim.exteriorDeposits);
     this.updateFixtureField();
     this.updateStreamPath();
     this.view.updateHeatmaps(this.sim.metrics.floorMap, this.sim.metrics.bodyMap);
@@ -2882,6 +2924,15 @@ export class App {
 
   setFieldMode(mode: FieldMode): void {
     this.view.fixture.mode = mode;
+    // Provenance colouring is a data view and belongs on the data tabs. On the tab
+    // whose description is "the fixture as it would look", airborne liquid is the
+    // colour of the liquid -- otherwise nine tenths of that view is red analytical
+    // dots, since at peak flow 906 of 973 live particles are splash. The Advanced
+    // select still wins if anyone has set it deliberately.
+    if (this.dropletColorOverride === null) {
+      this.view.droplets.colorMode =
+        mode === FieldMode.Liquid ? DropletColorMode.Liquid : DropletColorMode.Provenance;
+    }
     // The start-up chip sits where the legend goes, so a view with a colour scale
     // must not have to share the corner with it.
     this.dismissFirstHint();
@@ -2891,10 +2942,25 @@ export class App {
   }
 
   setCameraPreset(preset: CameraPreset): void {
-    this.view.applyCameraPreset(preset, this.sim.surface, this.sim.capture);
+    // The contact camera needs somewhere to point, and the only correct answer to
+    // "where does the stream land" is `traceAim` -- which tests the casting as well
+    // as the interior, so the view follows the stream onto the outside of the
+    // fixture when that is where it is going (Trap 15).
+    this.view.applyCameraPreset(
+      preset,
+      this.sim.surface,
+      this.sim.capture,
+      this.aimTrace?.point ?? null
+    );
   }
 
+  /** Set from the Advanced control; null means "follow the tab". */
+  private dropletColorOverride: DropletColorMode | null = null;
+
   private updateFixtureField(): void {
+    // Airborne liquid and the film on the wall take their colour from the same
+    // place, so a change of fluid moves both.
+    this.view.droplets.liquidTint = this.sim.config.fluid.tint;
     this.view.fixture.update(
       this.sim.film,
       this.sim.metrics,

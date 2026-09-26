@@ -14,6 +14,7 @@ import {
   buildFittings,
 } from '../geometry/fittings';
 import { ShellMesh, ShellParams, buildShell } from '../geometry/shell';
+import { UrinalPreset } from '../geometry/presets';
 import { SurfaceParams, UrinalSurface, defaultSurfaceParams } from '../geometry/surface';
 import { CaptureScene, CaptureZone, UserPosture, defaultPosture } from './capture';
 import { FixtureExtent, fixtureExtent } from './extent';
@@ -56,6 +57,13 @@ export const enum SimPhase {
   Finished = 3,
 }
 
+/** Whether the flush has run yet. Separate from SimPhase, which is the void. */
+const enum FlushState {
+  Waiting = 0,
+  Running = 1,
+  Done = 2,
+}
+
 export interface SimConfig {
   surface: SurfaceParams;
   /**
@@ -87,6 +95,38 @@ export interface SimConfig {
   timeStep: number;
   /** How long to keep simulating after flow stops, s. */
   drainTime: number;
+  /**
+   * Depth of standing water in the sump when the run starts, m.
+   *
+   * A washout urinal is not dry when you walk up to it. Its trap holds a water
+   * seal and the last flush left a pool over the outlet, and that pool is the
+   * first thing a low aim actually strikes -- which matters, because a droplet
+   * arriving on millimetres of standing liquid takes the wetted branch of the
+   * splash threshold rather than the dry one, and past about one droplet diameter
+   * the mechanism is cavity collapse rather than a corona. Starting every run on
+   * bone-dry ceramic put the sump on the dry branch for the whole of the first
+   * void, which is neither what the fixture looks like nor how it behaves.
+   *
+   * Measured at the sump low point, so it is the depth you would see. 8 mm is the
+   * standing film a washout bowl carries over its outlet between flushes; the
+   * trap's own 50 mm seal is below the china and out of the model. Zero for a
+   * waterless fixture, whose sealed cartridge is the point of the product.
+   */
+  trapSealDepth: number;
+  /**
+   * Flush delivered after the void, m^3. 0 disables it.
+   *
+   * The flushometer and the trough's sparge pipe were built as solid collidable
+   * geometry and never emitted a drop, so the most visible liquid event on a real
+   * urinal did not exist and `residenceTime` and `stagnantArea` were being
+   * measured on a fixture that is never washed down. 1.9 L is the 0.5 gpf that
+   * every fixture in this library is specified at.
+   */
+  flushVolume: number;
+  /** Seconds after flow stops before the flush starts. */
+  flushDelay: number;
+  /** How long the flush runs, s. */
+  flushDuration: number;
   /**
    * If set, aim at this profile fraction instead of using the raw elevation and
    * azimuth. 0 is the top of the back wall, 0.5 the sump.
@@ -165,6 +205,10 @@ export function defaultConfig(): SimConfig {
     resolutionV: 132,
     timeStep: 1 / 1000,
     drainTime: 30,
+    trapSealDepth: 0.008,
+    flushVolume: 1.9e-3,
+    flushDelay: 3,
+    flushDuration: 6,
     // Aim high enough on the back wall to stay on the surface the geometry
     // actually controls. Aiming lower pushes the impact into the throat fillet,
     // which no wall-shape strategy governs, and a carefully generated wall then
@@ -177,6 +221,36 @@ export function defaultConfig(): SimConfig {
     seed: 12345,
     particleCapacity: 200000,
   };
+}
+
+/**
+ * Put a fixture into a config: all of it, in one place.
+ *
+ * The three-line "copy the surface, the shell and the fittings" idiom was written
+ * out at nine call sites -- the app twice, the validation suite three times, four
+ * benches -- and Trap 43 is the story of one of them being incomplete: the
+ * headline A/B built its two control fixtures from `preset.params` alone, so both
+ * controls wore the *default* bowl's casting and metalwork, and "same stream, same
+ * seed, same aim" was controlling everything except the part of the fixture
+ * nearest the user. Adding a fourth per-preset field would have set that trap
+ * again in exactly the same shape, so there is now one function and the call sites
+ * cannot drift apart.
+ *
+ * Everything a preset does not state falls back to `defaultConfig()`, so a config
+ * that has been through a waterless fixture gets its water back when it is handed
+ * a flushed one.
+ */
+export function applyPreset(cfg: SimConfig, preset: UrinalPreset): void {
+  const base = defaultConfig();
+  // Copied, never aliased: presets are shared objects and configs get mutated.
+  cfg.surface = { ...preset.params };
+  cfg.casting = { ...(preset.shell ?? {}) };
+  cfg.fittings = { ...(preset.fittings ?? {}) };
+  cfg.trapSealDepth = preset.water?.trapSealDepth ?? base.trapSealDepth;
+  cfg.flushVolume = preset.water?.flushVolume ?? base.flushVolume;
+  // Aim belongs to the model: a profile fraction that lands mid-wall on a bowl
+  // lands in the throat of a stall.
+  if (preset.defaultAimV !== undefined) cfg.aimTargetV = preset.defaultAimV;
 }
 
 /** Result of flying the current aim at the fixture. */
@@ -243,8 +317,23 @@ export class Simulation {
   private stepResult: ParticleStepResult = makeStepResult();
   private bounds!: { min: Vec3; max: Vec3 };
 
+  /**
+   * Where liquid landed on the outside of the fixture, and how much.
+   *
+   * Published for the renderer. Trap 14 made the exterior splash properly and
+   * left it invisible: the part that stays put is booked to a capture zone,
+   * there is no film grid out here to hold it, and so the worst outcome the tool
+   * can report -- the stream on the front rim -- drew a spotless fixture. Flat
+   * `[x, y, z, nx, ny, nz, volume]` records, reset with the run.
+   */
+  readonly exteriorDeposits: number[] = [];
+
   time = 0;
   phase: SimPhase = SimPhase.Idle;
+  /** Where the flush has got to. Read by the HUD so the wash is visible as an event. */
+  flushState: FlushState = FlushState.Waiting;
+  /** Volume of the trap seal placed at the last restart, m^3. */
+  sealVolume = 0;
   /** Wall-clock cost of the last step, ms. */
   lastStepMs = 0;
   /** Cached impingement map, recomputed when geometry or aim changes. */
@@ -382,9 +471,75 @@ export class Simulation {
     this.metrics.reset();
     this.time = 0;
     this.phase = SimPhase.Voiding;
+    this.flushState = FlushState.Waiting;
+    this.exteriorDeposits.length = 0;
     this.unreachableSteps = 0;
+    this.placeTrapSeal();
     if (c.aimTargetV !== null) this.aimAtProfileFraction(c.aimTargetV);
     this.refreshImpingement();
+  }
+
+  /**
+   * Stand the water seal in the sump.
+   *
+   * Filled hydrostatically rather than by painting a thickness onto the drain
+   * cells: the level is a horizontal plane a stated height above the lowest point
+   * of the wetted interior, and each cell takes the depth that plane leaves over
+   * it, measured along the wall's own normal. That is what produces a real
+   * waterline -- a contact line at a constant height that runs round the basin and
+   * follows its shape -- instead of a puddle-shaped stain whose edge is wherever
+   * the drain cells happen to stop.
+   *
+   * The solver is then left to hold it. It is an equilibrium of the terms already
+   * there: the hydrostatic gradient pushes toward level and the contact line pins
+   * the edge, so if this ever drifts it is a solver regression rather than a
+   * cosmetic one, and volume closure will say so first.
+   */
+  private placeTrapSeal(): void {
+    this.sealVolume = 0;
+    const s = this.surface;
+    const n = s.nu * s.nv;
+    this.film.sealThickness.fill(0);
+    const depth = this.config.trapSealDepth;
+    if (!(depth > 0)) return;
+
+    let yMin = Infinity;
+    const p = v3();
+    for (let c = 0; c < n; c++) {
+      s.getCellPos(c, p);
+      if (p.y < yMin) yMin = p.y;
+    }
+    if (!Number.isFinite(yMin)) return;
+    const level = yMin + depth;
+
+    const nrm = v3();
+    let placed = 0;
+    for (let c = 0; c < n; c++) {
+      s.getCellPos(c, p);
+      const head = level - p.y;
+      if (head <= 0) continue;
+      s.getCellNormal(c, nrm);
+      // Depth normal to the wall under a horizontal free surface. On the flat
+      // washout floor the normal is vertical and this is the head itself; up the
+      // side of the basin it thins to nothing, which is the waterline.
+      const h = head * Math.abs(nrm.y);
+      if (h <= 0) continue;
+      // Both the liquid and the weir that keeps it. Without the second the outlet
+      // is an orifice discharging on the local head, which empties eight
+      // millimetres in about thirty milliseconds -- the seal was placed and gone
+      // before the first parcel arrived.
+      this.film.sealThickness[c] = h;
+      // Water. What stands in the trap between uses is whatever the last flush
+      // left, so a fixture opens clean rather than opening with a bowl of the
+      // previous user's void in it.
+      this.film.deposit(c, h * s.cellArea[c], 0, 0, 0);
+      placed += h * s.cellArea[c];
+    }
+    // `deposit` books into the film's own depositedVolume, which the closure sum
+    // does not read, so the seal is declared here instead. Trap 24: liquid that
+    // exists and is not in the sum is a leak waiting to be found by someone else.
+    this.metrics.introducedVolume += placed;
+    this.sealVolume = placed;
   }
 
   /**
@@ -632,8 +787,53 @@ export class Simulation {
       }
       if (landed > 0) {
         this.metrics.recordCapture(cap.zone, cap.to, landed, cap.generation);
+        if (cap.zone === CaptureZone.FixtureExterior && cap.normal) {
+          // Bounded: a rim strike puts tens of thousands of arrivals on the
+          // casting, and the renderer only needs enough of them to show where.
+          if (this.exteriorDeposits.length < 7 * 20000) {
+            this.exteriorDeposits.push(
+              cap.to.x, cap.to.y, cap.to.z,
+              cap.normal.x, cap.normal.y, cap.normal.z,
+              landed
+            );
+          }
+        }
       }
       this.particles.kill(cap.index);
+    }
+
+    // 4b. The flush.
+    //
+    // After the void, the flushometer washes the bowl down: a sheet entering at
+    // the top of the back wall and running the whole height of the fixture. It is
+    // the most visible liquid event a urinal produces and it did not exist -- the
+    // valve and the trough's sparge were built as solid collidable geometry that
+    // never emitted a drop, so `residenceTime` and `stagnantArea` were being
+    // reported for a fixture that is never washed.
+    //
+    // Injected as a flux into the `v = 0` row rather than as particles, because
+    // that is what a rim spreader does: it is not a jet, it is a film handed to
+    // the top of the wall at low speed. The solver then carries it, and the
+    // Nusselt balance already in it sets the sheet thickness -- about 0.6 mm for
+    // this flux over this width -- without anything being prescribed.
+    if (this.phase !== SimPhase.Voiding && this.config.flushVolume > 0) {
+      const start = this.metrics.flowEndTime + this.config.flushDelay;
+      const dur = Math.max(1e-3, this.config.flushDuration);
+      if (this.time >= start && this.time < start + dur) {
+        this.flushState = FlushState.Running;
+        // Volume per unit width of the receiving row, so a 1.5 m trough is washed
+        // by the same sheet as a 0.3 m bowl rather than by the same total flux.
+        let width = 0;
+        for (let i = 0; i < this.surface.nu; i++) width += this.surface.cellDu[i];
+        const q = this.config.flushVolume / dur;
+        const perWidth = q / Math.max(1e-6, width);
+        // Concentration 0: the flush is water. Without that the wash-down is
+        // more of the same liquid, and rinsing the bowl made it look dirtier.
+        this.film.injectRow(0, perWidth, dt, 0);
+        this.metrics.introducedVolume += q * dt;
+      } else if (this.time >= start + dur) {
+        this.flushState = FlushState.Done;
+      }
     }
 
     // 5. Advance the film.
@@ -756,7 +956,12 @@ export class Simulation {
       this.metrics.escapedVolume +
       this.particles.overflowVolume;
     const emitted = this.metrics.emittedVolume;
-    const closure = emitted > 0 ? Math.abs(accounted - emitted) / emitted : 0;
+    // The seal and the flush are liquid the fixture was given rather than liquid
+    // the user voided, so they belong on the input side of the balance and not in
+    // the denominator of a microlitres-per-litre figure. `voidedVolume` below is
+    // still `emitted`, which is what keeps every published number comparable.
+    const supplied = emitted + this.metrics.introducedVolume;
+    const closure = supplied > 0 ? Math.abs(accounted - supplied) / supplied : 0;
 
     return {
       splash,

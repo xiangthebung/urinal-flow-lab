@@ -6,17 +6,29 @@ import { degToRad } from '../core/vec3';
 /**
  * The fixture library.
  *
- * Six models, chosen so they are told apart at a glance and so they span the
- * design space rather than flattering any one approach: four ordinary products
- * you would actually find installed, one deliberate control, and one shape
- * generated from the constant-impingement-angle condition.
+ * Eight models, chosen so they are told apart at a glance and so they span the
+ * design space rather than flattering any one approach: six ordinary products you
+ * would actually find installed, one deliberate control, and one shape generated
+ * from the constant-impingement-angle condition.
  *
  * Distinguishable at a glance matters more than it sounds. The whole point of the
  * tool is comparing fixtures, and a picker full of near-identical bowls makes the
  * comparison feel arbitrary -- if two entries look the same, a difference in the
  * numbers reads as noise. So the set is spread across envelope as well as wall
- * shape: a compact bowl, a hard-edged slab, a full-height stall, a wide trough, a
- * deep narrow waterless bowl, and the generated shape.
+ * shape: a wide shielded bowl, a hard-edged slab, a full-height stall, a wide
+ * trough, a deep waterless panel, the generated shape, and -- added last -- the
+ * two halves of the COMPACT CLASS, which the first six had only as a footnote.
+ *
+ * THE COMPACT CLASS IS NOT A SMALL VERSION OF THE FULL-SIZE ONE. Full-size US
+ * bowls are wider than they are deep, because ANSI A117.1 pins the projection at a
+ * minimum (343 mm) while the width is free, so the whole class piles up just above
+ * that floor at W/D 1.2-1.35. Compact fixtures sit at W/D 0.93-1.01 -- Kohler
+ * Dexter 343x368, Zurn Z5738 368x365, TOTO UT104E 330x356, American Standard
+ * Maybrook 324x324 -- because they are as deep as the code requires and no wider.
+ * So they are square or slightly deeper than wide, and the aspect check that
+ * catches a transposed axis on a full-size bowl (Trap 46) does NOT apply to them:
+ * 13 x 14 in on a compact sheet is the fixture, not a mistake. That difference is
+ * why both new entries carry the ratio in their comments explicitly.
  *
  * Dimensions are taken from real fixtures, and the reference product is named in a
  * comment beside every preset so the numbers can be checked rather than trusted.
@@ -29,12 +41,15 @@ import { degToRad } from '../core/vec3';
  * and `compact-waterless` came out 140 mm too deep and 130 mm too narrow -- in both
  * cases inverting the plan aspect ratio, not just missing a size.
  *
- * Two independent checks catch it. Every US bowl and every waterless unit is WIDER
- * THAN IT IS DEEP, typically 1.2-1.35:1, because ANSI A117.1 pins the projection at
- * a minimum (343 mm) while the width is free, so the whole class piles up just above
- * that floor. And the phrase to look for on the sheet is "elongated 14 inch rim from
- * finished wall" -- that 14 inches is the PROJECTION, and it is the number that most
- * often ends up copied into the width slot as well.
+ * Two independent checks catch it. Every FULL-SIZE US bowl and every waterless unit
+ * is WIDER THAN IT IS DEEP, typically 1.2-1.35:1, because ANSI A117.1 pins the
+ * projection at a minimum (343 mm) while the width is free, so the whole class piles
+ * up just above that floor. (Read "full-size" strictly: the compact class is square
+ * or slightly deeper than wide and this check says nothing about it -- see the note
+ * above, and `compact-egg` and `square-washout` below.) And the phrase to look for on
+ * the sheet is "elongated 14 inch rim from finished wall" -- that 14 inches is the
+ * PROJECTION, and it is the number that most often ends up copied into the width slot
+ * as well.
  *
  * MARKET IDENTITY: THIS LIBRARY IS THE NORTH AMERICAN COMMERCIAL RANGE, on purpose.
  *
@@ -89,6 +104,16 @@ export interface UrinalPreset {
    * the product.
    */
   fittings?: Partial<FittingsParams>;
+  /**
+   * The water the fixture itself holds and delivers. Overrides only.
+   *
+   * Per-model for the same reason the metalwork is: a waterless fixture has no
+   * flush *and* no seal -- its sealed cartridge is the trap, and the absence of
+   * standing water is the product -- while a 1.5 m trough is washed by a cistern
+   * several times the size of a bowl's flushometer charge. Both are visible
+   * events, and both change what the first arriving droplet lands on.
+   */
+  water?: { trapSealDepth?: number; flushVolume?: number };
   /**
    * Where to aim on this fixture by default, as a profile fraction.
    *
@@ -530,6 +555,11 @@ export const PRESETS: UrinalPreset[] = [
     // but they hide the distribution inside an integral welded channel, so nothing
     // like a flushometer is visible on those either.
     fittings: { flushValve: false, spargePipe: true },
+    // A 1.5 m channel is washed by an auto-siphon cistern rather than by a
+    // flushometer charge, and it takes several times the water: 4.5 L is the
+    // common single-siphon size for this length. The gutter holds its own seal
+    // like any other fixture.
+    water: { flushVolume: 4.5e-3 },
     // 55 degrees, and the reachable band is now 0.02 to 0.76 -- 35 degrees of spread
     // where the old 290 mm-tall trough had almost none and v = 0.30 already read 80.
     // That change is entirely the corrected height: a trough with 460 mm of back
@@ -673,6 +703,12 @@ export const PRESETS: UrinalPreset[] = [
     // supply and no flushometer. The outlet spud stays, because the cartridge does
     // connect to a waste pipe.
     fittings: { flushValve: false },
+    // No flush and no seal. The sealed cartridge in the outlet *is* the trap, so
+    // there is no standing water in the bowl either -- which is not a detail: it
+    // means every arriving droplet meets dry glaze on the dry branch of the splash
+    // threshold, all the way into the sump, where every other fixture here has
+    // millimetres of liquid taking the wetted branch.
+    water: { trapSealDepth: 0, flushVolume: 0 },
     // 56 degrees, on a band that is now reachable from v = 0.02 all the way to 0.50.
     //
     // The old preset could be aimed into only as far as v = 0.15 before its own
@@ -770,6 +806,324 @@ export const PRESETS: UrinalPreset[] = [
     // edge: at 0.46 the trace has left the governed wall and reads 48 degrees, and
     // the advantage goes with it.
     defaultAimV: 0.18,
+  },
+  {
+    id: 'compact-egg',
+    name: 'Compact egg bowl',
+    summary:
+      'The small shieldless bowl: a rounded oval scooped into an egg-shaped body ' +
+      'that draws down to a narrow nose, with an integral trap and no privacy sides.',
+    expectation:
+      'The least enclosed product in the library, and that is the finding rather ' +
+      'than a defect. Its side walls stand less than half as far forward as the ' +
+      'shielded bowl’s, so splash that would be caught there leaves through the ' +
+      'open section here — watch where the liquid goes, not the total. It is the ' +
+      'other half of the pair with the square box: same class, near enough the same ' +
+      'width, opposite enclosure. Being short matters too: mounted at the standard ' +
+      '610 mm the whole wetted wall stands above the stream and every reachable aim ' +
+      'is a steep one, which is why this ships on the ADA mounting its own data ' +
+      'sheet recommends.',
+    // Dimensioned against a TOTO UT104E, the 0.5 gpf compact washout urinal with a
+    // 3/4 in top spud: 330 W x 356 D x 552 H mm (13 x 14 x 21-3/4 in), rim 610 mm
+    // above finished floor for a standard install and 432 mm for ADA, which TOTO's
+    // own sheet marks "recommended". Concealed integral trap, 2 in I.P. outlet
+    // through the wall.
+    //
+    // TOTO's drawing labels its own axes, which is the reason this fixture is safe
+    // to take at face value where Trap 46 says a bare triple is a coin flip: the
+    // 13 in is dimensioned across the front elevation and the 14 in from the
+    // finished wall on the side elevation, separately, on the same page.
+    //
+    // W/D = 0.93, i.e. DEEPER THAN IT IS WIDE, and that is correct rather than a
+    // transposition. See the note at the top of this file: the compact class sits at
+    // 0.93-1.01 (Kohler Dexter 343x368, Zurn Z5738 368x365) because it is built to
+    // the 343 mm projection the code demands and no wider. Applying the full-size
+    // aspect check here would "correct" a real fixture into one nobody makes.
+    //
+    // THE NOSE IS THE POINT OF THIS ENTRY, visually. `classic-bowl`'s shell comment
+    // says the long narrow nose "belongs to the compact egg class ... which is a
+    // different product and a different silhouette" and refuses it on a 470 mm body.
+    // Nothing in the library then had one. This is that product, so it gets the nose
+    // the steering notes describe (bottomExtension 0.10 / bottomTaper 0.20) and it is
+    // the only card in the picker that ends in a point.
+    params: P({
+      // 552 mm overall = rimHeight + sumpDepth + bottomExtension. 0.422 + 0.030 +
+      // 0.100, and that identity is exact on every preset with a planar or concave
+      // back wall — it is the only reliable way to hit a published height. It does
+      // NOT hold on `nautilus-tall`, where the generated wall makes `rimHeight` an
+      // upper bound rather than a value and the sum is 130 mm short of the envelope.
+      rimHeight: 0.422,
+      // Projection from the wall is `bowlDepth + backSetback + the lip skin`
+      // (Trap 47), so the published 356 mm wants 0.315 against the 0.018 setback
+      // below. Dropping the published projection straight into `bowlDepth` would
+      // have built a 397 mm fixture.
+      //
+      // THE SKIN ALLOWANCE IS NOT THE ~43 mm TRAP 47 QUOTES. Measured on this
+      // fixture it is 23 mm, and on `square-washout` 24 — because the skin is capped
+      // at `wallThickness` and both of these are thin-walled compact castings with a
+      // small `frontLipInturn`, where the full-size bowls the trap was written from
+      // are not. The trap's arithmetic is right and its constant is per-fixture:
+      // build it, read `W x D x H` out of `fixture-lab`, and correct once.
+      bowlDepth: 0.315,
+      backWallMode: 'concave',
+      // Gentle. A compact bowl has no depth to spend on curvature, and `buildProfile`
+      // caps `backWallRun` at `drainZ * 0.75` anyway, which is 116 mm here.
+      backWallRun: 0.055,
+      // 330 mm published, less the 50 mm the casting adds across the two sides.
+      widthRim: 0.28,
+      // A washout funnel to a central strainer, but not the waterless model's
+      // extreme one: this fixture is rinsed by half a gallon every use.
+      widthSump: 0.11,
+      // Trap 9: 0.248 / 0.280 = 0.886, inside the 0.85-0.9 band. It matters more
+      // here than anywhere, because the wrap is shallow and the front rise is most
+      // of what little enclosure this fixture has — narrowing the lip would open the
+      // one gap it cannot afford.
+      widthLip: 0.248,
+      taperExponent: 2.0,
+      // SHALLOW ON PURPOSE, AND IT IS THE PHYSICS OF THE PRODUCT. A shielded bowl
+      // stands its side edges 275 mm forward; this one has no shields at all, just a
+      // rim that turns up. The wrap is what stops splash leaving sideways, so this
+      // fixture is genuinely open at the sides and its figures should say so. Do not
+      // "fix" it by deepening the wrap — that turns it into a different product and
+      // deletes the comparison the entry exists to make.
+      wrapDepth: 0.13,
+      // Rounder in plan than the washout bowls, which is the egg. 2.6 keeps the
+      // section closer to a parabola than to the flat-walled U a squarish fixture
+      // wants.
+      wrapExponent: 2.6,
+      wrapDecay: 0.7,
+      throatHeight: 0.05,
+      sumpDepth: 0.03,
+      sumpSlope: 0.14,
+      // 0.60 gives the undercut that makes the nose read as a nose rather than as a
+      // plinth (Trap 4).
+      sumpFrontFraction: 0.6,
+      // Forward, per Trap 25. The clamp ceiling is
+      // `bowlDepth * sumpFrontFraction - 30 mm` = 159 mm, so this sits 4 mm under it
+      // — on the clamp itself `buildProfile` reports the profile as clamped, which
+      // the benches reject even when the geometry is fine.
+      drainZ: 0.155,
+      // 2 in outlet with a strainer over it.
+      drainRadius: 0.024,
+      frontLipHeight: 0.21,
+      frontLipInturn: 0.024,
+      // MOUNTED AT THE ACCESSIBLE HEIGHT, and TOTO's own sheet asks for it: it
+      // prints 24 in (610 mm) floor-to-rim as the standard install and marks 17 in
+      // (432 mm) "recommended for ADA height installation". Measured, the two are
+      // different fixtures to aim at — walking v from 0.08 to 0.44 in steps of 0.02:
+      //
+      //   432 mm (this)   59 58 57 56 55 55 54 53 53 52 52 51 51 50 50 49 49 49 49
+      //   610 mm          76 76 75 73 72 71 71 69 68 68 67 66 65 64 63 62 61 60 60
+      //
+      // 11 to 17 degrees apart at every point — widest at the top of the wall, where
+      // it matters most — and the shallowest aim available on the whole fixture goes
+      // 49 -> 60.
+      // The mechanism is `compact-waterless`'s: this body is only 552 mm tall, so at
+      // 610 mm its whole wetted wall stands above the stream's exit and every strike
+      // is a near-normal one. Nothing about the shape changes; the stream simply
+      // arrives descending instead of level.
+      //
+      // 0.644 = 432 mm to the front lip plus the 212 mm of body above it. That makes
+      // three of eight presets on the accessible mounting — this one,
+      // `square-washout` and `compact-waterless` — and all three are compact
+      // fixtures, which is what a real washroom looks like, since the compact unit is
+      // usually the low one in the row.
+      rimAboveFloor: 0.644,
+    }),
+    shell: {
+      // The one preset that should be round. `sectionSmoothing` at 5-7 was the
+      // "round pod" complaint on the washout bowls, and 0 is right for those — but
+      // this fixture genuinely is an oval in plan with no flat faces anywhere, so
+      // the parameter earns its keep here instead of being tuned to zero everywhere.
+      sectionSmoothing: 3,
+      bulge: 0.0,
+      clearance: 0.012,
+      wallThickness: 0.024,
+      // A real flushing rim: this is a washout fixture with water fed round the top,
+      // so it carries the rolled flange, unlike `compact-waterless` which must not.
+      rimThickness: 0.023,
+      rimBandWidth: 0.03,
+      backSetback: 0.018,
+      // The nose. 100 mm of body below the bowl drawn to a fifth of the section
+      // above it, which is the 0.10 / 0.17-ish pair the casting-style notes give for
+      // a wall-hung china bowl and which no other preset here uses.
+      bottomExtension: 0.1,
+      bottomTaper: 0.2,
+    },
+    fittings: {
+      // NO OUTLET SPUD, and this is a real feature of the product rather than a
+      // simplification: the UT104E has a CONCEALED INTEGRAL TRAP and takes its waste
+      // back through the wall, so nothing hangs below the china. Every photograph
+      // shows a clean rounded underside, and the nose above depends on it — a spud
+      // dropped 90 mm out of the tip would read as a funnel with a pipe in it.
+      // `square-washout` is the other end of this: an exposed tailpiece and no trap.
+      outletSpud: false,
+      // A short fixture on a normal rough-in leaves more pipe showing between the
+      // deck and the valve, which is the opposite of the stall's problem.
+      pipeRise: 0.13,
+    },
+    // 49 degrees, on a band that runs from v = 0.08 to 0.62 and falls monotonically
+    // — 59 at the top of the wall down to a 49-degree plateau over 0.38-0.44, then a
+    // cliff to 60 at 0.46 and 86 by 0.56 as the trace drops off the wall onto the
+    // throat and the front rise. 0.40 sits a full application sweep step (1/24) below
+    // that cliff — `aimcheck` reads its four neighbours at 0.358, 0.379, 0.421 and
+    // 0.442 as 49.9, 49.3, 48.8 and 48.7, so the recommendation is stable across the
+    // resolution at which it is actually made. That margin is what Trap 45 is about:
+    // an aim one step from a discontinuity reports a flattering angle for the worst
+    // possible reason. 0.44 would cost nothing in degrees and all of the margin.
+    // Everything from 0.64 on is blocked by the casting, and 0.02-0.06 by the rim.
+    defaultAimV: 0.4,
+  },
+  {
+    id: 'square-washout',
+    name: 'Square washout box',
+    summary:
+      'A small hard-edged box, exactly as deep as it is wide, with the side walls ' +
+      'carried nearly the full depth and an exposed tailpiece under the base.',
+    expectation:
+      'The most enclosed fixture in the library: the side walls stand almost as far ' +
+      'forward as the bowl is wide, so the section is a near-closed U and very ' +
+      'little can leave sideways. Set against the compact egg — same class, near ' +
+      'enough the same width, no shields — it isolates what enclosure alone is ' +
+      'worth, which is the one comparison the library could not make before. A deep ' +
+      'bowl on a very short body is the cost: the stream meets the wall close to ' +
+      'its normal wherever it lands, and at 59° across the whole usable band there ' +
+      'is no aim that helps.',
+    // Dimensioned against an American Standard Maybrook 6581.001 universal washout
+    // urinal: 324 x 324 x 457 mm (12-3/4 x 12-3/4 x 18 in), vitreous china,
+    // flushing rim, washout flush action, 3/4 in top spud, integral strainer, and a
+    // 1-1/2 in tubing tailpiece BOTTOM outlet. "Universal" is American Standard's
+    // word for the flush range it will work over, 0.125 to 1.0 gpf.
+    //
+    // W/D = 1.00 EXACTLY, the only fixture in the library that is square in plan.
+    // American Standard print D x W x H (Trap 46), so ordinarily this triple would
+    // need a second publisher to disambiguate — here the first two numbers are equal
+    // and only the height can be misread, and 18 in is confirmed independently.
+    //
+    // NO INTEGRAL TRAP. That is the difference between this and every other bowl in
+    // the set, and it is visible from the front: the china ends in a flat-ish base
+    // and a 1-1/2 in tailpiece hangs out of it into a separate P-trap below. The
+    // casting therefore must NOT be drawn to a nose (`bottomExtension` 0.025,
+    // `bottomTaper` 0.85) — the nose is where a concealed trap lives, and this
+    // fixture does not have one.
+    params: P({
+      // 457 mm overall = 0.404 + 0.028 + 0.025. The shortest fixture in the library
+      // by 91 mm, against the 548 mm slab. Note that being short is NOT what tells it
+      // apart in the picker: the thumbnail is framed to the card, so absolute size is
+      // normalised away and only the silhouette and the caption carry it. What reads
+      // at 126 px is the square plan, the hard edges and the tailpiece hanging below.
+      rimHeight: 0.404,
+      // 324 mm published projection, less the 0.014 setback and the 24 mm of lip
+      // skin this casting actually carries — see the note on `compact-egg`'s
+      // `bowlDepth`, which is the same correction. Trap 47's quoted ~43 mm is a
+      // full-size figure and it is 19 mm out on a thin-walled compact body.
+      bowlDepth: 0.286,
+      backWallMode: 'concave',
+      // Swept forward hard for the size of the fixture — a washout bowl's back wall
+      // runs down into the washout floor rather than meeting it at a corner. 90 mm
+      // is inside the `drainZ * 0.75` = 129 mm cap `buildProfile` applies.
+      backWallRun: 0.09,
+      // 324 mm published, less the 52 mm of casting across the two sides.
+      widthRim: 0.272,
+      // A broad washout floor, not a funnel: the flush sheets down the back wall and
+      // has to carry across the floor to the outlet, and there is no gravity funnel
+      // doing the work as there is on the waterless unit.
+      widthSump: 0.16,
+      // Trap 9: 0.239 / 0.272 = 0.879.
+      widthLip: 0.239,
+      // Delayed taper, which is what keeps the side walls parallel most of the way
+      // down instead of flaring into a funnel. Together with the wrap exponent below
+      // this is the whole of "boxy".
+      taperExponent: 2.8,
+      // ENCLOSURE MEASURED AGAINST THE WIDTH, WHICH IS THE RATIO THAT MATTERS. The
+      // side edges stand 240 mm forward on a 272 mm-wide bowl, 0.88 of the width, and
+      // that is the highest figure in the library — ahead of the generated shape
+      // (0.87), which was built deep on purpose, and well ahead of every other
+      // product (shielded bowl 0.65, slab 0.59, waterless 0.47, compact egg 0.46,
+      // stall 0.37, trough 0.03).
+      // On a fixture that is square in plan those shields are not styling, they are
+      // most of the object: a 324 mm urinal with 324 mm of projection is nearly a box
+      // with one face open, and Trap 9 says enclosure governs how much splash leaves
+      // sideways. This is the high end of that axis and `compact-egg` is the low end,
+      // at the same width.
+      //
+      // Against the bowl DEPTH it is 0.84, which is close to but not the highest in
+      // the library — `classic-bowl` is 0.89. Both ratios are worth having: depth
+      // says how far the shields reach relative to the fixture, width says how nearly
+      // closed the section is, and only the second predicts side spill.
+      wrapDepth: 0.24,
+      // High, so the middle of the wall stays flat and turns up sharply into the
+      // sides — a squarish plan section rather than a U. This is the plan-shape
+      // half of the hard-edged look; `sectionSmoothing: 0` is the casting half.
+      wrapExponent: 4.5,
+      wrapDecay: 0.6,
+      throatHeight: 0.05,
+      sumpDepth: 0.028,
+      sumpSlope: 0.1,
+      sumpFrontFraction: 0.72,
+      // Forward, per Trap 25. Ceiling is 0.286 * 0.72 - 0.03 = 176 mm; 4 mm under it
+      // so the profile does not report itself clamped.
+      drainZ: 0.172,
+      // 1-1/2 in tailpiece behind a strainer.
+      drainRadius: 0.023,
+      frontLipHeight: 0.16,
+      // Nearly none. The rim of this fixture is a crisp square edge, not a rolled
+      // curl over the bowl.
+      frontLipInturn: 0.012,
+      // ADA mounting, matching `compact-egg` so the two compact fixtures can be
+      // compared without the posture moving underneath the comparison — and for the
+      // same measured reason. American Standard dimension this one 24 in to finished
+      // floor with an "optional" lower line; walking v from 0.08 to 0.48, the standard
+      // mounting reads 83 degrees down to 72 where this one reads 64 down to 59 — 14
+      // to 20 degrees apart at every point, and it never gets below 72 anywhere. A
+      // 457 mm-tall fixture hung at 610 mm is entirely above the stream.
+      //
+      // 0.676 = 432 mm to the front lip plus 244 mm of body above it.
+      rimAboveFloor: 0.676,
+    }),
+    shell: {
+      // Zero, for the same reason the slab and the trough are zero: the plan section
+      // is squarish and relaxing it toward a circle throws that away.
+      sectionSmoothing: 0,
+      bulge: 0.0,
+      clearance: 0.012,
+      wallThickness: 0.026,
+      rimThickness: 0.024,
+      rimBandWidth: 0.03,
+      backSetback: 0.014,
+      // Almost no body below the bowl, and a base that stays wide. See the note
+      // about the missing integral trap above — this is the shape difference that
+      // records it.
+      bottomExtension: 0.025,
+      bottomTaper: 0.85,
+    },
+    fittings: {
+      // The exposed tailpiece: 1-1/2 in tube is 19 mm outside radius against the
+      // default 24, and it hangs a little further than the others because it has to
+      // reach a trap that is not inside the fixture.
+      //
+      // Worth knowing that this is the ONE preset where the spud below the fixture is
+      // literally what the product has. Everywhere else it is a simplification — the
+      // Washbrook, the TOTO and the Falcon all take their waste back through the wall
+      // — and only here is it the actual connection. Kept to 110 mm rather than the
+      // 135 it was first given: on a body only 457 mm tall a longer tube reads as a
+      // fixture on a stick, and the reference photograph shows a short stub.
+      spudRadius: 0.019,
+      spudDrop: 0.11,
+    },
+    // 59 degrees, and the flattest fixture in the library to aim at: the whole band
+    // from v = 0.08 to 0.48 spans 64 down to 59, and 0.36-0.48 is 59 throughout.
+    // 0.42 sits in the middle of that plateau rather than at either end.
+    //
+    // THE STEEPNESS IS THE RESULT, NOT A TUNING FAILURE, and it is worth stating
+    // because 59 degrees is twice the 30-degree criterion. This is a 286 mm-deep
+    // bowl with 404 mm of back wall on a body only 457 mm tall, so from any posture
+    // the stream arrives close to the wall's normal wherever it lands, and there is
+    // no part of the wall that is meaningfully better than another. The reachable
+    // spread is 25 degrees against the compact egg's 37 and the stall's much wider
+    // band — aim is nearly powerless on this fixture, which is exactly what makes
+    // its enclosure worth measuring separately from its wall.
+    defaultAimV: 0.42,
   },
 ];
 

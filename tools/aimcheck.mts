@@ -26,7 +26,7 @@
  *   npx tsx tools/aimcheck.mts trough     one preset, with the full band map
  */
 import { PRESETS, getPreset } from '../src/geometry/presets';
-import { Simulation, defaultConfig, SimConfig } from '../src/sim/simulation';
+import { applyPreset, Simulation, defaultConfig, SimConfig } from '../src/sim/simulation';
 
 const args = process.argv.slice(2);
 const only = args.find((a) => !a.startsWith('--'));
@@ -37,9 +37,7 @@ const SWEEP_STEP = 0.5 / 12;
 const configFor = (id: string, v: number): SimConfig => {
   const p = getPreset(id);
   const c = defaultConfig();
-  c.surface = { ...p.params };
-  c.casting = { ...(p.shell ?? {}) };
-  c.fittings = { ...(p.fittings ?? {}) };
+  applyPreset(c, p);
   // The coarse grid: this is a geometry question, and the casting -- which is what
   // does the blocking -- is fitted from the interior at whatever resolution it is
   // given. 48x96 is what the validation suite uses.

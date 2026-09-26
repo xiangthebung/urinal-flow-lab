@@ -18,7 +18,10 @@ because each item in them cost real time to find, and most of them look correct.
 | `npm run shoot` | Screenshot the **running app** headlessly. See below. |
 | `npm run render` | Offline render of the fixture **meshes only**. Fast, but not the product. |
 | `npx tsx tools/fixture-lab.mts <id> [--full] [--out x.png]` | **Shape a fixture.** Merges `tools/tuned/<id>.json` over a preset, prints the admissibility metrics, writes a 4-view PNG. `--full` runs all four grid resolutions. |
-| `npx tsx tools/thumbsheet.mts [--scale 3] [--out x.png]` | **Check the picker.** Contact sheet of all six thumbnails, rendered by calling `renderFixtureThumbnail` — the function the cards call — and composited on the panel's own background. Prints ink coverage and mean luminance per card. |
+| `npx tsx tools/diag-jet.mts <preset>` | **What the jet is at the wall.** Exit speed and diameter across the flow curve against the traced path, the live particle census by provenance, the cell metric and the deposition footprint in cells, and the film thickness *distribution* -- which is the number that matters, because every appearance cue is nonlinear in it. |
+| `npx tsx tools/diag-coherent.mts` | Sweeps stand-off x aim over all eight presets and asks whether the wall is ever inside the breakup length. It is not: see Trap 63. |
+| `npx tsx tools/wetcontrast.mts <liquid.png> <dry.png>` | **Is the liquid visible?** The same view in `Liquid` and in `Dry` -- same geometry, same lighting, `uLiquid` at zero -- differenced over the pixels the fixture occupies. The project's only pixel-level measurement, and the one that showed the wetted bowl differing from a dry one on 4% of pixels by an average of 0.3 of a level. |
+| `npx tsx tools/thumbsheet.mts [--scale 3] [--out x.png]` | **Check the picker.** Contact sheet of all eight thumbnails, rendered by calling `renderFixtureThumbnail` — the function the cards call — and composited on the panel's own background. Prints ink coverage and mean luminance per card. |
 
 `fixture-lab` is the right tool for geometry work: no browser, a second per iteration,
 and it prints the numbers that decide whether a shape is legal rather than only
@@ -27,9 +30,13 @@ subagents) can shape different fixtures without touching `presets.ts` or each ot
 
 `npm run shoot` needs `npx playwright install chromium` once (~88 MB).
 
-Useful flags: `--models classic-bowl --t 0.9,6.8 --cameras threeQuarter,front,side,top
+Useful flags: `--models classic-bowl --t 0.9,6.8 --cameras threeQuarter,front,side,top,userEye,contact
 --field dry|liquid|impingement|... --overlays zones=0,heatmaps=0,streamPath=0,shell=0
---stage --out tools/shots/x`. Times are **simulated** seconds, so shots are reproducible.
+--aim 0.55 --stage --out tools/shots/x`. Times are **simulated** seconds, so shots are
+reproducible. `--aim` walks the aim down the profile: without it every screenshot this
+project has ever taken was of a preset's own default, and the rim strike -- the worst
+outcome available -- could not be photographed. `contact` is the close camera on the
+impact point.
 
 ---
 
@@ -86,11 +93,15 @@ geometry/   profile   sagittal 2-D section (ProfileParams, buildProfile)
             shell     exterior casting (ShellParams, buildShell -> ShellMesh)
             fittings  flush valve, supply pipe, outlet spud — SOLID, collidable
             collider  SolidCollider / MeshCollider / CompositeCollider
-            presets   the 6-model fixture library
+            presets   the 8-model fixture library
             bvh       ray/triangle acceleration
 sim/        simulation  owns surface + casting + castingCollider; SimConfig
             stream, particles, impact, film, capture, metrics
 render/     sceneView, fixtureView, dropletView, streamView, colormap
+            washroom    the room the wet glaze reflects. A physical input, not
+                        set dressing: see Trap 56
+            stainView   liquid on the *outside* of the casting, which has no film
+                        grid to live on. Trap 65
             softRaster  software rasteriser shared by thumbnails and tools/preview
 ui/         app, controls, charts, thumbnail, automation
 validation/ suite (60 checks), runCli
@@ -147,30 +158,80 @@ tools/      shoot.mts      headless screenshots of the running app
   ceramic. See Trap 15.
 - **Volume closure is validated at 0.0000%.** If a change makes liquid appear or
   vanish, that check fails. Treat it as the strongest signal in the suite.
-- Presets are shared objects. Always copy on load: `{ ...getPreset(id).params }`.
-  `src/ui/app.ts` does this for both `surface` and `casting`.
+- **`applyPreset(config, preset)` is the only way to put a fixture into a config.**
+  `src/sim/simulation.ts`. The "copy the surface, the shell and the fittings" idiom
+  was written out at nine call sites and Trap 43 is the story of one of them being
+  incomplete -- the headline A/B built its two controls from `preset.params` alone, so
+  both wore the *default* bowl's casting and metalwork. Adding a fourth per-preset
+  field (`water`: the trap seal and the flush) would have set the same trap again, so
+  there is one function now and the call sites cannot drift. Presets are shared
+  objects; it copies rather than aliasing.
+- **The appearance of the liquid is physics, and it is measured.** Every cue is
+  nonlinear in film thickness, the solver reports a mean over cells 3.7-55 mm across,
+  and wet white glaze is only 16% darker than dry -- so the wetted region cannot be
+  shown by darkening it, and the reflection has to carry it. That needs an
+  environment, a room worth reflecting and a tone curve, and the absence of all three
+  is what made the bowl look like wetted cardboard. Traps 55-58. `tools/wetcontrast.mts`
+  is how to check a change here; `npm run validate` cannot see any of it.
 
 ---
 
 ## The fixture library
 
-`src/geometry/presets.ts` — 6 models, chosen to be told apart at a glance.
+`src/geometry/presets.ts` — 8 models, chosen to be told apart at a glance.
 
 `classic-bowl` · `flat-wall` (square slab, also the flat-wall splash control) ·
-`stall-urinal` · `trough` · `compact-waterless` · `nautilus-tall` (constant-angle).
+`stall-urinal` · `trough` · `compact-waterless` · `nautilus-tall` (constant-angle) ·
+`compact-egg` · `square-washout`.
 
-Four of them are now dimensioned against named real products, and the reference is
+Six of them are now dimensioned against named real products, and the reference is
 recorded in the preset's comment so it can be checked rather than trusted:
 
 | preset | reference product | envelope W×D×H mm | published |
 |---|---|---|---|
-| `classic-bowl` | American Standard Washbrook 6501.010 wall-hung washout | 470×364×692 | 470×355×692 |
-| `stall-urinal` | American Standard Stallbrook 6400.001 / Kohler Branham K-25039-T | 458×382×972 | 457×381×972 |
-| `trough` | Pland Bruges TR1500P wall-hung stainless | 1491×317×550 | 1500 × 220–300 × 440–593 |
-| `compact-waterless` | Falcon Waterfree F-4000 (= Sloan WES-1000 body) | 391×357×576 | 492×657×366 as W×H×D |
+| `classic-bowl` | American Standard Washbrook 6501.010 wall-hung washout | 480×364×692 | 470×355×692 |
+| `stall-urinal` | American Standard Stallbrook 6400.001 / Kohler Branham K-25039-T | 463×382×973 | 457×381×972 |
+| `trough` | Pland Bruges TR1500P wall-hung stainless | 1493×317×550 | 1500 × 220–300 × 440–593 |
+| `compact-waterless` | Falcon Waterfree F-4000 (= Sloan WES-1000 body) | 397×357×576 | 492×657×366 as W×H×D |
+| `compact-egg` | TOTO UT104E compact washout, 0.5 gpf, 3/4 in top spud | 330×356×552 | 330×356×552 (13×14×21¾ in) |
+| `square-washout` | American Standard Maybrook 6581.001 universal washout | 324×324×457 | 324×324×457 (12¾×12¾×18 in) |
 
 `flat-wall` is a deliberate control rather than a product, and `nautilus-tall` is
 generated, so neither is dimensioned to a catalogue.
+
+**The two compact entries are the compact size class, which is not a smaller version
+of the full-size one.** Full-size US bowls are 1.2–1.35 wider than deep because ANSI
+A117.1 pins the projection at a 343 mm minimum while the width is free, so the class
+piles up just above that floor. Compact fixtures sit at **W/D 0.93–1.01** — Kohler
+Dexter 343×368, Zurn Z5738 368×365, TOTO UT104E 330×356, AS Maybrook 324×324 —
+because they are as deep as the code demands and no wider. **The aspect check in
+Trap 46 therefore does not apply to them**, and applying it would "correct" a real
+fixture into one nobody makes. Both presets carry the ratio in their comments for
+exactly that reason.
+
+Both hit their published envelope **exactly** at 56×104 and above, which is the first
+time any preset here has. That is not luck — it is Trap 47's arithmetic run forwards
+and then corrected once against `fixture-lab`, and the correction was needed: see the
+per-fixture skin note now in that trap.
+
+What each new one is for:
+
+- **`compact-egg`** is the low end of the enclosure axis: a small bowl with **no
+  privacy sides at all** (`wrapDepth`/`widthRim` = 0.46). The library had no shieldless
+  product, and `classic-bowl`'s own shell comment describes the long narrow nose as
+  belonging to "the compact egg class … a different product and a different
+  silhouette" while refusing it — nothing then had one. This is that product, and it is
+  the only preset with the nose, the only one with `sectionSmoothing: 3` earned rather
+  than tuned away, and the only one with **no outlet spud** (concealed integral trap,
+  waste back through the wall).
+- **`square-washout`** is the high end of the same axis: side edges 240 mm forward on a
+  272 mm-wide bowl, **0.88 of the width, the highest figure in the library** — ahead of
+  the generated shape (0.87), which was built deep on purpose. Same class and near
+  enough the same width as `compact-egg`, so **the pair isolates what enclosure alone
+  is worth**, which is a comparison the library could not make before. It is also the
+  only fixture that is exactly square in plan, the shortest at 457 mm, and the only one
+  whose outlet spud is literally what the product has (1½ in bottom tailpiece, no
+  integral trap).
 
 **The library is the North American commercial range, on purpose.** That decision used
 to be implicit and was therefore made wrongly: US bowls carry integral privacy sides and
@@ -200,21 +261,51 @@ Two per-preset fields carry things that genuinely differ by model:
 
 - **`fittings?: Partial<FittingsParams>`** — `compact-waterless` sets
   `flushValve: false`, because a waterless urinal has no water supply at all and the
-  absence of a flushometer *is* the product. The trough and the stall adjust
-  `pipeRise` for their height.
+  absence of a flushometer *is* the product. `trough` is sparged rather than flushed.
+  The trough and the stall adjust `pipeRise` for their height. **`compact-egg` sets
+  `outletSpud: false`** — it has a concealed integral trap and takes its waste back
+  through the wall, so nothing hangs below the china; **`square-washout` is the
+  opposite**, a 1½ in bottom tailpiece into a separate trap, and the only preset where
+  the spud below is what the product actually has rather than a simplification.
 - **`defaultAimV?: number`** — one global fraction cannot mean the same thing on a
   290 mm trough and a 974 mm stall. At the old shared 0.18 the stall was struck at
   **75°**, near normal incidence and the worst angle on the fixture, purely because
   the same fraction lands somewhere else on a fixture three times the height. Measured
-  angle-vs-aim, the defaults are: classic-bowl 0.26 (55°), flat-wall 0.34 (33°),
-  stall 0.50 (42°), trough 0.22 (52°), compact 0.26 (63°), nautilus 0.18 (25°).
-  Two are worth knowing: the oval bowl is 55° *anywhere* from v = 0.10 to 0.38 — it is
-  a uniformly steep target, which is the mechanism its `expectation` text describes —
-  and the trough has so little wall that v = 0.30 already reads 80°.
-  **`compact-waterless` is now 0.12, not 0.26** — 0.26 was inside the band its own
-  casting blocks, so the preset could not be aimed into at its own default. See Trap 44,
-  and re-check `traceAim().blocked` at every preset's default after any casting or
-  posture change.
+  with `tools/aimcheck.mts` on 2026-08-09, the defaults are: classic-bowl 0.26 (53°),
+  flat-wall 0.34 (34°), stall 0.50 (43°), trough 0.48 (55°), compact-waterless 0.34
+  (54°), nautilus 0.18 (25°), compact-egg 0.40 (49°), square-washout 0.42 (59°).
+  *(That list previously read "trough 0.22 (52°), compact 0.26 (63°)" and said
+  compact-waterless was 0.12 — all three had moved in the code and the text had not.
+  Re-read it off `aimcheck` rather than trusting it.)*
+  Three are worth knowing: the oval bowl is ~53° *anywhere* from v = 0.10 to 0.38 — it
+  is a uniformly steep target, which is the mechanism its `expectation` text describes;
+  `square-washout` is flatter still and worse with it, **59° across the whole of
+  v = 0.36–0.48 and never below 59 anywhere**, because it is a deep bowl on a very
+  short body so the stream meets the wall near its normal wherever it lands; and
+  `compact-egg` falls monotonically to a 49° plateau at 0.38–0.44 and then cliffs to
+  86° by 0.56 as the trace leaves the wall.
+  Re-check `traceAim().blocked` at every preset's default after any casting or
+  posture change (Trap 44), and keep the default a full sweep step clear of both a
+  blocked aim and a discontinuity (Trap 45).
+
+**`rimAboveFloor` is a physics input, not an install note, and on a short fixture it
+outweighs the shape.** Catalogues give two mounting heights — 610 mm floor-to-rim
+standard, 432 mm for ADA — and which one a preset carries moves the whole impingement
+band, because a fixture mounted above the stream's exit is struck near its normal
+everywhere. Measured on the two compact entries with nothing else changed:
+
+| preset | v walked | at 432 mm (ADA) | at 610 mm (standard) | gap |
+|---|---|---|---|---|
+| `compact-egg` | 0.08 → 0.44 | 59° → 49° | 76° → 60° | 11–17° |
+| `square-washout` | 0.08 → 0.48 | 64° → 59° | 83° → 72° | 14–20° |
+
+The gap is widest at the top of the wall and never closes, and it costs more than any
+shape change either preset could absorb. Three of the eight are therefore on the accessible mounting —
+`compact-waterless`, `compact-egg`, `square-washout` — and all three are compact
+fixtures, which is also what a real washroom looks like, since the compact unit is
+usually the low one in the row. **When adding a fixture, measure both heights before
+picking one**; `compact-waterless` reached 89/87/85/80° at the standard height, which
+is Trap 44's condition arrived at by mounting rather than by depth.
 
 **`src/validation/suite.ts` hardcodes the ids `classic-bowl`, `flat-wall` and
 `nautilus-tall`.** Renaming or removing them breaks the suite. `flat-wall` must keep a
@@ -387,11 +478,13 @@ saturating at 30 µm which is *below* the retention thickness, so every cell the
 had ever touched read as fully wet and no contact line existed anywhere. And the
 capillary-wave term was isotropic `sin/cos` noise on three axes, which is what a rough
 absorbent surface looks like; injecting wall-jet momentum made it worse because its
-amplitude follows film speed. Now: the mask is referenced to
-`FilmParams.retentionThickness` via the `uWetOnset` uniform, the ripple is applied along
-the flow direction only, and there is an `aEdge` vertex channel carrying a meniscus
-highlight computed on the solver's grid (a wet cell with a much drier neighbour), which
-is resolution-independent.
+amplitude follows film speed. The mask was then referenced to the solver's dry threshold via the
+`uWetOnset` uniform, the ripple was applied along the flow direction only, and an
+`aEdge` vertex channel carried a meniscus highlight computed on the solver's grid.
+**All three have since been superseded by Trap 66**, which found that the remaining
+stain-like quality was not a shading-model fault at all but a *reconstruction* fault:
+the liquid was being interpolated per vertex, and a per-vertex field has no continuous
+slope for the shading to read.
 
 **20. Statistics about "the stream" must exclude re-impacting splash.**
 `actualImpingement()` was volume-weighted over every impact of every generation.
@@ -460,6 +553,20 @@ boundary halved it to 8.4%.
 > the stall and 1.99% on compact. Two agents measured that residual independently, by
 > different methods, and agreed to 0.03 percentage points before either changed
 > anything — which is what made the prediction worth acting on.
+>
+> **Six of eight are exactly 0.0 µL; `square-washout` is 16–20 µL (0.006%) and that is
+> physical.** The six originals and `compact-egg` read 0.0–0.4 µL of 285–300 mL. The
+> one that does not was diagnosed rather than tuned: it is **insensitive to `wrapDepth`
+> (0.24/0.22/0.20 give bit-identical spill) and to `wrapExponent`, and scales inversely
+> with the bowl width** — 16.5 µL at `widthRim` 0.272, 3.9 at 0.34, 1.2 at 0.42, and
+> `compact-egg` narrowed to 0.24 starts spilling too. So it is not a hole in the
+> geometry: it is the wall jet reaching the top edge of the side shield with momentum
+> left, on the narrowest interior in the library struck at the steepest angle in it
+> (59°). Stable across seeds (16.5 / 16.1 / 19.9 µL). Left alone, because moving the
+> fixture off its published 324 mm width to chase 16 µL would be tuning the product to
+> flatter the metric. **The tripwire still works — treat anything above ~0.05% as the
+> Trap 52 failure returning, and anything that appears on a *wide* preset as a bug
+> whatever its size.**
 
 **24. Anything that removes liquid must be added to the closure sum.**
 `Metrics.escapedVolume` was declared, reset and *reported* — but never
@@ -691,6 +798,18 @@ it is deep, and W/D under 1 should have been read as a contradiction of the "ext
 sides for privacy" bullet on the same sheet. Cross-check every triple against a second
 manufacturer publishing the same fixture, and prefer sheets that label their axes.
 
+> **The ratio check is FULL-SIZE ONLY, and using it on a compact fixture inverts it.**
+> The compact class runs W/D 0.93–1.01 — TOTO UT104E 330×356 (`compact-egg`), AS
+> Maybrook 324×324 (`square-washout`), Kohler Dexter 343×368, Zurn Z5738 368×365 — so
+> a compact sheet reading 13 × 14 in is the fixture, and "correcting" it to 14 × 13
+> builds something nobody makes. The rule that survives both cases is the *mechanism*,
+> not the ratio: ANSI A117.1 pins the projection at ≥343 mm and leaves the width free,
+> so **depth clusters just above 343 for every class and only the width varies**. Check
+> the depth against 343–390 first; a triple whose smallest number is under 340 or whose
+> depth is over 400 is the one to distrust. TOTO's own drawing dimensions the 13 in
+> across the front elevation and the 14 in from the finished wall on the side, on the
+> same page, which is what made this one safe to take at face value.
+
 **47. `bowlDepth` is measured from the profile datum, not the finished wall.**
 `backSetback` puts the back face ~45 mm behind the datum and the casting adds ~43 mm of
 skin, so **projection from the wall is `bowlDepth + ~88 mm`**. A published projection
@@ -700,6 +819,16 @@ projection, and the existing 0.294 was **already giving 382 mm and was right to 
 millimetre**; 0.381 would have made it 463 mm, deeper than any stall urinal made. The
 defect was at the *other end* — 277 mm of projection at the top against a published 203 —
 and the lever was `wrapDepth`. Measure the silhouette before changing a depth.
+
+> **The ~88 mm is per-fixture, and the skin half of it is not a constant.** The setback
+> is whatever `backSetback` says (14–45 mm across the library), and the lip skin is
+> capped at `wallThickness`, so on the two thin-walled compact castings it measures
+> **23–24 mm, not ~43**. Building `compact-egg` from the quoted figure came out 20 mm
+> shallow and `square-washout` 19 mm shallow — both would have shipped inside the
+> tolerance a catalogue is usually read to. The reliable procedure is not better
+> arithmetic: **build it, read `W × D × H` out of `fixture-lab`, correct `bowlDepth` by
+> the residual once, and re-read.** Both now land on their published projection exactly
+> (356 and 324 mm) at 56×104 and above.
 
 **48. A `W × D × H` envelope cannot express a taper, which is how a wrong one survives.**
 Every stall urinal in production slopes: American Standard Stallbrook 381 mm at the base
@@ -822,26 +951,263 @@ changing: `cellDu`, `cellArea` and both face lengths are measured off the vertic
 metric followed the spacing on its own, and volume closure at 0.0000% is the check that
 would have caught any disagreement instantly.
 
+**55. Rendering the *mean* of a distribution is not rendering the distribution, and
+every cue for liquid is nonlinear.** The film solver reports one thickness per cell
+and the cells are 3.7 to 55 mm across on the default bowl. A film running down glaze
+is not spread evenly over anything that size: surface tension gathers it into
+rivulets about two capillary lengths apart -- 4.7 mm for urine on china -- a few
+tenths of a millimetre deep, with merely damp glaze between them. A cell reporting
+20 um mean is a 0.35 mm rivulet over a twentieth of its width. Beer-Lambert, the
+wet/dry ramp and the gloss are all nonlinear in thickness, so evaluating them at the
+average gives the *wrong* answer rather than a blurred one. `fixtureView` now shades
+the cell as what it is -- coverage `h / h_rivulet` of real rivulet, the rest residual
+film -- with the pattern filtered against `fwidth` so that where the rivulets fall
+below the sampling rate it converges to its own area average instead of into moire.
+The first attempt at this had no filtering and drew the wall as a dashed camouflage
+pattern, which looked like a geometry fault and was aliasing.
+
+**56. Wet white glaze is barely darker than dry, and building the appearance on the
+darkening is what makes it look like cardboard.** The shader multiplied the albedo by
+`1 - 0.42 * wet`. The real mechanism is that light entering the layer is scattered by
+the ceramic and mostly turned back at the water-air interface -- internal diffuse
+reflectance about 0.47 for n = 1.33 -- so it has to try again. On a *dark* substrate
+each extra pass is another chance to be absorbed and the surface goes markedly
+darker; on a white glaze almost nothing is absorbed per pass, and
+`a (1-R) / (1 - R a)` takes a 0.78 albedo to 0.65, a ratio of 0.84. A large diffuse
+darkening with a soft edge is precisely the appearance of a wetted *absorbent*
+surface, which is exactly how this was reported: "it looks like wetting of
+cardboard". **The cue has to be the reflection**, and three things were stopping it:
+
+- **There was nothing to reflect.** `scene.environment` is a PMREM in three's CubeUV
+  layout, readable only through the chunks a built-in material includes; the wetted
+  interior is a raw `ShaderMaterial` because it carries six per-vertex data channels,
+  so it could see none of it. `render/washroom.ts` now builds the room once and it is
+  used twice -- PMREM for the casting and the chrome, and a 128 cube for the interior.
+- **The room was three's `RoomEnvironment`,** a photographic studio. A fixture
+  reflecting a softbox does not look like plumbing, and its scale is arbitrary: PMREM
+  convolves its 17-to-100 emitters into an irradiance of order one while a raw cube
+  capture carries them at face value, so the two paths came out two orders of
+  magnitude apart and the interior blew to white.
+- **There was no tone mapping.** A luminaire runs tens of times the radiance of the
+  wall it lights, and its reflection in a wet film arrives multiplied by a Fresnel
+  term of three or four percent at the angles a urinal is seen from. Clamping at 1.0
+  makes such a source impossible, so the room has to be built dim to fit, and a dim
+  room reflects as nothing. `ACESFilmicToneMapping` at exposure 0.80, and the shader
+  calls three's own `toneMapping()` -- which three prefixes into every non-raw
+  `ShaderMaterial` -- rather than a second copy of the fit. Pasting in a copy failed
+  to compile with "function already has a body", which is the compiler catching the
+  duplication before it could drift.
+
+**57. The interior's key light was a headlamp, and its own numbers said so.**
+`vNormal = normalMatrix * normal` is a *view*-space normal, while `uLightA`/`uLightB`
+were (0.38, 0.81, 0.48) and (-0.62, 0.31, 0.72) -- the scene's own key and fill
+directions in *world* space, matching to two decimals, so the intent is not in
+question. The highlight was therefore pinned to the screen and the interior had no
+fixed relation to the light, while the casting a few millimetres away, a
+`MeshStandardMaterial`, lit correctly. Two halves of one ceramic object shading
+inconsistently is most of why the wetted basin read as flat next to a solid-looking
+exterior. `FixtureView.setLights` now takes the scene's actual light objects, so
+there is no second copy to drift. Related and in the same shader: it wrote its
+working values straight to an sRGB framebuffer with no encode, so the interior was
+also on a different transfer function from everything else. It is linear throughout
+now and encodes once at the end.
+
+**58. Optical wetness is not hydrodynamic retention.** The wet ramp ran from 12.5 to
+45 um -- a quarter to nine tenths of `retentionThickness`, the layer a vertical wall
+keeps once it stops draining. That is a real threshold and the wrong one: a surface
+is optically wet as soon as it carries a continuous layer, a fraction of a micron, at
+which point the interface the light meets is water. Measured on the default bowl at
+peak flow, the wall runs 20 to 150 um over 27% of its area and 73% is under 2 um, so
+much of the liquid sat below the foot of the old ramp. It is now referenced to
+`FILM_DRY_THICKNESS`, which is the solver's own definition of a dry cell and the
+threshold `wettedArea()` reports against, so the picture and the metrics use one
+number.
+
+**59. The outlet was an orifice, not a trap, so a water seal could not exist.** The
+drain discharged `Cd sqrt(2 g h)` on the local head, which empties a cell to nothing
+-- eight millimetres of seal placed in the sump was gone in about thirty
+milliseconds, before the first parcel arrived. A trap passes what arrives *over its
+weir* and keeps the rest. `FilmSolver.sealThickness` is that weir, and it is also the
+per-cell floor for `excessVolume`, because liquid a fixture is designed to retain is
+not a drainage failure and counting it as one reports every sealed fixture as never
+clearing. Consequence worth knowing: `classic-bowl` now stands about 130 mL in its
+sump, so impacts there meet `h/d` of order ten and take the wetted branch clamped at
+`WET_SPLASH_K_FILM_MAX_DELTA` (Trap 22) instead of the dry one.
+
+**60. A flush that is the same liquid as the void makes the bowl dirtier.** The
+flushometer and the trough's sparge were solid collidable geometry that never emitted
+a drop, so `residenceTime` and `stagnantArea` were reported for a fixture that is
+never washed down. Adding the flush as a flux into the `v = 0` row is right -- a rim
+spreader hands a film to the top of the wall, it is not a jet, and the Nusselt
+balance already in the solver sets the sheet at about 0.6 mm on its own. But with one
+fluid the wash-down was more of the same liquid: Beer-Lambert over a thicker layer
+gave *more* colour and rinsing made the bowl look worse. `FilmSolver.hs` carries the
+voided fraction as a tracer on the same donor-cell fluxes as the thickness, the flush
+and the seal go in at concentration 0, and the tint is `path length x concentration`.
+The tracer is deliberately **absent from the closure sum** -- it is a tracer, not a
+volume, and adding it would count the same millilitres twice. The seal and the flush
+*are* in the sum, as `Metrics.introducedVolume`, and are kept out of `emittedVolume`
+because that is the denominator of every microlitre-per-litre figure here.
+
+**61. The deposition footprint was measured in cell indices, and the grid is not
+isotropic.** `depositJet` rounded the physical radius to whole cells in u and in v,
+clamped both to three, and then normalised the offsets by those index extents -- so
+the patch was an ellipse in *index* space of whatever aspect the grid had there. With
+`cellDu` 3.7-55.3 mm against `cellDv` 1.5-12.1 mm, one 12 mm footprint came out
+between 0.22 and 3.22 cells across in u and 0.99 to 7.90 in v, and collapsed to a bar
+one cell wide wherever a rounding hit zero. The arms of the cross in the `Film
+thickness` view start there. Offsets are now taken in metres. Related, in the same
+place: a droplet was given a flat 0.75 d of wetted radius, which is what a drop that
+arrives and *stops* would cover. An impacting drop flattens to `beta_max d` with
+`beta_max ~ 0.87 We^0.25`; at the wall Weber number of about 48 measured here that is
+1.15 d, three times the area, and depositing into one cell instead makes a spike the
+advection scheme has to smear away -- which is the soft soaked-in edge again.
+
+**62. A satellite that spawns inside its parent stays there.** `ParticleSystem.step`
+pushed the pinch-off with the parent's exact position *and* velocity, so the two rode
+inside one another for the whole flight -- visible at 4x zoom as a pale blue dot in
+the middle of every yellow drop, which is where the model put it rather than a
+rendering artefact. A satellite is the collapse of the ligament *between* two main
+drops: half a wavelength behind, and slower than either neighbour, which is why a
+real droplet train spreads along its length instead of travelling as a rigid chain.
+The wavelength needs no storing -- a coherent parcel is one wavelength of jet, so
+`lambda = 4V / (pi d^2)` from the volume it carried and the jet diameter.
+
+**63. The coherent-jet deposition branch cannot be reached from any control.**
+Measured with `tools/diag-coherent.mts` over all eight presets, stand-offs of 2 to
+20 cm and 41 aim points: the longest breakup length anywhere on the flow curve is
+**21.1 cm**, and the shortest traced path to the interior is **25.5 cm** (the trough;
+`classic-bowl` 45.1). So `ev.coherent` is never true at an interior impact, and
+`jetSplashAttenuation`, `wallJetEfficiency` and the `jetFootprintRatio` arm of
+`depositJet` -- the whole Trap 18 mechanism -- are inert there. **This is left in
+place deliberately**, because it is physically correct: a human stream at a real
+stand-off does arrive as a droplet train, which is Trap 18's own point and the regime
+the PNAS work addresses. It still fires on the *casting*, which stands only about
+12 cm from the exit. What was wrong was not knowing, so it is measured now. Same
+defect class as Traps 38 and 50 -- assert on a count of the thing happening -- and
+`disturbanceRatio` is not a way out: breakup length goes as `ln(1/eps)`, so doubling
+21 cm needs a lab nozzle at 0.0025 rather than a human meatus at 0.05.
+
+**64. A marker larger than the thing it marks is not a scale reference.** The exit
+point was drawn as a 12 mm sphere over a 3 mm jet, so at every camera preset the
+marker was clearly visible while the liquid was a one-pixel hairline. All fixed: the
+marker is 3 mm, the jet has a 2.2 mm floor on its drawn radius so it survives
+antialiasing without being scaled anywhere it is genuinely wider, and there is a
+`Contact` camera framing 180 mm on the traced impact point -- the subject of the
+tool, which no view showed. 180 mm rather than 90: the film lives on cells 3.7 to
+55 mm across, so at 90 mm you are looking at two of them and the ceramic goes to a
+blur. The tube also carries the varicose necking now, which costs nothing --
+`solveBreakup` already returns the wavelength and each parcel carries its
+`timeToBreakup`, so the amplitude is `eps0 exp(omega t)` and reaches the jet radius
+exactly at pinch-off by the definition of `breakupTime`.
+
+**65. Liquid on the outside of the casting had physics and no picture.** Trap 14 made
+the exterior splash properly and left the remainder booked to a capture zone with
+nowhere to be drawn, because the film grid stops at the interior. So the worst
+outcome the tool exists to demonstrate -- the stream catching the front rim -- drew a
+spotless fixture while the report said 119,790 uL/L. `Simulation.exteriorDeposits`
+publishes the arrivals and `render/stainView.ts` draws them as wetted marks. Marks
+rather than a film, because there is no film to solve out here and inventing one
+would claim more than is known. `npm run shoot --aim 0.55` is how to see it; the
+screenshot tool had no way to move the aim before, so every picture ever taken of
+this project was of a preset's own default.
+
+**66. Shading reads the slope of a field, and a per-vertex field has no slope.** The
+wetted bowl drew as smooth contour bands with a corduroy weave over them, and several
+previous passes had treated that as a shading-model fault. It was not. Film thickness,
+surface relief, speed, contact line and concentration were scattered onto the vertices
+every frame and left to the rasteriser, which interpolates linearly -- so the thickness
+field was C0, its gradient was piecewise *constant*, and the free surface of a liquid
+layer tilts by exactly that gradient. A piecewise-constant normal over 5 mm triangles
+draws the triangles. Every attempt to make the film visible by raising `reliefGain`
+raised the triangulation with it, which is why the banding got stronger the harder the
+liquid was pushed to show.
+
+The fix is `render/filmField.ts`: the solver state goes to the GPU as an RGBA32F
+texture on the cell grid, and the fragment shader reconstructs it with a Catmull-Rom
+cubic and takes the *analytic derivative of the same basis* for the slope. C1
+everywhere, exact gradient, every liquid cue evaluated per pixel. Full float rather than
+half, because half carries eleven bits of mantissa -- ample for the value and useless
+for the difference, and a still pool that sparkles is worse than one that bands.
+
+Three things followed, and are worth keeping straight:
+
+- **The contact line moved from cells to pixels.** `aEdge` marked a wet cell with a
+  drier neighbour, so the drawn edge was one cell wide -- 5 to 55 mm, growing and
+  shrinking with the grid resolution. The real edge is the level set
+  `h = FILM_DRY_THICKNESS`, and dividing the distance from that level by `fwidth` of
+  the same quantity gives a distance in *pixels*, so the line stays a line at every
+  camera distance and every resolution.
+- **A meniscus is a shaded feature, not a glow.** Drawn as a fixed pale value added all
+  the way round a patch it reads as a sticker outline, and the wetted marks came out as
+  pale decals. It is a steeply curved piece of liquid, so it belongs in the *normal* --
+  tilted outward by the contact angle over a band a couple of pixels wide -- and the
+  lighting that shades everything else then shades it too, bright on the lit side and
+  dark on the other.
+- **Sub-pixel structure is roughness, not flatness.** Fading the rivulets into their own
+  area average is right for the thickness and wrong for the shading: it turns a film
+  that was scattering the room over a wide cone into a mirror pointed in one direction,
+  and on a bowl interior that direction is the dark floor. So the wetted wall had a
+  sheen up close and went to a dead grey patch two steps back. The lost RMS slope is
+  added back as `alpha^2 += 2 sigma^2`.
+
+The rivulet pattern itself was rebuilt at the same time. It was a sine comb -- one
+wavelength, one width, laid out on the world horizontal -- which is what a machined
+finish looks like, and being pinned to the horizontal rather than to the flow it ran
+*across* the liquid wherever the wall turned. It is now a ridged two-octave noise in the
+flow's own frame, stretched twenty to one along it, advecting at the film's own speed,
+and gated on two conditions that matter: the cell must be wet by the solver's own
+reckoning, and the film must be *running*. Without the first, the 1/cover
+redistribution lifts a sub-threshold trace into a visibly wet lane and paints rivulets
+over bone-dry glaze -- which it did, across the whole bowl, because splash leaves a
+trace everywhere it has ever reached. Without the second, every 3 mm droplet splat is
+drawn as a rainstorm.
+
+**67. Two more found by the same close-up screenshots.**
+
+- **A punctual light with a clamped lobe cannot produce a highlight.** The GGX peak goes
+  as 1/a2, so the wet film's lobe was clamped to 24 and then scaled by 0.06 -- capping
+  the brightest possible specular return at 1.44, which against a Fresnel of 0.02 and a
+  diffuse of around 0.7 is three hundredths of a level. The relief work of several
+  passes had nothing to catch. Real luminaires subtend a few degrees; folding that
+  angular size into the roughness bounds the lobe by construction, at a value that means
+  something, and lets the glint be as bright as a real one.
+- **The jet tube sampled its own varicose wave at exactly one sample per cycle.** One
+  parcel per Rayleigh wavelength is the right discretisation of the *physics* and the
+  worst available one for drawing a surface with the same period: consecutive rings
+  landed at drifting phases and the tube folded over itself. It rendered as a shredded
+  worm at close range, which is what `--aim 0.55` shows. `streamView` now subdivides
+  each segment six ways, interpolating position, radius and growth phase between the two
+  parcels that bracket each ring, so nothing is invented between samples.
+
 ---
 
 ## Current measured state
 
-All six presets, at every grid resolution from 48×96 to 112×200:
+All eight presets, at every grid resolution from 48×96 to 112×200:
 
 - flipped normals: **0** (was 2–10 on the original presets)
 - degenerate cells: **0** (was 4–28)
-- worst cell skew: **0.42–0.99** (was 0.079 — tangents 4.5° apart). The 0.42 is
-  `nautilus-tall` at 112×200; everything else is above 0.47.
+- self-intersection: **none**; clamped parameters: **none**
+- worst cell skew: **0.16–0.73**, per `tools/labsheet.mts` on 2026-08-09. The 0.16 is
+  `compact-egg` at 112×200 and the 0.73 is the trough; the six originals span
+  0.18–0.73 (`compact-waterless` 0.18, `stall-urinal` 0.19, `classic-bowl` 0.21).
+  *This line used to read "0.42–0.99 … everything else is above 0.47", and that was
+  already stale for the six originals before the two compact presets were added — the
+  basin reshape (Trap 52) moved it and the text was not re-read. Skew is reported by
+  `labsheet` but is not part of its pass/fail, which is why it drifted unnoticed.*
 
-Re-measure with a throwaway script over `PRESETS` × resolutions if you touch
-`surface.ts`, `wrap.ts` or any preset's `wrapDepth` / `taperExponent` / `widthSump`.
-Those three quantities are what move it.
+Re-measure with `tools/labsheet.mts` if you touch `surface.ts`, `wrap.ts` or any
+preset's `wrapDepth` / `taperExponent` / `widthSump`. Those three quantities are what
+move it. (The steering text used to say "a throwaway script over `PRESETS` ×
+resolutions"; `labsheet` is that script, kept.)
 
 `npm run validate` → **60/60** (~395 s). `npm run build` clean. The count rose from 46
 when the solver audit added 14 checks, and three existing tolerances were *tightened* from
 3%/3%/2% to 1% at the same time, because the corrected jet-breakup wavenumber lands closer
-to Rayleigh's published 0.697 than the old one did. `tools/labsheet.mts` reports all six
-presets clean at all four grid resolutions.
+to Rayleigh's published 0.697 than the old one did. `tools/labsheet.mts` reports all
+eight presets clean at all four grid resolutions, and `tools/aimcheck.mts` reports all
+eight default aims reachable and not grazing.
 
 > **The absolute µL/L figures below moved on 2026-08-08** and the older ones are kept
 > only for the shape of the argument. Three changes account for it, all of them making
@@ -880,12 +1246,24 @@ Fixture envelopes and the notch, after the reshape. All six are 0 flipped normal
 
 | preset | W×D×H mm | notch | openMouth | protrude | ribbing |
 |---|---|---|---|---|---|
-| classic-bowl | 480×364×692 | **0 mm** | 283 mm | 0.0 mm | 17.0–18.9 mm |
-| flat-wall | 394×371×548 | **0 mm** | 250 mm | 0.0 mm | 16.6 mm |
-| stall-urinal | 463×381×972 | **0 mm** | 254 mm | 0.0 mm | 40.7 mm |
-| trough | 1493×317×550 | **0 mm** | 158 mm | 0.0 mm | 24.9 mm |
-| compact-waterless | 397×356×575 | **0 mm** | 236 mm | ≤0.9 mm | 24.3 mm |
+| classic-bowl | 480×364×692 | **0 mm** | 283 mm | 0.0 mm | 16.4–18.9 mm |
+| flat-wall | 394×371×548 | **0 mm** | 293 mm | 0.0 mm | 14.9–16.6 mm |
+| stall-urinal | 463×382×973 | **0 mm** | 284 mm | 0.0 mm | 35.6–40.7 mm |
+| trough | 1493×317×550 | **0 mm** | 250 mm | 0.0 mm | 23.1–24.9 mm |
+| compact-waterless | 397×357×576 | **0 mm** | 299 mm | ≤0.9 mm | 22.7–24.3 mm |
 | nautilus-tall | 352×391×627 | **0 mm** | 86 mm | 0.0 mm | 2.4–4.4 mm |
+| compact-egg | 330×356×552 | **0 mm** | 293 mm | 0.0 mm | 20.0–22.2 mm |
+| square-washout | 324×324×457 | **0 mm** | 275 mm | 0.0 mm | 13.3–13.8 mm |
+
+*(The `openMouth` column had drifted on four rows — it read 250/254/158/236 for
+flat-wall, stall, trough and compact against a measured 293/284/250/299. Re-read from
+`tools/labsheet.mts`, 2026-08-09. Trap 26 is why it does not matter: `openMouth` is
+identically `bowlDepth` and no parameter moves it.)*
+
+`square-washout`'s 13.3–13.8 mm is the **lowest ribbing of any product preset**, below
+`flat-wall`'s 14.9. Both new presets peak within 1–3 mm of their own `lipY` (213 mm and
+161 mm), which is the front-lip step of Trap 29 — the same single diagnosed place as
+every other preset, not a new artefact.
 
 **The notch is 0 mm on every preset**, against 0–301 mm before, and `openMouth` — which
 Trap 26 says no parameter moves and which is identically `bowlDepth` — has fallen with it,
@@ -928,11 +1306,26 @@ envelope is a polar `radius(y, θ)` about `x = 0`, which is the wrong parameteri
 something that elongated. Both are visible in the render only as a faint crease; neither
 is the corduroy that used to be there.
 
-`nautilus-tall` is the only one still carrying a large notch, and outstanding item 0
-explains why it is structural rather than untuned. ADA reference points: rim 430 mm max
-above floor, depth 345 mm minimum from
-the outer rim face to the wall. Only `classic-bowl` and `trough` currently meet the
-depth minimum; the stall is the non-accessible tall variant by design.
+*(Superseded first sentence: "`nautilus-tall` is the only one still carrying a large
+notch, and outstanding item 0 explains why it is structural rather than untuned." Trap
+52 took every preset to 0 mm, including that one.)*
+
+**ADA reference points: rim 430 mm maximum above the finished floor, projection 345 mm
+minimum from the outer rim face to the wall.** Measured against the envelope table
+above, the projection minimum is met by every preset except `trough` (317 mm) and
+`square-washout` (324 mm) — and both of those are correct, because a trough is
+dimensioned by length rather than by projection and the Maybrook is a 12¾ in-square
+fixture that predates the requirement. *(This paragraph previously said "only
+`classic-bowl` and `trough` currently meet the depth minimum", which named the one
+preset that fails it and excluded four that pass. Re-read off the table, 2026-08-09.)*
+
+On the rim height: `rimAboveFloor` is measured to the **top of the back panel**, not to
+the rim the code means, so it is not directly comparable with the 430 mm figure — the
+ADA rim is the *front lip*. `compact-waterless`, `compact-egg` and `square-washout` are
+mounted with that lip at 432 mm; the other five are at the standard 610 mm, and the
+stall is the non-accessible tall variant by design. `fixture-lab`'s "rim above floor …
+(ADA limit 430 mm)" line prints the top of the interior and therefore reads 644–676 mm
+on the accessible presets, which looks like a violation and is not.
 
 **One physics-relevant consequence of the reshape:** `classic-bowl` now has a broad
 washout floor with the outlet forward of centre (`widthSump` 0.14 → 0.185, `drainZ`
@@ -945,7 +1338,10 @@ they are unaffected — but if that ever changes, Trap 12 applies.
 
 ## Outstanding work, in priority order
 
-**0. The opening is not a mouth — done, on all six.** Closed by Trap 52 rather than by
+**0. The opening is not a mouth — done, and it stayed done: 0 mm on all eight.** The
+two presets added on 2026-08-09 needed no wrap tuning at all to reach it, which is the
+strongest evidence yet that this was a topology fault rather than a per-fixture one.
+Closed by Trap 52 rather than by
 the wrap tuning this item spent so long on: the side edge could not stop diving back to
 the mounting plane while the loft had no side wall to hold it. The notch is 0 mm on every
 preset, including `nautilus-tall`, which this item described as the one genuine remaining
@@ -988,7 +1384,7 @@ Which lever works depends on the back wall, and this is the useful generalisatio
   only thing left, and it is a change to the generator, not a tuning value.
 
 Any further work here must beat the current baseline — **0 flipped normals and 0
-degenerate cells on all six presets at every resolution from 48×96 to 112×200** — and
+degenerate cells on all eight presets at every resolution from 48×96 to 112×200** — and
 must re-run the seed and stand-off sweeps, because enclosure is what stops splash
 leaving and the A/B claim rests on it. It survived this pass: 46/46 with both control
 fixtures reshaped.
@@ -1110,8 +1506,8 @@ asymmetric model or a two-opening model breaks it.
 
 ## UI
 
-Two rounds of reduction. First the ~40 geometry sliders became a six-card fixture picker
-with real rendered thumbnails (`src/ui/thumbnail.ts`, painted one per idle tick, ~40 ms
+Two rounds of reduction. First the ~40 geometry sliders became a fixture picker (six
+cards then, eight now) with real rendered thumbnails (`src/ui/thumbnail.ts`, painted one per idle tick, ~40 ms
 each). Then the remaining panel — 24 controls opening flat, with no indication which
 three mattered — was cut to **5 sliders visible by default** out of 21 present.
 

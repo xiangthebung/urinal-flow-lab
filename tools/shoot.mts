@@ -50,6 +50,8 @@ const STAGE_ONLY = has('stage');
 const WIDTH = Number(flag('w', '1600'));
 const HEIGHT = Number(flag('h', '900'));
 const FIELD = flag('field');
+/** --aim 0.55 drives the aim down the profile, for the rim-strike cases. */
+const AIM = flag('aim');
 /** --overlays zones=0,heatmaps=0,shell=1 */
 const OVERLAYS: Record<string, boolean> = {};
 for (const kv of (flag('overlays', '') as string).split(',')) {
@@ -145,6 +147,15 @@ async function main(): Promise<void> {
         await page.evaluate((f) => {
           (window as unknown as { __lab: { setFieldMode(f: string): void } }).__lab.setFieldMode(f);
         }, FIELD);
+      }
+      // Aim is the most sensitive input in the model and there was no way to move
+      // it from here, so every screenshot the project has ever taken was of a
+      // preset's default. The rim strike -- the worst outcome available, and the
+      // one the exterior stain layer exists to show -- was unreachable.
+      if (AIM !== undefined) {
+        await page.evaluate((v) => {
+          (window as unknown as { __lab: { setAim(v: number): void } }).__lab.setAim(v);
+        }, Number(AIM));
       }
 
       for (const camera of CAMERAS) {

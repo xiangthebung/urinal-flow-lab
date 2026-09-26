@@ -331,6 +331,18 @@ export class Metrics {
   escapedVolume = 0;
   /** Volume voided so far, m^3. */
   emittedVolume = 0;
+  /**
+   * Liquid put into the fixture by something other than the user, m^3.
+   *
+   * The trap seal that is already standing in the sump when a run starts, and the
+   * flush that washes the bowl down afterwards. Kept apart from `emittedVolume`
+   * on purpose: that one is the denominator of every microlitres-per-litre figure
+   * in the project, and rolling two litres of flush water into it would divide
+   * every published splashback number by seven. It still has to appear in the
+   * closure sum, because it is liquid that exists (Trap 24) -- so the balance is
+   * `accounted == emitted + introduced` while the reported void stays the void.
+   */
+  introducedVolume = 0;
 
   peakFilmVolume = 0;
   peakWettedArea = 0;
@@ -390,6 +402,7 @@ export class Metrics {
     this.primaryAngleSum.fill(0);
     this.escapedVolume = 0;
     this.emittedVolume = 0;
+    this.introducedVolume = 0;
     this.peakFilmVolume = 0;
     this.peakWettedArea = 0;
     this.peakExcessVolume = 0;

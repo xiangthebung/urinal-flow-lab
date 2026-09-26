@@ -331,9 +331,38 @@ export class ParticleSystem {
             this.satelliteVolume[i] = 0;
             this.satellitesReleased++;
             this.satelliteVolumeReleased += satVol;
+            // Behind the parent, and slower.
+            //
+            // This used to hand the satellite the parent's exact position *and*
+            // velocity, so the two rode inside one another for the whole flight --
+            // visible at 4x zoom as a pale blue dot sitting in the middle of every
+            // yellow drop, which is not a rendering artefact but where the model
+            // put it. A satellite is the collapse of the *ligament between two main
+            // drops*, so it starts about half a wavelength behind the one ahead of
+            // it, and it is left with less of the jet's momentum than either
+            // neighbour -- which is why a real droplet train spreads out along its
+            // length instead of travelling as a rigid chain.
+            //
+            // Half a wavelength back is `0.5 * lambda`, and the parcel knows the
+            // wavelength as the distance it covers in one emission period. Speed is
+            // taken at 0.94 of the parent's: the ligament is decelerating relative
+            // to the drops pulling away from both of its ends.
+            //
+            // The wavelength does not need storing: a coherent parcel is exactly
+            // one wavelength of jet, so lambda = 4V / (pi d^2) from the volume it
+            // was carrying before the split and the diameter of the jet it came
+            // from.
+            const dj = Math.max(1e-6, this.jetDiameter[i]);
+            const lambda = (4 * (this.volume[i] + satVol)) / (Math.PI * dj * dj);
+            const sp = Math.hypot(this.vx[i], this.vy[i], this.vz[i]);
+            const back = sp > 1e-6 ? (0.5 * lambda) / sp : 0;
             out.satellites.push({
-              position: v3(this.px[i], this.py[i], this.pz[i]),
-              velocity: v3(this.vx[i], this.vy[i], this.vz[i]),
+              position: v3(
+                this.px[i] - this.vx[i] * back,
+                this.py[i] - this.vy[i] * back,
+                this.pz[i] - this.vz[i] * back
+              ),
+              velocity: v3(this.vx[i] * 0.94, this.vy[i] * 0.94, this.vz[i] * 0.94),
               volume: satVol,
               diameter: Math.cbrt((6 * satVol) / Math.PI),
             });

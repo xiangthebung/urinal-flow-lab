@@ -120,6 +120,7 @@ const CAMERAS: Record<string, CameraPreset> = {
   side: CameraPreset.Side,
   top: CameraPreset.Top,
   userEye: CameraPreset.UserEye,
+  contact: CameraPreset.Contact,
 };
 
 export function attachAutomation(app: App): void {

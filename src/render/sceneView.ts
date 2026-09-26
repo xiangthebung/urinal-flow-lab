@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
+import { buildWashroom, disposeWashroom } from './washroom';
 import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
 import { FittingsMesh } from '../geometry/fittings';
@@ -11,6 +11,7 @@ import { ColorScale, sample, toCss } from './colormap';
 import { DropletView } from './dropletView';
 import { FixtureView } from './fixtureView';
 import { StreamView } from './streamView';
+import { StainView } from './stainView';
 import { ParticleSystem } from '../sim/particles';
 import { Vec3 } from '../core/vec3';
 
@@ -30,7 +31,42 @@ export const enum CameraPreset {
   Side = 'side',
   Top = 'top',
   UserEye = 'userEye',
+  /**
+   * Close on where the stream meets the ceramic.
+   *
+   * The subject of this tool is what happens at the contact point, and not one of
+   * the five presets above could show it: every one framed the whole fixture, at
+   * which scale a 3 mm jet is about two pixels and the wetted footprint is a
+   * smudge. Orbit could get there by hand, but nothing offered it, so nobody used
+   * it. Framed on the traced impact point at a fixed physical width, so the same
+   * preset means the same magnification on a 324 mm bowl and a 1.5 m trough.
+   */
+  Contact = 'contact',
 }
+
+/**
+ * Strength of the reflected room, shared by `scene.environment` and by the
+ * interior's own copy of it. One constant, because the two are the same room and
+ * a difference between them shows up as the interior and the casting disagreeing
+ * about how bright the washroom is.
+ *
+ * 1.0, not a fudge factor: `washroom.ts` states its surfaces as absolute radiances
+ * in linear working space, so there is nothing to correct for. The 0.55 that stood
+ * here was compensating for `RoomEnvironment` being a studio of arbitrary scale.
+ */
+const ENV_INTENSITY = 1.0;
+
+/**
+ * Renderer exposure.
+ *
+ * ACES multiplies by `exposure / 0.6` before the curve, so 1.0 is a 1.67x gain
+ * and put white glaze at 0.92 in sRGB -- against the shoulder, where a reflected
+ * luminaire has nowhere left to go and every highlight the wet film makes is
+ * clipped into the ceramic. 0.80 puts dry glaze near 0.82 and leaves the top of
+ * the range for the things that are genuinely brighter than the fixture: the
+ * lamps, their reflections in the film, and the glints on the droplets.
+ */
+const EXPOSURE = 0.80;
 
 export class SceneView {
   readonly scene = new THREE.Scene();
@@ -40,8 +76,10 @@ export class SceneView {
   readonly fixture = new FixtureView();
   readonly droplets: DropletView;
   readonly stream = new StreamView();
+  readonly stains = new StainView();
 
   private shell: ShellMesh | null = null;
+  private envCube: THREE.WebGLCubeRenderTarget | null = null;
   private roomGroup = new THREE.Group();
   private userGroup = new THREE.Group();
   private zoneGroup = new THREE.Group();
@@ -61,6 +99,17 @@ export class SceneView {
       antialias: true,
       powerPreference: 'high-performance',
     });
+    // Filmic response, and every surface in the frame on the same one.
+    //
+    // Without it the renderer clamps at 1.0, so a light source can be at most as
+    // bright as a white wall -- and a reflected light that is no brighter than the
+    // ceramic behind it is not a reflection. The whole reason wet glaze announces
+    // itself is that it carries an image of something far brighter than itself,
+    // arriving through a Fresnel term of a few percent. `FixtureView` applies the
+    // `FixtureView` goes through the identical curve because three prefixes its
+    // own `toneMapping()` into every non-raw ShaderMaterial.
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = EXPOSURE;
     this.renderer.setClearColor(0x0d1218, 1);
     this.scene.fog = new THREE.Fog(0x0d1218, 2.4, 6.5);
 
@@ -76,28 +125,60 @@ export class SceneView {
 
     this.droplets = new DropletView(dropletCapacity);
 
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.45));
+    // Ambient was 0.45 while there was nothing else filling the shadows. The
+    // washroom below now supplies real indirect light from every direction, and
+    // leaving the flat term where it was would count it twice and wash out the
+    // form the environment is there to give back.
+    const ambient = new THREE.AmbientLight(0xffffff, 0.14);
+    this.scene.add(ambient);
     const key = new THREE.DirectionalLight(0xffffff, 1.1);
     key.position.set(1.2, 2.4, 1.6);
     this.scene.add(key);
     const fill = new THREE.DirectionalLight(0x9fc6ff, 0.45);
     fill.position.set(-1.4, 0.9, 1.4);
     this.scene.add(fill);
+    this.fixture.setLights(key, fill, ambient);
 
-    // An environment, because the metalwork is a metal.
+    // An environment, because the metalwork is a metal and the glaze gets wet.
     //
     // A physically based metal has no diffuse response at all -- everything you see
     // on chrome is reflected surroundings -- so with directional lights and no
     // environment the flushometer rendered as a black silhouette standing over a
     // white fixture. It looked like a hole in the scene. Lowering its metalness
     // would have fixed the symptom by making it not be metal; supplying something
-    // for it to reflect fixes the cause, and the glaze picks up a specular sheen
-    // from the same source, which is what glaze does.
+    // for it to reflect fixes the cause.
+    //
+    // The second reason came later and is larger: wet glaze is a mirror at grazing
+    // incidence, so what a wet fixture looks like is mostly a picture of the room
+    // it stands in. See `washroom.ts` for why that room is now a washroom rather
+    // than three's photographic studio.
+    const room = buildWashroom();
     const pmrem = new THREE.PMREMGenerator(this.renderer);
-    const env = pmrem.fromScene(new RoomEnvironment(), 0.04);
+    const env = pmrem.fromScene(room, 0.04);
     this.scene.environment = env.texture;
-    this.scene.environmentIntensity = 0.55;
+    this.scene.environmentIntensity = ENV_INTENSITY;
     pmrem.dispose();
+
+    // The same room again, as a plain mipmapped cube map.
+    //
+    // `scene.environment` is a PMREM in three's own CubeUV layout and is only
+    // readable through the chunks a built-in material includes. The wetted
+    // interior is a raw ShaderMaterial -- it has to be, it carries five per-vertex
+    // data channels -- so it could see none of it, and a surface with nothing to
+    // reflect cannot look wet however its highlight is tuned. Wet glaze is a
+    // mirror at grazing incidence and that is the cue the eye uses. A 128 cube
+    // with mipmaps costs 128 kB and one render, and its mip chain stands in for
+    // the roughness prefilter well enough at the sizes a fixture is drawn at.
+    this.envCube = new THREE.WebGLCubeRenderTarget(128, {
+      generateMipmaps: true,
+      minFilter: THREE.LinearMipmapLinearFilter,
+      magFilter: THREE.LinearFilter,
+      type: THREE.HalfFloatType,
+    });
+    const cubeCam = new THREE.CubeCamera(0.05, 40, this.envCube);
+    cubeCam.update(this.renderer, room);
+    this.fixture.setEnvironment(this.envCube.texture, ENV_INTENSITY);
+    disposeWashroom(room);
 
     this.scene.add(this.roomGroup);
     this.scene.add(this.userGroup);
@@ -107,11 +188,28 @@ export class SceneView {
     this.scene.add(this.fixture.group);
     this.scene.add(this.stream.mesh);
     this.scene.add(this.droplets.points);
+    this.scene.add(this.stains.points);
 
+    // A ring, not a ball.
+    //
+    // It marks where the traced aim meets the ceramic, and it was an 8 mm solid
+    // sphere in flat cyan. At the fixture-filling cameras that is a dot; at the
+    // close ones, where the frame is a few centimetres across and the whole point
+    // is to look at what the liquid is doing on the glaze, it is an opaque
+    // 16 mm disc parked over the impact site -- the one part of the bowl the
+    // camera was brought in to see. An annulus annotates the same point and hides
+    // nothing inside it.
     this.aimMarker = new THREE.Mesh(
-      new THREE.SphereGeometry(0.008, 16, 12),
-      new THREE.MeshBasicMaterial({ color: 0x35e0ff })
+      new THREE.RingGeometry(0.006, 0.0085, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0x35e0ff,
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+      })
     );
+    this.aimMarker.renderOrder = 3;
     this.aimMarker.visible = false;
     this.scene.add(this.aimMarker);
   }
@@ -256,8 +354,14 @@ export class SceneView {
     this.userGroup.add(torso);
 
     // Exit point, so the standoff and height are visible rather than implied.
+    //
+    // 3 mm, which is the exit itself. It was a 12 mm ball -- eight times the area
+    // of the 3 mm jet leaving it -- so the brightest thing anywhere near the
+    // stream was a marker for the stream, and at the framing every camera preset
+    // uses the marker was clearly visible while the liquid was a one-pixel
+    // hairline. A marker larger than the thing it marks is not a scale reference.
     const exit = new THREE.Mesh(
-      new THREE.SphereGeometry(0.012, 16, 12),
+      new THREE.SphereGeometry(0.0015, 12, 8),
       new THREE.MeshBasicMaterial({ color: 0xffe07a })
     );
     exit.position.set(
@@ -384,9 +488,31 @@ export class SceneView {
   }
 
   /** Redraw the airborne liquid: the intact jet as a tube, droplets as points. */
-  updateLiquid(ps: ParticleSystem, emitter: Vec3, exitDiameter: number): void {
-    this.stream.update(ps, emitter, exitDiameter);
+  updateLiquid(
+    ps: ParticleSystem,
+    emitter: Vec3,
+    exitDiameter: number,
+    breakup?: { wavelength: number; breakupTime: number; disturbanceRatio: number }
+  ): void {
+    this.stream.update(ps, emitter, exitDiameter, breakup);
     this.droplets.update(ps);
+  }
+
+  /**
+   * Drain the simulation's list of exterior arrivals into the stain layer.
+   *
+   * Consumed rather than copied, so replaying does not redraw the same marks and
+   * a restart clears both sides at once.
+   */
+  drainExteriorDeposits(records: number[]): void {
+    for (let i = 0; i + 6 < records.length; i += 7) {
+      this.stains.add(
+        records[i], records[i + 1], records[i + 2],
+        records[i + 3], records[i + 4], records[i + 5],
+        records[i + 6]
+      );
+    }
+    records.length = 0;
   }
 
   /** Push heat map data to the GPU. */
@@ -436,6 +562,9 @@ export class SceneView {
 
     if (trace.point) {
       this.aimMarker.position.set(trace.point.x, trace.point.y, trace.point.z);
+      // Face the camera, so the ring reads as a ring from every orbit position
+      // rather than collapsing to a line edge-on.
+      this.aimMarker.quaternion.copy(this.camera.quaternion);
       (this.aimMarker.material as THREE.MeshBasicMaterial).color.setHex(
         blocked ? 0xffa03c : 0x35e0ff
       );
@@ -536,7 +665,50 @@ export class SceneView {
     return dist;
   }
 
-  applyCameraPreset(preset: CameraPreset, surface: UrinalSurface, capture: CaptureScene): void {
+  applyCameraPreset(
+    preset: CameraPreset,
+    surface: UrinalSurface,
+    capture: CaptureScene,
+    contactPoint?: Vec3 | null
+  ): void {
+    if (preset === CameraPreset.Contact) {
+      // A fixed 90 mm of frame width, which is about twenty jet diameters: enough
+      // to hold the arrival, the wetted footprint around it and the runnel leaving
+      // it, and tight enough that the jet is tens of pixels rather than two. Falls
+      // back to the middle of the wetted interior when the aim reaches nothing,
+      // rather than refusing to move.
+      const b = surface.bounds();
+      const p = contactPoint ?? {
+        x: 0,
+        y: (b.min.y + b.max.y) * 0.5,
+        z: (b.min.z + b.max.z) * 0.5,
+      };
+      this.target.set(p.x, p.y, p.z);
+      // 180 mm of frame. Tighter reads better on the jet and worse on the wall:
+      // the film lives on cells 3.7-55 mm across, so at 90 mm you are looking at
+      // two of them and the ceramic goes to a blur. This is the width that holds
+      // the arrival, the footprint and the runnel leaving it with enough cells
+      // under them to have structure.
+      const halfWidth = 0.09;
+      const vFov = (this.camera.fov * Math.PI) / 180;
+      const hFov = 2 * Math.atan(Math.tan(vFov * 0.5) * this.camera.aspect);
+      const d = Math.max(0.2, halfWidth / Math.tan(Math.min(vFov, hFov) * 0.5));
+      // Looking slightly down and from the user's side, which is the angle a
+      // person actually sees the contact point from.
+      const dir = new THREE.Vector3(0.25, 0.5, 0.83).normalize();
+      this.camera.position.copy(this.target).addScaledVector(dir, d);
+      this.controls.target.copy(this.target);
+      this.controls.update();
+      return;
+    }
+    this.applyFixtureFramedPreset(preset, surface, capture);
+  }
+
+  private applyFixtureFramedPreset(
+    preset: CameraPreset,
+    surface: UrinalSurface,
+    capture: CaptureScene
+  ): void {
     // Framed on everything the fixture occupies, casting *and* metalwork. Using
     // the interior alone put the ceramic outside the frame on every model, and
     // stopping at the ceramic cropped the flushometer off the top.
@@ -595,6 +767,7 @@ export class SceneView {
     this.camera.aspect = width / Math.max(1, height);
     this.camera.updateProjectionMatrix();
     this.droplets.setViewport(height, dpr);
+    this.stains.setViewport(height, dpr);
   }
 
   render(): void {

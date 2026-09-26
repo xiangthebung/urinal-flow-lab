@@ -1,11 +1,13 @@
 import * as THREE from 'three';
-import { CRITICAL_IMPINGEMENT_ANGLE } from '../core/constants';
+import { CRITICAL_IMPINGEMENT_ANGLE, FILM_DRY_THICKNESS } from '../core/constants';
 import { FittingsMesh } from '../geometry/fittings';
 import { ShellMesh } from '../geometry/shell';
 import { UrinalSurface } from '../geometry/surface';
 import { FilmSolver } from '../sim/film';
+import { capillaryLength } from '../core/fluid';
 import { Metrics } from '../sim/metrics';
 import { COLORMAP_GLSL, ColorScale } from './colormap';
+import { FILM_GLSL, FilmField } from './filmField';
 
 /**
  * The fixture, the liquid clinging to it, and whichever data field is being
@@ -56,8 +58,16 @@ export interface FieldInfo {
 
 const SENTINEL = -1e9;
 
-/** Per-vertex scatter channels: field, film, relief xyz, speed, edge. */
-const ACCUM_CHANNELS = 7;
+/**
+ * A colour written the way a designer picks one -- as an sRGB triple -- and held
+ * the way the shader needs it, in linear light.
+ *
+ * `new THREE.Color(r, g, b)` stores its arguments in the working colour space,
+ * which is linear, so a value chosen by eye off a screen arrives 2.2 gammas too
+ * dark. Every constant colour in this file was picked by eye.
+ */
+const srgb = (r: number, g: number, b: number): THREE.Color =>
+  new THREE.Color().setRGB(r, g, b, THREE.SRGBColorSpace);
 
 export class FixtureView {
   readonly group = new THREE.Group();
@@ -74,27 +84,46 @@ export class FixtureView {
   private fittingsMesh: THREE.Mesh | null = null;
   private chromeMaterial: THREE.MeshStandardMaterial;
 
-  // Per-vertex channels.
+  /**
+   * The one channel still carried per vertex: whichever data field is on display.
+   *
+   * The liquid used to be here too -- thickness, surface relief, speed, contact
+   * line and concentration, five channels scattered onto the vertices every frame
+   * -- and moving it into `filmField` is most of this file's change. A data
+   * overlay is a piecewise-constant readout of a cell value and looking like one
+   * is honest; liquid is a continuous surface and looking like a mesh is not.
+   */
   private field!: Float32Array;
-  private film!: Float32Array;
-  private relief!: Float32Array;
-  private speed!: Float32Array;
-  /** Contact-line strength: 1 where a wet cell abuts a much drier one. */
-  private edge!: Float32Array;
+  /** Solver film state as a texture, reconstructed per pixel by the shader. */
+  private filmField = new FilmField();
   // Scatter scratch.
-  private accum!: Float64Array;
   private counts!: Uint16Array;
   private cellScratch!: Float64Array;
 
   mode: FieldMode = FieldMode.Liquid;
   info: FieldInfo = FixtureView.infoFor(FieldMode.Liquid, 0, 1);
   /**
-   * Exaggeration on the film's surface relief. A 50 um film varying over a 3 mm
-   * cell tilts its surface by only a couple of degrees, which is real but too
-   * subtle to see; this scales the tilt up so rivulets and waves read clearly.
-   * Purely a visualisation gain -- it changes no physics.
+   * Exaggeration on the film's surface relief.
+   *
+   * Not a taste dial: it stands in for structure the grid cannot hold. The cells
+   * here are 3.7 to 55 mm across and a rivulet is two capillary lengths wide --
+   * about 4.7 mm for urine on glaze -- so every rivulet in a real running film is
+   * sub-grid, and the solver can only report the smooth average of several of
+   * them. That average tilts its surface by well under a degree, while the
+   * rivulets it is averaging tilt by ten or twelve: a rivulet 4.7 mm wide and half
+   * a millimetre deep has flanks at atan(0.5 / 2.35), which is 12 degrees.
+   *
+   * Twelve degrees is the difference between a surface that catches the ceiling
+   * lights and one that does not, and catching them is the whole of how a wet
+   * surface announces itself. At the old gain of 12 the rendered tilt was under
+   * four degrees, the reflection never moved, and the film could only be seen
+   * through a diffuse darkening -- which is what a wetted *absorbent* surface
+   * looks like. The gain is set so that a typical film gradient reaches the tilt
+   * of the rivulets it is standing for, and `maxTilt` in the shader caps it there.
+   *
+   * It changes no physics; nothing reads it but the fragment shader.
    */
-  reliefGain = 12;
+  reliefGain = 60;
   /** Master strength of the liquid appearance, 0 disables it. */
   liquidStrength = 1;
 
@@ -110,42 +139,100 @@ export class FixtureView {
         uLiquid: { value: 1 },
         uRelief: { value: 12 },
         uTime: { value: 0 },
-        uWetOnset: { value: 50e-6 },
-        uShadowColor: { value: new THREE.Color(0.34, 0.35, 0.38) },
-        uBase: { value: new THREE.Color(0.895, 0.905, 0.925) },
-        uLiquidTint: { value: new THREE.Color(0.86, 0.84, 0.55) },
-        uLightA: { value: new THREE.Vector3(0.4, 0.85, 0.5).normalize() },
-        uLightB: { value: new THREE.Vector3(-0.6, 0.3, 0.7).normalize() },
+        /** Thickness at which glaze starts to read wet, m. The solver's own. */
+        uWetOnset: { value: FILM_DRY_THICKNESS },
+        // Authored in sRGB and stored linear, because the shader now works in
+        // linear light and encodes once at the end -- the same pipeline the
+        // casting's MeshStandardMaterial uses. The old shader wrote its working
+        // values straight to an sRGB framebuffer with no encode, which is a
+        // second reason the two halves of one ceramic object never matched in
+        // level however the lighting was adjusted.
+        uShadowColor: { value: srgb(0.34, 0.35, 0.38) },
+        uBase: { value: srgb(0.895, 0.905, 0.925) },
+        // Transmittance of a `uTintDepth` layer of the working fluid. Set from
+        // FluidProperties.tint every frame; this is only the initial value.
+        uLiquidTint: { value: new THREE.Color(0.88, 0.83, 0.5) },
+        /** Depth at which uLiquidTint is the exact transmittance, m. */
+        uTintDepth: { value: 1.5e-3 },
+        /** Capillary length of the working fluid, m. Sets the rivulet scale. */
+        uCapillary: { value: 2.34e-3 },
+        // The scene's own three lights, so the interior is lit by the same rig as
+        // the casting instead of by a private one that only resembled it.
+        uLightA: { value: new THREE.Vector3(1.2, 2.4, 1.6).normalize() },
+        uLightB: { value: new THREE.Vector3(-1.4, 0.9, 1.4).normalize() },
+        uKeyColor: { value: srgb(1, 1, 1).multiplyScalar(1.1) },
+        uFillColor: { value: srgb(0.624, 0.776, 1).multiplyScalar(0.45) },
+        uAmbient: { value: srgb(1, 1, 1).multiplyScalar(0.45) },
+        // The washroom, as a cube map, for the interior to reflect. Supplied by
+        // SceneView from the same RoomEnvironment the casting and the chrome
+        // reflect. Without one there is nothing for wet glaze to mirror, and a
+        // mirror is the cue the eye uses.
+        uEnv: { value: null as THREE.CubeTexture | null },
+        uHasEnv: { value: 0 },
+        uEnvIntensity: { value: 0.55 },
+        uEnvMaxLod: { value: 8 },
+        /** Roughness of dry fired glaze. Wet, the reflecting interface is water. */
+        uDryRoughness: { value: 0.22 },
+        // The film, as a grid rather than as vertex attributes. See filmField.ts.
+        uFilm: { value: null as THREE.DataTexture | null },
+        uFilmSize: { value: new THREE.Vector2(1, 1) },
+        /**
+         * Downhill, in world space, for the flow direction where the film has
+         * stopped moving and its own velocity says nothing. A constant: the
+         * fixture group is never transformed, so world down is fixture down.
+         */
+        uGravity: { value: new THREE.Vector3(0, -1, 0) },
       },
       vertexShader: /* glsl */ `
         attribute float aField;
-        attribute float aFilm;
-        attribute vec3 aRelief;
-        attribute float aSpeed;
-        attribute float aEdge;
+        attribute vec2 aUv;
+        attribute vec3 aTanU;
+        attribute vec3 aTanV;
         varying float vField;
-        varying float vFilm;
-        varying vec3 vRelief;
-        varying float vSpeed;
-        varying float vEdge;
+        varying vec2 vUv;
+        varying vec3 vTanU;
+        varying vec3 vTanV;
         varying vec3 vNormal;
         varying vec3 vView;
-        varying vec3 vLocal;
+        varying vec3 vWorld;
         void main() {
           vField = aField;
-          vFilm = aFilm;
-          vRelief = aRelief;
-          vSpeed = aSpeed;
-          vEdge = aEdge;
-          vLocal = position;
-          vNormal = normalize(normalMatrix * normal);
-          vec4 mv = modelViewMatrix * vec4(position, 1.0);
-          vView = -mv.xyz;
-          gl_Position = projectionMatrix * mv;
+          vUv = aUv;
+          // World tangents divided by the cell size they span, so the fragment
+          // shader can turn a derivative in cell-index units straight into a
+          // world-space gradient. Carrying the division here rather than a cell
+          // size separately means the two can never be paired up wrongly, and the
+          // grid is graded -- cells run from 3.7 to 55 mm across -- so a single
+          // scalar would have been wrong nearly everywhere.
+          vTanU = mat3(modelMatrix) * aTanU;
+          vTanV = mat3(modelMatrix) * aTanV;
+          // World space, not view space.
+          //
+          // normalMatrix is the inverse-transpose of the *modelView* matrix, so
+          // normalMatrix * normal is a view-space normal -- and uLightA/uLightB
+          // are world directions, deliberately set to the same two directions as
+          // the scene's key and fill lights. Lighting a view-space normal with a
+          // constant vector is a headlamp: the highlight stayed in the same place
+          // on screen however the camera orbited, so the interior had no fixed
+          // relationship to the light while the casting eight millimetres away
+          // -- a MeshStandardMaterial lit by the real lights -- did. Two halves of
+          // one ceramic object shading inconsistently is most of why the wetted
+          // basin read as flat and matte next to a solid-looking exterior.
+          vec4 world = modelMatrix * vec4(position, 1.0);
+          vNormal = normalize(mat3(modelMatrix) * normal);
+          vView = cameraPosition - world.xyz;
+          // The rivulet pattern's coordinate, in the same space as the flow
+          // direction, the normal and gravity. It was the object-space position,
+          // which is the same thing only while the model matrix is the identity --
+          // and if it ever stopped being, the pattern would shear away from the
+          // frame it is laid out in without anything failing to compile.
+          vWorld = world.xyz;
+          gl_Position = projectionMatrix * viewMatrix * world;
         }
       `,
       fragmentShader: /* glsl */ `
         ${COLORMAP_GLSL}
+        ${FILM_GLSL}
         uniform float uFieldMin;
         uniform float uFieldMax;
         uniform float uFieldLog;
@@ -159,16 +246,92 @@ export class FixtureView {
         uniform vec3 uShadowColor;
         uniform vec3 uBase;
         uniform vec3 uLiquidTint;
+        uniform float uTintDepth;
+        uniform float uCapillary;
         uniform vec3 uLightA;
         uniform vec3 uLightB;
+        uniform vec3 uKeyColor;
+        uniform vec3 uFillColor;
+        uniform vec3 uAmbient;
+        uniform samplerCube uEnv;
+        uniform float uHasEnv;
+        uniform float uEnvIntensity;
+        uniform float uEnvMaxLod;
+        uniform float uDryRoughness;
+        uniform vec3 uGravity;
         varying float vField;
-        varying float vFilm;
-        varying vec3 vRelief;
-        varying float vSpeed;
-        varying float vEdge;
+        varying vec2 vUv;
+        varying vec3 vTanU;
+        varying vec3 vTanV;
         varying vec3 vNormal;
         varying vec3 vView;
-        varying vec3 vLocal;
+        varying vec3 vWorld;
+
+        // sRGB transfer, both directions. The colour scales are authored as
+        // display values and the lighting has to happen in linear light, so the
+        // two have to be told apart rather than mixed -- which is what the old
+        // shader did by writing its working values straight to the framebuffer.
+        vec3 srgbToLinear(vec3 c) {
+          return mix(
+            pow((c + 0.055) / 1.055, vec3(2.4)),
+            c / 12.92,
+            step(c, vec3(0.04045))
+          );
+        }
+        /**
+         * Tone mapping is three's own, not a copy of it.
+         *
+         * toneMapping() and toneMappingExposure are prefixed into every
+         * non-raw ShaderMaterial when the renderer has tone mapping enabled, so
+         * this surface goes through the identical curve as the casting beside it
+         * by construction rather than by two implementations agreeing. An earlier
+         * pass here did paste in three's ACES fit, and the shader failed to compile
+         * with "function already has a body" -- which was the compiler pointing out
+         * the duplication before it could become a drift.
+         *
+         * Tone mapping is not a finishing touch here, it is what lets the room have
+         * a light in it. A ceiling luminaire runs tens of times the radiance of the
+         * wall it lights, and its reflection in a wet film arrives multiplied by a
+         * Fresnel term of three or four percent at the angles a urinal is seen
+         * from. Clamping at 1.0 makes such a source impossible, the room has to be
+         * built dim to fit, and a dim room reflects as nothing -- which is why the
+         * wetted glaze could only ever be shown by darkening it, and a darker matte
+         * patch with a soft edge is the appearance of wetted cardboard.
+         */
+        vec3 linearToSrgb(vec3 c) {
+          c = max(c, vec3(0.0));
+          return mix(
+            1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055,
+            c * 12.92,
+            step(c, vec3(0.0031308))
+          );
+        }
+
+        /**
+         * The washroom in a chosen direction, blurred by roughness.
+         *
+         * Mip level stands in for prefiltering: a rough surface gathers a wide
+         * cone and a smooth one a narrow ray, which is the whole of what a
+         * prefiltered environment encodes.
+         *
+         * Linear in roughness, not square-rooted. A square root looks like the
+         * right shape -- it spends more of the mip range on the rough end, which
+         * is where a prefilter's cone angle actually grows fastest -- but it puts
+         * a wet film at roughness 0.045 on mip 1.5 of a 128 cube, i.e. a 45-pixel
+         * face, and a mirror reflecting a 45-pixel room is not a mirror. The
+         * reflected ceiling luminaires are the cue, and they have to stay
+         * rectangular.
+         */
+        vec3 envAt(vec3 dir, float rough) {
+          if (uHasEnv < 0.5) {
+            // No environment: a plain sky/ground so the terms below still mean
+            // something rather than collapsing the surface to a flat diffuse.
+            float up = dir.y * 0.5 + 0.5;
+            return mix(vec3(0.10, 0.11, 0.13), vec3(0.62, 0.66, 0.72), up);
+          }
+          float lod = uEnvMaxLod * clamp(rough, 0.0, 1.0);
+          return textureCubeLodEXT(uEnv, dir, lod).rgb;
+        }
 
         void main() {
           vec3 n = normalize(vNormal);
@@ -178,77 +341,253 @@ export class FixtureView {
           if (dot(n, v) < 0.0) n = -n;
           vec3 nDry = n;
 
-          // ---- liquid ------------------------------------------------------
-          // Liquid on glaze has a contact line, not a gradient, and the old
-          // mapping had no way to show one. It saturated at 30 um -- below the
-          // retention thickness, the layer that is always left behind -- so any
-          // cell the liquid had ever touched read as fully wet. The whole basin
-          // came out uniformly damp with a soft edge, which is what a porous
-          // surface looks like. Ceramic does not do that: it carries a bounded
-          // patch with a bright edge and dry glaze beyond it.
+          // ---- the film, reconstructed --------------------------------------
           //
-          // Referenced to the retention thickness so the appearance follows the
-          // physics rather than a constant that happened to look acceptable on one
-          // fixture.
-          float wet = smoothstep(uWetOnset * 0.25, uWetOnset * 0.9, vFilm) * uLiquid;
-          // Depth tint saturates around 0.4 mm, so sump pooling reads distinctly
-          // from a damp wall.
-          float deep = (1.0 - exp(-vFilm / 4.0e-4)) * uLiquid;
+          // One cubic sample carries everything the solver knows here: the mean
+          // thickness over this cell, the mean velocity, and how much of the layer
+          // is voided liquid rather than flush water. The gradient comes out of
+          // the same basis analytically, so the free surface's tilt is the exact
+          // slope of the reconstruction rather than a difference taken across
+          // whatever the mesh happened to be.
+          vec4 fs;
+          float dhdi;
+          float dhdj;
+          sampleFilm(vUv, fs, dhdi, dhdj);
+          float hMean = fs.x * 1.0e-6;
+          float conc = fs.w;
+
+          // The two in-plane directions, in world space and in metres.
+          vec3 tuHat = normalize(vTanU);
+          vec3 tvHat = normalize(vTanV);
+          // vTanU is the unit tangent divided by the cell's width, so the world
+          // gradient of the thickness is the index-space derivative times it.
+          vec3 gradH = (dhdi * vTanU + dhdj * vTanV) * 1.0e-6;
+
+          // Where the liquid is going. The film's own velocity while it is
+          // running; downhill once it is not, because a pool at rest still has a
+          // direction its surface structure lines up with, and normalising a zero
+          // vector would otherwise leave the pattern pointing at whatever the
+          // rounding produced.
+          vec3 flow = fs.y * tuHat + fs.z * tvHat;
+          float speed = length(flow);
+          vec3 downhill = uGravity - n * dot(uGravity, n);
+          float dhLen = length(downhill);
+          vec3 fHat = speed > 1.0e-3
+            ? flow / speed
+            : (dhLen > 1.0e-4 ? downhill / dhLen : tvHat);
+          vec3 aHat = normalize(cross(n, fHat));
+
+          // ---- sub-grid rivulets ---------------------------------------------
+          //
+          // The solver reports a mean thickness over a cell 3.7 to 55 mm across,
+          // and a film running down glaze is not spread evenly over anything that
+          // size. Surface tension gathers it into rivulets about two capillary
+          // lengths apart -- 4.7 mm for urine on china -- a few tenths of a
+          // millimetre deep, with merely damp glaze between them. A cell reporting
+          // 20 um mean is a 0.35 mm rivulet over a twentieth of its width, and the
+          // two are not remotely the same thing to look at: one is a bright wet
+          // streak with colour in it, the other is nothing at all.
+          //
+          // Rendering the mean is why the wall could not be made to look wet by
+          // any amount of shading work. Every cue is nonlinear in thickness -- the
+          // Beer-Lambert path, the surface tilt, the gloss -- so evaluating them
+          // at the average of a distribution gives the wrong answer, not a blurred
+          // one.
+          //
+          // The pattern this stands on used to be a sine comb: one wavelength, one
+          // width, laid out on a fixed horizontal axis with a sine wobble in the
+          // phase. Evenly spaced parallel lines of constant width are what a
+          // machined finish looks like, and being pinned to the world horizontal
+          // rather than to the flow meant they ran across the direction the liquid
+          // was actually moving wherever the wall turned. It is now a ridged
+          // two-octave noise in the *flow's* own frame, stretched eight to one
+          // along it, so the lanes wander, vary in width, merge and split; and
+          // because the frame moves with the film at the film's own speed, they
+          // run rather than sit.
+          float hRivulet = 0.15 * uCapillary;
+          float pitch = 2.0 * uCapillary;
+          float cover = clamp(hMean / max(1.0e-9, hRivulet), 0.0, 1.0);
+
+          // Wet by the solvers own reckoning, on the cell mean. Everything the
+          // sub-grid model does is bounded by this, and it has to be: the model
+          // redistributes a cell mean into lanes that are deeper than the mean by
+          // 1/cover, so at a mean of a tenth of a micron -- a trace, well under
+          // the dry threshold -- it would lift the lanes to a visibly wet layer
+          // and paint rivulets across bone-dry glaze. It did exactly that, over
+          // the whole bowl, because a droplet splash leaves a trace everywhere it
+          // has ever reached.
+          float wetMean = smoothstep(uWetOnset, uWetOnset * 4.0, hMean);
+
+          // Rivulets are a feature of a film that is *running*. Where the film has
+          // stopped -- an isolated splash that landed and was pinned by its own
+          // contact line, or a settled pool -- the liquid is a patch with an edge,
+          // not a set of lanes, and the reconstruction plus the contact line below
+          // already draw exactly that. Splitting on the film speed is what keeps a
+          // 3 mm splat from being drawn as a rainstorm down the wall.
+          float running = smoothstep(0.02, 0.14, speed);
+
+          float hLocal = hMean;
+          vec3 gradDetail = vec3(0.0);
+          // Slope the rivulets carry that is finer than one pixel, as an RMS tilt.
+          // See where it is used, below the lighting terms.
+          float subgridSlope = 0.0;
+          float detail = uLiquid * wetMean * running;
+          if (detail > 0.004) {
+            // Twenty pitches long against one across. A rivulet is a line, and the
+            // lattice it is drawn from has to be at least as anisotropic as the
+            // thing it stands for or the lanes come out as a field of dashes.
+            float along = pitch * 20.0;
+            vec2 q = vec2(
+              dot(vWorld, aHat) / pitch,
+              (dot(vWorld, fHat) - uTime * speed) / along);
+            vec3 rf = rivuletField(q);
+
+            // Level set chosen so the lanes cover the area the liquid can cover.
+            // The exponent calibrates a ridged noise level against its own area
+            // and is the only fitted number in here.
+            float thr = 1.0 - pow(cover, 0.55);
+            float e0 = thr - 0.16;
+            float e1 = thr + 0.16;
+            float t = clamp((rf.x - e0) / (e1 - e0), 0.0, 1.0);
+            float stripe = t * t * (3.0 - 2.0 * t);
+            float dStripe = 6.0 * t * (1.0 - t) / (e1 - e0);
+
+            // Filtered against the pixel footprint. A rivulet 0.3 mm wide on a
+            // 400 mm bowl is a third of a pixel, and a hard lane that size does
+            // not render as a thin line -- it renders as moire. Where the pattern
+            // falls below the sampling rate it is faded into its own area average,
+            // which is the correct filtered answer and is exactly the cover.
+            float aa = clamp(fwidth(rf.x) * 1.4, 0.0, 1.0);
+            float resolved = 1.0 - smoothstep(0.25, 0.9, aa);
+            // Cover close to one is a continuous sheet -- the sump pool -- and
+            // there is nothing left to break up.
+            float breakable = 1.0 - smoothstep(0.75, 1.0, cover);
+            float visible = detail * resolved * breakable;
+            // What the filter just threw away, kept as a slope rather than
+            // discarded. See uses below.
+            subgridSlope = 0.26 * detail * (1.0 - resolved) * breakable;
+
+            // The cell mean redistributed over the pattern, so that the shading
+            // still integrates to the number the solver reported: a fraction
+            // cover of the area carries the rivulet and the rest carries a
+            // residual damp layer, and the two are weighted to average to hMean.
+            float between = 0.15;
+            float ridgeH = (1.0 - between * (1.0 - cover)) / max(cover, 0.02);
+            float profile = mix(between, ridgeH, stripe);
+            hLocal = hMean * mix(1.0, profile, visible);
+
+            // The slope of that redistribution, which is what actually makes a
+            // rivulet visible: it turns the surface away from the mean by ten or
+            // twelve degrees and the reflected room moves with it.
+            float amp = hMean * (ridgeH - between) * visible * dStripe;
+            gradDetail = amp * (rf.y * aHat / pitch + rf.z * fHat / along);
+          }
+
+          // ---- wet or dry ----------------------------------------------------
+          //
+          // An optical question, asked of the thickness that is actually here
+          // rather than of the cell mean. A surface is optically wet as soon as it
+          // carries a continuous layer, which is a fraction of a micron: at that
+          // point the interface the light meets is water, the Fresnel term is
+          // water, and scattered light starts being trapped by internal
+          // reflection. Referenced to FILM_DRY_THICKNESS, which is the solvers
+          // own definition of a dry cell and the threshold wettedArea() reports
+          // against, so what the picture calls wet and what the metrics call wet
+          // are one number. Multiplied by the cell wet mask so that the sub-grid
+          // redistribution can shape the wetted region but never extend it.
+          float wet = smoothstep(uWetOnset, uWetOnset * 8.0, hLocal) * wetMean * uLiquid;
+
+          // ---- the contact line ----------------------------------------------
+          //
+          // The free surface turns through a large angle in the last fraction of a
+          // millimetre at the edge of a wetted patch, and that turn is most of what
+          // tells the eye it is looking at liquid resting on a surface rather than
+          // at a stain in one.
+          //
+          // Two things about it were wrong. It was located on the solver's grid --
+          // a per-vertex flag raised where one cell held much more liquid than its
+          // neighbour -- so the drawn edge was one cell wide: a 5 to 55 mm soft
+          // band that grew and shrank with the grid resolution and, close up, was
+          // the widest feature on the bowl. And it was drawn by *adding light*, a
+          // fixed pale value all the way round the patch, which is not what an edge
+          // does: a meniscus is a piece of steeply curved liquid surface, so it is
+          // bright where it happens to face the light and dark where it does not,
+          // and a uniform bright outline reads as a sticker. The wetted marks came
+          // out as pale decals with cartoon outlines.
+          //
+          // So it is located in *pixels* from the level set h = the dry threshold,
+          // which is where the contact line really is and is resolution-independent
+          // -- the distance from that level divided by its screen-space rate of
+          // change is a distance in pixels, so the feature stays a line at every
+          // camera distance -- and it is applied as a tilt of the surface, letting
+          // the same lighting that shades everything else shade it too.
+          float pxGrad = max(fwidth(hMean), 1.0e-12);
+          float dPix = (hMean - uWetOnset) / pxGrad;
+          // Only where there is liquid to hold one: the level set exists all over
+          // the dry bowl at h = 0, and without this every cell boundary out on the
+          // dry glaze would draw an edge.
+          float hasEdge = smoothstep(uWetOnset * 0.5, uWetOnset * 4.0, hMean + pxGrad);
+          // Sitting just inside the line, where the meniscus climbs.
+          float lip = exp(-(dPix - 1.0) * (dPix - 1.0) * 0.5) * hasEdge * uLiquid;
+          // Uphill, out of the liquid: the surface rises from the dry glaze to the
+          // film, so the meniscus faces outwards.
+          vec3 gOut = -gradH + n * dot(gradH, n);
+          float gOutLen = length(gOut);
 
           vec3 nWet = n;
-          if (wet > 0.001) {
-            // The relief gain has to serve two scales at once: a 50 um wall film
-            // tilts its surface by under a degree, while the rim of a 2.5 mm pool
-            // tilts by twenty. One linear gain large enough to reveal the first
-            // would let the second overwhelm the surface normal completely and the
-            // pool edge would shade as though it faced sideways. Saturating the
-            // offset keeps small ripples visible and bounds the steep places.
-            float rlen = length(vRelief);
-            vec3 rdir = rlen > 1.0e-9 ? vRelief / rlen : vec3(0.0);
+          if (wet > 0.001 || lip > 0.001) {
+            // The free surface of a layer of thickness h has normal proportional
+            // to (n - grad h), so the offset is the negated in-plane gradient.
+            vec3 g = gradH + gradDetail;
+            g -= n * dot(g, n);
+            float rlen = length(g);
+            vec3 rdir = rlen > 1.0e-9 ? g / rlen : vec3(0.0);
             float s = rlen * uRelief;
-            float maxTilt = 0.70;
-            nWet = normalize(n + rdir * (s / (1.0 + s / maxTilt)));
+            // 17 degrees. Above the 12 a rivulet flank actually has, because the
+            // pool rim in the sump genuinely turns further than that, and below
+            // the 40 an earlier cap allowed, where a pool edge shaded as though it
+            // faced sideways. Saturating rather than clipping keeps the small
+            // slopes linear.
+            float maxTilt = 0.30;
+            nWet = normalize(n - rdir * (s / (1.0 + s / maxTilt)));
+
+            // The meniscus, as a much steeper turn of the same surface in the same
+            // direction. Liquid pinned on fired glaze sits at a contact angle of
+            // twenty to forty degrees, and the free surface has to get from that
+            // angle back to flat within a capillary length -- so the last sliver
+            // before the contact line is the steepest liquid on the fixture by a
+            // wide margin. Twenty degrees, at the shallow end of that range,
+            // because the band is a couple of pixels wide and a steeper one starts
+            // to read as an embossed bump rather than as an edge.
+            if (lip > 0.001 && gOutLen > 1.0e-12) {
+              nWet = normalize(nWet + (gOut / gOutLen) * (0.36 * lip));
+            }
+
             // Capillary waves on fast film, at a scale the grid cannot resolve.
-            //
-            // This used to be isotropic sin/cos noise in three axes at a few
-            // hundred cycles per metre, and it was the single biggest reason the
-            // liquid read as a stain soaking into a porous surface: it put
-            // high-frequency mottle over the whole wetted region, in every
-            // direction at once, which is what a rough absorbent surface looks
-            // like and the opposite of what a sheet of liquid running over glaze
-            // looks like. Injecting wall-jet momentum made it worse, because the
-            // amplitude follows film speed and the film is now genuinely fast.
-            //
-            // Real ripples on a running film are transverse: stretched across the
-            // flow and travelling with it. So the perturbation is applied along
-            // the surface gradient direction only, which is the flow direction to
-            // within the accuracy of a shading trick, and at a much lower
-            // amplitude.
-            float agitate = clamp(vSpeed * 1.6, 0.0, 1.0);
-            if (agitate > 0.01 && rlen > 1.0e-9) {
-              float phase = dot(vLocal, rdir) * 900.0 - uTime * 9.0;
-              nWet = normalize(nWet + rdir * (sin(phase) * 0.018 * agitate));
+            // Transverse -- stretched across the flow and travelling with it --
+            // which is what ripples on a running film are; an isotropic mottle in
+            // every direction at once is what a rough absorbent surface looks
+            // like, and it was most of why this read as a stain soaking in.
+            float agitate = clamp(speed * 1.6, 0.0, 1.0) * (1.0 - 0.7 * cover);
+            if (agitate > 0.01) {
+              vec2 wq = vec2(
+                dot(vWorld, aHat) / (uCapillary * 3.0),
+                (dot(vWorld, fHat) - uTime * speed * 1.3) / (uCapillary * 1.6));
+              vec3 wn = vnoiseD(wq);
+              vec3 wg = (wn.y * aHat / (uCapillary * 3.0)
+                       + wn.z * fHat / (uCapillary * 1.6));
+              nWet = normalize(nWet - wg * (agitate * 2.2e-5 * uRelief));
             }
           }
-          vec3 nUse = normalize(mix(nDry, nWet, wet));
+          // The contact line is liquid too, so it gets the liquid's optics -- water's
+          // Fresnel and a mirror roughness -- and not just its shape. Without this
+          // the meniscus would be a steep piece of *dry glaze*, and the one place
+          // on a wetted surface that is guaranteed to catch a highlight would be
+          // the one place shaded as though it could not.
+          float wetOptical = clamp(max(wet, lip * 0.8 * uLiquid), 0.0, 1.0);
+          vec3 nUse = normalize(mix(nDry, nWet, wetOptical));
 
-          // ---- lighting ----------------------------------------------------
-          float dA = max(dot(nUse, uLightA), 0.0);
-          float dB = max(dot(nUse, uLightB), 0.0);
-          float diffuse = 0.34 + 0.62 * dA + 0.30 * dB;
-
-          // Wet surfaces are far glossier and their highlight is much tighter.
-          vec3 hA = normalize(uLightA + v);
-          vec3 hB = normalize(uLightB + v);
-          float shin = mix(48.0, 190.0, wet);
-          float specA = pow(max(dot(nUse, hA), 0.0), shin);
-          float specB = pow(max(dot(nUse, hB), 0.0), shin);
-          float specGain = mix(0.35, 1.35, wet);
-          float spec = (specA + 0.45 * specB) * specGain;
-
-          float rim = pow(1.0 - max(dot(nUse, v), 0.0), 3.0);
-
-          // ---- albedo ------------------------------------------------------
+          // ---- albedo of the substrate -------------------------------------
           vec3 albedo;
           if (uUseField > 0.5) {
             if (vField < -1.0e8) {
@@ -262,37 +601,178 @@ export class FixtureView {
               } else {
                 t = (vField - uFieldMin) / max(1.0e-9, uFieldMax - uFieldMin);
               }
-              albedo = colorScale(uScale, clamp(t, 0.0, 1.0), uCriticalT);
+              // The colour scales are picked as display values, so they come back
+              // to linear before anything is multiplied by them.
+              albedo = srgbToLinear(colorScale(uScale, clamp(t, 0.0, 1.0), uCriticalT));
             }
           } else {
             albedo = uBase;
           }
 
-          // Wet glaze darkens, the way any wet surface does, and deeper liquid
-          // takes on its own colour. The darkening is the main cue that separates
-          // wetted from dry at a glance, so it is worth more than the 30% it used
-          // to get -- at that strength, with mottle over the top, the boundary of
-          // the patch was invisible and the whole basin read as uniformly damp.
-          albedo *= (1.0 - 0.42 * wet);
-          // Tint from a tenth of a millimetre rather than only in a deep pool, so
-          // a running film reads as liquid rather than as dark ceramic.
-          float tint = max(0.55 * deep, 0.30 * wet * smoothstep(0.0, 1.2e-4, vFilm));
-          albedo = mix(albedo, albedo * uLiquidTint, tint);
+          // ---- the film as a layer, not as a darker patch --------------------
+          //
+          // Wet glaze is not the same surface with the brightness turned down. It
+          // is a second interface standing on top of the first, and every visible
+          // difference follows from that:
+          //
+          //  - the reflection now comes off *water*, which is smoother than fired
+          //    glaze and which follows the film's own surface, so the room appears
+          //    in it as an image rather than as a broad sheen;
+          //  - at grazing incidence Fresnel returns nearly all of the light, so a
+          //    wet surface becomes a mirror. That is the cue the eye actually
+          //    uses, and the reason the old shader could not produce one is that
+          //    there was nothing in the scene for it to reflect;
+          //  - light that does get in is refracted into a narrow cone, scatters
+          //    off the ceramic, and is largely trapped by total internal
+          //    reflection on the way back out. *That* is why wet things look
+          //    darker, and it is a transmission loss rather than a change of
+          //    albedo;
+          //  - and what finally emerges has crossed the layer twice, so it carries
+          //    the liquid's own colour by Beer-Lambert over that path rather than
+          //    by a blend factor.
+          //
+          // The old model kept the third bullet's consequence and none of its
+          // mechanism: a flat 42% multiply on the albedo, a Blinn-Phong lobe over
+          // the top, and no environment. A darker matte patch with a soft edge is
+          // exactly what a wetted *absorbent* surface looks like, which is how
+          // this came to be reported as "wetting of cardboard".
+          float NoV = clamp(dot(nUse, v), 1.0e-3, 1.0);
+          // Normal-incidence reflectance of the top interface: water against air
+          // is 0.020, fired glaze against air 0.043.
+          float f0 = mix(0.043, 0.020, wetOptical);
+          float fres = f0 + (1.0 - f0) * pow(1.0 - NoV, 5.0);
 
-          vec3 col = albedo * diffuse + vec3(spec) + albedo * rim * 0.22;
-          // Grazing reflection off the liquid surface.
-          col += vec3(0.10, 0.13, 0.16) * rim * wet;
+          // One roughness drives the reflected room and the punctual highlight
+          // together, so they cannot disagree about how glossy the surface is --
+          // which they did, the environment being absent and the Blinn exponent
+          // being a separate hand-set number.
+          float rough = mix(uDryRoughness, 0.045, wetOptical);
+          // Rivulets finer than a pixel are roughness, not flatness.
+          //
+          // The lanes are a fraction of a millimetre wide, so beyond about half a
+          // metre from the camera they fall below the sampling rate and the code
+          // above fades them into their own area average -- which is the right
+          // answer for the *thickness* and precisely the wrong one for the
+          // *shading*. Averaging a corrugated surface to a flat one turns a film
+          // that was scattering the room over a wide cone into a mirror pointed at
+          // one direction, and on a bowl whose interior mostly reflects the dark
+          // floor that direction is dark. The wetted wall therefore went from a
+          // soft sheen up close to a dead grey patch two steps back, which is the
+          // opposite of how wet things behave.
+          //
+          // A sub-pixel corrugation of RMS slope sigma is optically a rougher
+          // surface: the standard variance result adds 2 sigma^2 to alpha^2. So the
+          // structure is not lost when it stops being resolved, it is converted
+          // into the thing it becomes, and the film keeps its sheen at any
+          // distance while still going mirror-smooth where it genuinely is smooth.
+          rough = min(1.0, sqrt(rough * rough + 2.0 * subgridSlope * subgridSlope));
+          vec3 envSpec = envAt(reflect(-v, nUse), rough);
+          // Not the very top mip. A single whole-sphere average gives every point
+          // on the fixture the same ambient, which is a flat fill light and throws
+          // away the one thing an environment is for: a surface facing the ceiling
+          // is lit differently from one facing the floor, and on a basin whose
+          // walls face in every direction that difference is most of the form.
+          vec3 envDiff = envAt(nUse, 0.82);
 
-          // Meniscus at the contact line. The free surface turns through a large
-          // angle in the last fraction of a millimetre at the edge of a patch, so
-          // it gathers a bright line -- and that line is most of what tells the eye
-          // it is looking at liquid resting on a surface rather than at a stain in
-          // one. vEdge is built on the solver's own grid, from a wet cell having a
-          // much drier neighbour, so it marks the real boundary of the wetted
-          // region at any resolution.
-          col += vec3(0.42, 0.47, 0.52) * vEdge * (0.45 + 0.55 * wet);
+          float dA = max(dot(nUse, uLightA), 0.0);
+          float dB = max(dot(nUse, uLightB), 0.0);
+          vec3 direct = uKeyColor * dA + uFillColor * dB;
 
-          gl_FragColor = vec4(col, 1.0);
+          // GGX for the two directional lights, and the reason the film had no
+          // glints on it at all.
+          //
+          // A punctual light is a fiction: it has no angular size, so the GGX peak
+          // goes as 1/a2 and a mirror-smooth film puts several thousand on a single
+          // pixel. The previous pass met that by clamping the lobe to 24 and then
+          // multiplying by 0.06, which caps the brightest possible specular return
+          // on wet glaze at 1.44 -- and with the Fresnel term at normal incidence
+          // being 0.02, that is three hundredths of a level against a diffuse of
+          // around 0.7. The highlight was mathematically present and optically
+          // absent, which is why no amount of relief work made the film catch the
+          // light: there was nothing for it to catch.
+          //
+          // The fix is to stop pretending the lights are points. A ceiling
+          // luminaire in a washroom subtends a few degrees, and a source of
+          // angular radius r reflected in a smooth surface is not a singularity but
+          // a spot of that size. Folding the source size into the roughness -- the
+          // standard representative-point treatment -- bounds the lobe by
+          // construction, at a value that means something, and lets the glint be as
+          // bright as a real one.
+          float srcRough = max(rough, 0.10);
+          vec3 hA = normalize(uLightA + v);
+          vec3 hB = normalize(uLightB + v);
+          float a2 = srcRough * srcRough * srcRough * srcRough;
+          float dhA = max(dot(nUse, hA), 0.0);
+          float dhB = max(dot(nUse, hB), 0.0);
+          float denA = dhA * dhA * (a2 - 1.0) + 1.0;
+          float denB = dhB * dhB * (a2 - 1.0) + 1.0;
+          float ggxA = a2 / (3.14159265 * denA * denA);
+          float ggxB = a2 / (3.14159265 * denB * denB);
+          // Smith-Schlick visibility with the 1/(4 NoL NoV) folded in, so the
+          // specular is the real Cook-Torrance quotient rather than a lobe times a
+          // number picked to stop it exploding. The NoL that would multiply it
+          // cancels against the one in the denominator.
+          float k = srcRough * srcRough * 0.5;
+          float visA = 0.25 / max(1.0e-4, (dA * (1.0 - k) + k) * (NoV * (1.0 - k) + k));
+          float visB = 0.25 / max(1.0e-4, (dB * (1.0 - k) + k) * (NoV * (1.0 - k) + k));
+          vec3 directSpec = uKeyColor * ggxA * visA * dA + uFillColor * ggxB * visB * dB;
+
+          // Why a wet surface is darker, and why a white one is hardly darker at
+          // all.
+          //
+          // Light that gets past the top interface scatters off the ceramic and
+          // comes back up at every angle, and most of it arrives beyond the
+          // critical angle for water against air -- so it is turned back down and
+          // has to try again. The diffuse internal reflectance for n = 1.33 is
+          // about 0.47. On a *dark* substrate each extra pass is another chance to
+          // be absorbed and the surface goes markedly darker, which is the
+          // everyday observation. On a white glaze almost nothing is absorbed per
+          // pass, so the trapped light escapes eventually and the darkening nearly
+          // cancels: this term takes a 0.78 albedo to 0.65, a ratio of 0.84, where
+          // a flat multiply was taking it to 0.62.
+          //
+          // That matters here rather than being a refinement. Wet white sanitary
+          // glaze in a real washroom is barely darker than dry -- what changes is
+          // that it turns into a mirror. Modelling the wetness as a big diffuse
+          // darkening with a soft edge is *precisely* the appearance of a wetted
+          // absorbent surface, which is why this read as damp cardboard. The cue
+          // has to come from the reflection, and it does now that there is a room
+          // to reflect.
+          float R_INTERNAL = 0.47;
+          vec3 wetAlbedo = albedo * (1.0 - R_INTERNAL) / (1.0 - R_INTERNAL * albedo);
+
+          // Beer-Lambert over twice the thickness. One law covers the whole range
+          // the solver produces: tens of microns on the wall reads faintly warm,
+          // millimetres in the sump reads as properly coloured liquid. That depth
+          // blend used to be a second, separate mechanism for the same thing.
+          // Path length times *concentration*: a millimetre of the void colours
+          // strongly and a millimetre of flush water does not colour at all, and
+          // the same layer somewhere between reads as the mixture it is. Without
+          // the concentration the flush was simply more liquid, so washing the
+          // bowl down made it darker -- the one thing a flush must never do.
+          vec3 absorb = pow(
+            clamp(uLiquidTint, vec3(1.0e-3), vec3(1.0)),
+            vec3(clamp((2.0 * hLocal * conc) / max(1.0e-6, uTintDepth), 0.0, 8.0))
+          );
+          vec3 sub = mix(albedo, wetAlbedo, wet) * mix(vec3(1.0), absorb, uLiquid);
+
+          // Lambert, with the 1/pi the ad-hoc version never had -- which is most
+          // of why the punctual lights used to overwhelm everything else and why
+          // the interior and the casting could not be brought to the same level by
+          // adjusting either one. The environment term is already a radiance, and
+          // the irradiance from a uniform hemisphere of radiance L is pi*L, so the
+          // pi cancels there and does not for the two directional lights.
+          float RCP_PI = 0.31830989;
+          // (1 - fres) on the diffuse path is energy conservation, not a wetness
+          // term: whatever the top interface reflects never reaches the ceramic,
+          // wet or dry.
+          vec3 col = sub * (1.0 - fres) * ((direct + uAmbient) * RCP_PI + envDiff * uEnvIntensity)
+                   + (envSpec * uEnvIntensity + directSpec) * fres;
+
+
+          // Encoded once, here, so that everything above is linear light and the
+          // interior lands on the same transfer function as the casting beside it.
+          gl_FragColor = vec4(linearToSrgb(toneMapping(col)), 1.0);
         }
       `,
       side: THREE.DoubleSide,
@@ -371,6 +851,50 @@ export class FixtureView {
     if (this.shellMesh) this.shellMesh.visible = v;
   }
 
+  /**
+   * Adopt the scene's actual lighting rig.
+   *
+   * The shader used to carry its own copy of the two directional light directions
+   * -- close enough to the real ones to read as intentional, applied to a
+   * view-space normal so they behaved as a headlamp, and free to drift the moment
+   * anyone touched `SceneView`. A second, unread copy of a number the project
+   * already has is this codebase's most-repeated defect; one call keeps them
+   * identical by construction.
+   */
+  setLights(
+    key: THREE.DirectionalLight,
+    fill: THREE.DirectionalLight,
+    ambient: THREE.AmbientLight
+  ): void {
+    const u = this.material.uniforms;
+    (u.uLightA.value as THREE.Vector3).copy(key.position).normalize();
+    (u.uLightB.value as THREE.Vector3).copy(fill.position).normalize();
+    (u.uKeyColor.value as THREE.Color).copy(key.color).multiplyScalar(key.intensity);
+    (u.uFillColor.value as THREE.Color).copy(fill.color).multiplyScalar(fill.intensity);
+    (u.uAmbient.value as THREE.Color).copy(ambient.color).multiplyScalar(ambient.intensity);
+  }
+
+
+  /**
+   * Give the glaze something to reflect.
+   *
+   * The casting and the chrome reflect a PMREM'd `RoomEnvironment` through
+   * `scene.environment`; a raw `ShaderMaterial` gets none of that machinery, so
+   * the interior -- the one surface in the scene that is supposed to be *wet* --
+   * had nothing to mirror. `SceneView` renders the same room into a cube target
+   * and hands it over here, so all three surfaces reflect one room.
+   */
+  setEnvironment(env: THREE.CubeTexture | null, intensity = 0.55): void {
+    this.material.uniforms.uEnv.value = env;
+    this.material.uniforms.uHasEnv.value = env ? 1 : 0;
+    this.material.uniforms.uEnvIntensity.value = intensity;
+    if (env && env.image && Array.isArray(env.image) && env.image[0]) {
+      const w = (env.image[0] as { width?: number }).width ?? 256;
+      this.material.uniforms.uEnvMaxLod.value = Math.log2(Math.max(2, w));
+    }
+    this.material.needsUpdate = true;
+  }
+
   setSurface(surface: UrinalSurface): void {
     this.surface = surface;
     if (this.mesh) {
@@ -391,19 +915,18 @@ export class FixtureView {
       new THREE.BufferAttribute(surface.vertexNormals.slice(), 3)
     );
     this.field = new Float32Array(nVert);
-    this.film = new Float32Array(nVert);
-    this.relief = new Float32Array(nVert * 3);
-    this.speed = new Float32Array(nVert);
-    this.edge = new Float32Array(nVert);
     this.geometry.setAttribute('aField', new THREE.BufferAttribute(this.field, 1));
-    this.geometry.setAttribute('aFilm', new THREE.BufferAttribute(this.film, 1));
-    this.geometry.setAttribute('aRelief', new THREE.BufferAttribute(this.relief, 3));
-    this.geometry.setAttribute('aSpeed', new THREE.BufferAttribute(this.speed, 1));
-    this.geometry.setAttribute('aEdge', new THREE.BufferAttribute(this.edge, 1));
+    this.geometry.setAttribute('aUv', new THREE.BufferAttribute(this.buildUv(surface), 2));
+    const { tanU, tanV } = this.buildTangents(surface);
+    this.geometry.setAttribute('aTanU', new THREE.BufferAttribute(tanU, 3));
+    this.geometry.setAttribute('aTanV', new THREE.BufferAttribute(tanV, 3));
     this.geometry.setIndex(new THREE.BufferAttribute(surface.indices.slice(), 1));
     this.geometry.computeBoundingSphere();
 
-    this.accum = new Float64Array(nVert * ACCUM_CHANNELS);
+    this.filmField.resize(surface);
+    this.material.uniforms.uFilm.value = this.filmField.texture;
+    (this.material.uniforms.uFilmSize.value as THREE.Vector2).set(surface.nu, surface.nv);
+
     this.counts = new Uint16Array(nVert);
     this.cellScratch = new Float64Array(nCell);
 
@@ -421,6 +944,80 @@ export class FixtureView {
     if (this.drainRing) this.group.remove(this.drainRing);
     this.drainRing = this.buildDrainOutline(surface);
     this.group.add(this.drainRing);
+  }
+
+  /**
+   * Where each vertex sits in the film grid's own coordinates.
+   *
+   * Vertex (i, j) is the *corner* of cell (i, j), so it lands at i/nu -- half a
+   * texel short of the texel centre, which is exactly what the shader's `uv *
+   * size - 0.5` expects. Getting this off by half a cell would slide the whole
+   * film half a cell up and to the left of the geometry it is running over, which
+   * is the kind of error that looks like a physics bug.
+   */
+  private buildUv(s: UrinalSurface): Float32Array {
+    const stride = s.nu + 1;
+    const uv = new Float32Array((s.nu + 1) * (s.nv + 1) * 2);
+    for (let j = 0; j <= s.nv; j++) {
+      for (let i = 0; i <= s.nu; i++) {
+        const o = (j * stride + i) * 2;
+        uv[o] = i / s.nu;
+        uv[o + 1] = j / s.nv;
+      }
+    }
+    return uv;
+  }
+
+  /**
+   * Surface tangents divided by the cell size they span, at the vertices.
+   *
+   * The shader gets its thickness derivatives in cell-index units, and the grid is
+   * graded -- 3.7 mm cells at the sump, 55 mm at the rim -- so turning those into
+   * a world-space slope needs the local cell size and not a global one. Folding
+   * the division in here means the shader can never pair a tangent with the wrong
+   * width, and it costs nothing per frame: both are fixed by the geometry.
+   */
+  private buildTangents(s: UrinalSurface): { tanU: Float32Array; tanV: Float32Array } {
+    const stride = s.nu + 1;
+    const nVert = (s.nu + 1) * (s.nv + 1);
+    const tanU = new Float32Array(nVert * 3);
+    const tanV = new Float32Array(nVert * 3);
+    const touch = new Uint8Array(nVert);
+    for (let j = 0; j < s.nv; j++) {
+      for (let i = 0; i < s.nu; i++) {
+        const c = j * s.nu + i;
+        const o3 = c * 3;
+        const du = Math.max(1e-6, s.cellDu[c]);
+        const dv = Math.max(1e-6, s.cellDv[c]);
+        const vs = [
+          j * stride + i,
+          j * stride + i + 1,
+          (j + 1) * stride + i,
+          (j + 1) * stride + i + 1,
+        ];
+        for (const vi of vs) {
+          const b = vi * 3;
+          tanU[b] += s.cellTangentU[o3] / du;
+          tanU[b + 1] += s.cellTangentU[o3 + 1] / du;
+          tanU[b + 2] += s.cellTangentU[o3 + 2] / du;
+          tanV[b] += s.cellTangentV[o3] / dv;
+          tanV[b + 1] += s.cellTangentV[o3 + 1] / dv;
+          tanV[b + 2] += s.cellTangentV[o3 + 2] / dv;
+          touch[vi]++;
+        }
+      }
+    }
+    for (let vi = 0; vi < nVert; vi++) {
+      const t = touch[vi] || 1;
+      const b = vi * 3;
+      tanU[b] /= t;
+      tanU[b + 1] /= t;
+      tanU[b + 2] /= t;
+      tanV[b] /= t;
+      tanV[b + 1] /= t;
+      tanV[b + 2] /= t;
+    }
+    return { tanU, tanV };
   }
 
   private buildSparseWireframe(
@@ -477,7 +1074,7 @@ export class FixtureView {
   }
 
   /**
-   * Push all per-vertex channels in one pass.
+   * Push the displayed data field onto the vertices.
    *
    * Cell-centred solver values are averaged onto the vertices the shader
    * interpolates over. Invalid cells are excluded from the average rather than
@@ -485,120 +1082,45 @@ export class FixtureView {
    * the stream cannot reach, and folding an undefined cell into its neighbours
    * would smear a fabricated value across the boundary. A vertex with no valid
    * neighbour keeps the sentinel and renders grey.
+   *
+   * This used to carry the liquid as well, in seven more channels. It does not any
+   * more -- see `filmField` -- and what is left makes the reason plain: a data
+   * overlay is a per-cell readout and reading one off a vertex average is honest,
+   * while liquid is a continuous surface whose *slope* is most of its appearance,
+   * and a vertex average has no slope worth the name.
    */
   private scatter(fieldCells: Float64Array, invalid: Uint8Array | undefined): void {
     const s = this.surface;
     const stride = s.nu + 1;
     const nVert = this.field.length;
-    this.accum.fill(0);
+    this.field.fill(0);
     this.counts.fill(0);
 
-    // Channel layout per vertex: field, film, reliefX, reliefY, reliefZ, speed,
-    // edge.
-    const wetOnset = Math.max(1e-9, this.material.uniforms.uWetOnset.value as number);
-    const wetFloor = 0.25 * wetOnset;
     for (let j = 0; j < s.nv; j++) {
       for (let i = 0; i < s.nu; i++) {
         const c = j * s.nu + i;
-        const bad = invalid ? invalid[c] !== 0 : false;
+        if (invalid && invalid[c] !== 0) continue;
         const fv = fieldCells[c];
-        const fieldOk = !bad && Number.isFinite(fv);
-
-        // Film surface relief: the free surface of a layer of thickness h has
-        // normal proportional to (n - grad_tangential h), so the offset is the
-        // negated in-plane gradient expressed in world space.
-        const iL = i > 0 ? i - 1 : 0;
-        const iR = i < s.nu - 1 ? i + 1 : s.nu - 1;
-        const jD = j > 0 ? j - 1 : 0;
-        const jU = j < s.nv - 1 ? j + 1 : s.nv - 1;
-        const spanU = Math.max(1e-6, s.cellDu[c] * (iR - iL));
-        const spanV = Math.max(1e-6, s.cellDv[c] * (jU - jD));
-        const hL = this.filmH[j * s.nu + iL];
-        const hR = this.filmH[j * s.nu + iR];
-        const hD = this.filmH[jD * s.nu + i];
-        const hU = this.filmH[jU * s.nu + i];
-        const dhdu = (hR - hL) / spanU;
-        const dhdv = (hU - hD) / spanV;
-        const o3 = c * 3;
-        const rx = -dhdu * s.cellTangentU[o3] - dhdv * s.cellTangentV[o3];
-        const ry = -dhdu * s.cellTangentU[o3 + 1] - dhdv * s.cellTangentV[o3 + 1];
-        const rz = -dhdu * s.cellTangentU[o3 + 2] - dhdv * s.cellTangentV[o3 + 2];
-
-        const h = this.filmH[c];
-        const sp = this.filmSpeed(c);
-
-        // Contact line: this cell holds enough liquid to read as wet while a
-        // neighbour holds far less. Computed on the solver's grid from the four
-        // face neighbours rather than from a thickness gradient, because a
-        // gradient threshold has to be retuned for every grid resolution and this
-        // does not -- the drop across one cell at a pinned contact line is the
-        // whole film thickness however large the cell is.
-        let edge = 0;
-        if (h > wetFloor) {
-          const nbMin = Math.min(
-            this.filmH[j * s.nu + iL],
-            this.filmH[j * s.nu + iR],
-            this.filmH[jD * s.nu + i],
-            this.filmH[jU * s.nu + i]
-          );
-          edge = Math.max(0, Math.min(1, 1 - nbMin / h));
-          // Only the outer boundary, not the gentle taper inside a settled pool.
-          edge = edge * edge;
-        }
-
-        const vs = [
-          j * stride + i,
-          j * stride + i + 1,
-          (j + 1) * stride + i,
-          (j + 1) * stride + i + 1,
-        ];
-        for (const vi of vs) {
-          const b = vi * ACCUM_CHANNELS;
-          if (fieldOk) {
-            this.accum[b] += fv;
-            this.counts[vi]++;
-          }
-          this.accum[b + 1] += h;
-          this.accum[b + 2] += rx;
-          this.accum[b + 3] += ry;
-          this.accum[b + 4] += rz;
-          this.accum[b + 5] += sp;
-          this.accum[b + 6] += edge;
-        }
+        if (!Number.isFinite(fv)) continue;
+        const v0 = j * stride + i;
+        const v1 = v0 + 1;
+        const v2 = v0 + stride;
+        const v3 = v2 + 1;
+        this.field[v0] += fv;
+        this.field[v1] += fv;
+        this.field[v2] += fv;
+        this.field[v3] += fv;
+        this.counts[v0]++;
+        this.counts[v1]++;
+        this.counts[v2]++;
+        this.counts[v3]++;
       }
     }
 
-    // Every interior vertex touches four cells, edges two, corners one. The film
-    // channels are always valid so a plain divide by the touch count works; the
-    // data field uses its own count because invalid cells were skipped.
-    const stride2 = s.nu + 1;
     for (let vi = 0; vi < nVert; vi++) {
-      const b = vi * ACCUM_CHANNELS;
-      const i = vi % stride2;
-      const j = (vi - i) / stride2;
-      const nu = i > 0 && i < s.nu ? 2 : 1;
-      const nv = j > 0 && j < s.nv ? 2 : 1;
-      const touch = nu * nv;
-      this.field[vi] = this.counts[vi] > 0 ? this.accum[b] / this.counts[vi] : SENTINEL;
-      this.film[vi] = this.accum[b + 1] / touch;
-      this.relief[vi * 3] = this.accum[b + 2] / touch;
-      this.relief[vi * 3 + 1] = this.accum[b + 3] / touch;
-      this.relief[vi * 3 + 2] = this.accum[b + 4] / touch;
-      this.speed[vi] = this.accum[b + 5] / touch;
-      this.edge[vi] = this.accum[b + 6] / touch;
+      this.field[vi] = this.counts[vi] > 0 ? this.field[vi] / this.counts[vi] : SENTINEL;
     }
-
-    (this.geometry.getAttribute('aField') as THREE.BufferAttribute).needsUpdate = true;
-    (this.geometry.getAttribute('aFilm') as THREE.BufferAttribute).needsUpdate = true;
-    (this.geometry.getAttribute('aRelief') as THREE.BufferAttribute).needsUpdate = true;
-    (this.geometry.getAttribute('aSpeed') as THREE.BufferAttribute).needsUpdate = true;
-    (this.geometry.getAttribute('aEdge') as THREE.BufferAttribute).needsUpdate = true;
-  }
-
-  private filmH!: Float64Array;
-  private filmRef!: FilmSolver;
-  private filmSpeed(c: number): number {
-    return this.filmRef.speedAt(c);
+    (this.geometry.getAttribute("aField") as THREE.BufferAttribute).needsUpdate = true;
   }
 
   /** Refresh the surface appearance and the displayed field. */
@@ -611,15 +1133,26 @@ export class FixtureView {
   ): void {
     const s = this.surface;
     const nCell = s.nu * s.nv;
-    this.filmH = film.h;
-    this.filmRef = film;
+
+    // The whole liquid state, as one upload.
+    this.filmField.update(film);
 
     this.material.uniforms.uTime.value = time;
     this.material.uniforms.uRelief.value = this.reliefGain;
-    // Tied to the solver's own retention thickness, so if that is changed the
-    // point at which the glaze starts to look wet moves with it instead of the
-    // appearance quietly disagreeing with the physics.
-    this.material.uniforms.uWetOnset.value = Math.max(5e-6, film.params.retentionThickness);
+    // The solver's own dry threshold, not the retention thickness: see the note
+    // in the fragment shader. Held as a uniform rather than inlined so the
+    // contact line the shader draws and the wetted area the metrics report are
+    // the same threshold.
+    this.material.uniforms.uWetOnset.value = FILM_DRY_THICKNESS;
+    // The liquid's own colour, from the fluid preset rather than from a constant
+    // in this file. It was hardcoded amber, so the water reference -- the preset
+    // that exists to reproduce published lab experiments -- drew yellow water.
+    const t = film.fluid.tint;
+    (this.material.uniforms.uLiquidTint.value as THREE.Color).setRGB(t[0], t[1], t[2]);
+    // The rivulet scale is the fluid's, not a constant: a lower surface tension
+    // makes narrower, shallower rivulets, and the fluid selector should move the
+    // appearance for the same reason it moves the splash threshold.
+    this.material.uniforms.uCapillary.value = capillaryLength(film.fluid);
     // Dry mode is for reading geometry, so the liquid is switched off entirely.
     const liquid = this.mode === FieldMode.Dry ? 0 : this.liquidStrength;
     this.material.uniforms.uLiquid.value = liquid;
@@ -827,6 +1360,7 @@ export class FixtureView {
   dispose(): void {
     this.geometry?.dispose();
     this.material.dispose();
+    this.filmField.dispose();
   }
 }
 

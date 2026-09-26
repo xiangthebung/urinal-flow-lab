@@ -23,6 +23,17 @@ export const enum DropletColorMode {
   Speed = 1,
   /** Diameter. */
   Size = 2,
+  /**
+   * The colour of the liquid, and nothing else.
+   *
+   * Provenance colouring -- gold jet, red splash, pale blue satellite -- is a data
+   * view, and it was the only one available on the tab whose own description is
+   * "the fixture as it would look". At peak flow 906 of 973 live particles are
+   * splash, so nine tenths of what the realistic view showed was a hard red dot
+   * carrying an analytical meaning, over a fixture rendered as carefully as this
+   * one is. It is still the right default on every other tab.
+   */
+  Liquid = 3,
 }
 
 export class DropletView {
@@ -34,8 +45,21 @@ export class DropletView {
   private sizes: Float32Array;
   private capacity: number;
   colorMode: DropletColorMode = DropletColorMode.Provenance;
-  /** Multiplier on the drawn droplet size. Purely visual. */
-  sizeScale = 1.6;
+  /**
+   * Multiplier on the drawn droplet size.
+   *
+   * 1.0, not the 1.6 it was. The main drops off a 3 mm stream are 5.5 mm across
+   * and leave one wavelength -- 13.3 mm -- apart, so drawing them 1.6x oversize
+   * put 8.8 mm spheres at 13.3 mm centres: a two-thirds duty cycle, which is a
+   * string of beads rather than a train of droplets. The sprite has a soft edge
+   * and a size-carrying alpha now, so nothing needs inflating to stay visible.
+   */
+  sizeScale = 1.0;
+  /**
+   * The liquid's colour, for `DropletColorMode.Liquid`. Linear RGB, from the
+   * fluid preset, so airborne liquid and the film on the wall agree.
+   */
+  liquidTint: [number, number, number] = [0.95, 0.92, 0.78];
 
   constructor(capacity: number) {
     this.capacity = capacity;
@@ -61,6 +85,7 @@ export class DropletView {
         attribute vec3 aColor;
         attribute float aSize;
         varying vec3 vColor;
+        varying float vAlpha;
         uniform float uPixelRatio;
         uniform float uViewHeight;
         void main() {
@@ -70,25 +95,70 @@ export class DropletView {
           // Perspective-correct: a droplet's on-screen size should shrink with
           // distance the same way the fixture does, otherwise depth reads wrong.
           float scale = uViewHeight * projectionMatrix[1][1] * 0.5;
-          gl_PointSize = clamp(aSize * scale / max(0.02, -mv.z), 1.4, 40.0) * uPixelRatio;
+          // Below about three pixels a hard-edged disc is an aliased square, and
+          // a spray of aliased squares reads as sensor noise rather than as
+          // liquid. The sprite is never drawn smaller than that; the *opacity*
+          // carries the size instead, so a 0.2 mm satellite far from the camera
+          // fades rather than turning into a bright pixel the size of a 5 mm drop.
+          float want = aSize * scale / max(0.02, -mv.z);
+          float px = clamp(want, 3.0, 44.0);
+          vAlpha = clamp(want / px, 0.12, 1.0);
+          gl_PointSize = px * uPixelRatio;
         }
       `,
       fragmentShader: /* glsl */ `
         varying vec3 vColor;
+        varying float vAlpha;
         void main() {
           vec2 d = gl_PointCoord - vec2(0.5);
           float r2 = dot(d, d);
           if (r2 > 0.25) discard;
-          // Cheap spherical shading so a dense spray still reads as droplets
-          // rather than as a flat cloud.
+          // A droplet is a lens, not a marble.
+          //
+          // The old sprite was an opaque sphere with a diffuse term and a tight
+          // highlight, which is how you draw a bead. Water in air does almost
+          // nothing diffusely: it is transparent through the middle, where you see
+          // whatever is behind it, and bright round the edge, where the view grazes
+          // the surface and Fresnel turns it into a mirror. So the *alpha* carries
+          // the shape -- near-clear at the centre, near-opaque at the rim -- and the
+          // only bright things on it are the rim and one specular glint. That is
+          // also why real spray photographs as a haze of tiny rings rather than as
+          // a cloud of dots.
           float z = sqrt(max(0.0, 0.25 - r2)) * 2.0;
-          float lit = 0.45 + 0.55 * z;
-          float spec = pow(z, 12.0) * 0.5;
-          gl_FragColor = vec4(vColor * lit + vec3(spec), 1.0);
+          // Fresnel on the sphere, sharpened. The reflectance of water only runs
+          // away in the last few degrees of grazing -- it is 0.02 at normal, still
+          // under 0.1 at sixty degrees off, and reaches one only at the silhouette
+          // -- so the bright part of a drop is a *thin* ring at its outline. The
+          // 2.5 power spread it over most of the disc, and a disc that is bright
+          // everywhere but the very middle is a pearl.
+          float fres = pow(1.0 - z, 5.0);
+          float rim = smoothstep(0.55, 0.98, 1.0 - z);
+          // One glint, offset up and left, where the key light sits, plus the spot
+          // where the drop focuses that light through itself onto its far side.
+          // A sphere of water has a focal length of about 1.5 radii, so the
+          // caustic lands just inside the opposite limb, and it is the single most
+          // recognisable thing about a backlit droplet.
+          vec2 hg = d - vec2(-0.13, -0.13);
+          float spec = pow(max(0.0, 1.0 - dot(hg, hg) * 40.0), 3.0) * 1.6;
+          vec2 cg = d - vec2(0.17, 0.17);
+          float caustic = pow(max(0.0, 1.0 - dot(cg, cg) * 55.0), 2.0) * 0.5;
+          // Soft rim on the sprite itself, so a three-pixel droplet is not a
+          // stamped hole. Two pixels of falloff is the difference between spray
+          // and confetti.
+          float edge = smoothstep(0.25, 0.17, r2);
+          // The body is what you see *through* the drop, so it is nearly clear and
+          // carries only the liquid's own colour; the bright things are the rim,
+          // the glint and the caustic. It used to be a 30%-opaque wash of the
+          // liquid colour at 55% brightness over the whole disc, which is an
+          // opaque bead of wax -- and at the close cameras, where a drop covers
+          // forty pixels, that was the most prominent object in the frame.
+          vec3 col = vColor * (0.32 + 0.55 * rim) + vec3(spec + caustic);
+          float a = (0.10 + 0.62 * fres + 0.45 * rim + spec + caustic) * vAlpha * edge;
+          gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
         }
       `,
-      transparent: false,
-      depthWrite: true,
+      transparent: true,
+      depthWrite: false,
     });
 
     this.points = new THREE.Points(this.geometry, this.material);
@@ -116,7 +186,16 @@ export class DropletView {
       let r: number;
       let g: number;
       let b: number;
-      if (this.colorMode === DropletColorMode.Speed) {
+      if (this.colorMode === DropletColorMode.Liquid) {
+        // One colour, lightened a little for the smallest drops: a 0.2 mm
+        // satellite has almost no path length through it and reads nearly white,
+        // while a 5 mm drop carries enough liquid to show its own colour.
+        const t = Math.min(1, ps.diameter[i] / 0.004);
+        const lift = 1 - 0.45 * t;
+        r = Math.min(1, this.liquidTint[0] + lift * (1 - this.liquidTint[0]));
+        g = Math.min(1, this.liquidTint[1] + lift * (1 - this.liquidTint[1]));
+        b = Math.min(1, this.liquidTint[2] + lift * (1 - this.liquidTint[2]));
+      } else if (this.colorMode === DropletColorMode.Speed) {
         const sp = Math.hypot(ps.vx[i], ps.vy[i], ps.vz[i]);
         const t = Math.min(1, sp / 4);
         r = 0.15 + 0.85 * t;

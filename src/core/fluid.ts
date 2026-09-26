@@ -24,6 +24,26 @@ export interface FluidProperties {
   contactAngleReceding: number;
   /** Temperature, K -- carried for reporting, not used in the solver. */
   temperature: number;
+  /**
+   * Linear RGB the ceramic beneath a *deep* layer of this fluid is multiplied by.
+   *
+   * An optical property of the liquid, and it belongs here for the same reason
+   * surface tension does: it differs between the presets, and the renderer had it
+   * as one hardcoded constant. Selecting the water reference -- the preset that
+   * exists so the tool can reproduce published laboratory experiments -- still
+   * drew amber liquid in the bowl, which is the appearance disagreeing with the
+   * stated fluid on the one setting whose entire purpose is fidelity to a
+   * measurement.
+   *
+   * Urine's colour is urobilin, which absorbs in the blue around 450-470 nm and
+   * barely at all in the red, so the blue channel carries almost all of the
+   * variation across the concentration range and the red channel almost none.
+   * The film is tens of microns over most of the wall and millimetres only in the
+   * sump, so the shader ramps toward this over depth rather than applying it flat:
+   * a damp wall is faintly warm and a standing pool is properly coloured, which is
+   * what a used urinal looks like.
+   */
+  tint: [number, number, number];
   /** Free-text provenance for the numbers, surfaced in the UI. */
   source: string;
 }
@@ -50,6 +70,8 @@ export const URINE_37C: FluidProperties = {
   contactAngleAdvancing: deg(45),
   contactAngleReceding: deg(25),
   temperature: 310.15,
+  // Straw, the mid-range clinical description and the colour of an ordinary void.
+  tint: [0.88, 0.83, 0.50],
   source: 'SG 1.005-1.030; nu=0.829 cSt @37C (Rossi 2013); sigma = water - 12..18 mN/m',
 };
 
@@ -65,6 +87,8 @@ export const URINE_DILUTE: FluidProperties = {
   contactAngleAdvancing: deg(52),
   contactAngleReceding: deg(30),
   temperature: 310.15,
+  // Pale, nearly colourless: the same urobilin load spread through more water.
+  tint: [0.95, 0.93, 0.80],
   source: 'Low-solute limit of the urine range',
 };
 
@@ -81,6 +105,8 @@ export const URINE_CONCENTRATED: FluidProperties = {
   contactAngleAdvancing: deg(38),
   contactAngleReceding: deg(20),
   temperature: 310.15,
+  // Dark amber. The blue channel carries the whole of the concentration range.
+  tint: [0.82, 0.66, 0.26],
   source: 'High-solute limit; sigma depressed by urea and organic solutes',
 };
 
@@ -97,6 +123,8 @@ export const WATER_20C: FluidProperties = {
   contactAngleAdvancing: deg(55),
   contactAngleReceding: deg(35),
   temperature: 293.15,
+  // Colourless at this scale. Water's own absorption needs metres to show.
+  tint: [0.97, 0.98, 1.0],
   source: 'CRC Handbook',
 };
 

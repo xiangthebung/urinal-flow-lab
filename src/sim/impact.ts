@@ -511,9 +511,27 @@ export class ImpactResolver {
       // as this did, left the liquid to seep outward under hydrostatic pressure
       // alone and the wall read as absorbent rather than glazed.
       const spread = vNormal * this.params.wallJetEfficiency;
-      // A jet spreads over far more than its own width; a single droplet barely
-      // more than its own. Scaled by the coherence of what arrived.
-      const footprint = d * (ev.coherent ? this.params.jetFootprintRatio : 0.75);
+      // How wide the arrival actually wets.
+      //
+      // A jet spreads over far more than its own width, and that case has its own
+      // ratio. A droplet was given a flat 0.75 d of radius -- one and a half
+      // diameters across -- which is roughly what a drop that arrives and stops
+      // would cover, and not what one arriving at several metres a second does. An
+      // impacting drop flattens into a lamella whose maximum diameter is
+      // beta_max * d with beta_max going as We^(1/4); 0.87 We^0.25 is the standard
+      // low-viscosity fit and is good to about ten percent over the range here.
+      // Measured on the default bowl, the normal Weber number at the wall is
+      // around 48, so beta_max is 2.3 and the wetted radius is 1.15 d rather than
+      // 0.75 -- three times the area, spread over three or four cells instead of
+      // landing in one.
+      //
+      // It is not only a footprint: depositing an arrival into a single cell makes
+      // a spike the advection scheme then has to smear away, and a smeared spike
+      // is the soft soaked-in edge a glazed surface never shows. The patchwork of
+      // hard-edged blobs the wetted region used to render as came from here.
+      const betaMax = clamp(0.87 * Math.pow(Math.max(1e-6, th.weberNormal), 0.25), 1, 6);
+      const footprint =
+        d * (ev.coherent ? this.params.jetFootprintRatio : 0.5 * betaMax);
       film.depositJet(cell, depositVolume, velU, velV, spread, footprint);
     }
     this.totals.depositedVolume += depositVolume;

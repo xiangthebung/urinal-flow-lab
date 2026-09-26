@@ -100,10 +100,26 @@ export class FilmSolver implements FilmSink {
   readonly hu: Float64Array;
   /** Momentum density along v, m^2/s. */
   readonly hv: Float64Array;
+  /**
+   * Voided liquid per unit area, m. Divide by `h` for the local concentration.
+   *
+   * Carried because the flush is water and the void is not, and without this the
+   * two are the same liquid: the wash-down added thickness, Beer-Lambert over a
+   * thicker layer gave *more* colour, and rinsing the bowl made it look dirtier.
+   * That is the opposite of what a flush is for and it would have been the most
+   * visible wrong thing in the tool.
+   *
+   * Advected as its own conserved quantity on the same donor-cell fluxes as the
+   * thickness, so it cannot separate from the liquid carrying it. It is a tracer,
+   * not a volume: it is deliberately absent from the closure sum, because adding
+   * it would be counting the same millilitres twice.
+   */
+  readonly hs: Float64Array;
 
   private hNew: Float64Array;
   private huNew: Float64Array;
   private hvNew: Float64Array;
+  private hsNew: Float64Array;
   /** Curvature of the free surface plus substrate, 1/m. Scratch. */
   private curvature: Float64Array;
   /** Signed volume flux across each u-face this substep, m^3. Scratch. */
@@ -142,6 +158,22 @@ export class FilmSolver implements FilmSink {
   /** Per-boundary-cell accumulators so drips leave as droplets, not a trickle. */
   private edgeAccum: Float64Array;
 
+  /**
+   * Liquid the fixture is built to hold, per cell, m.
+   *
+   * The trap seal. The outlet in this solver is an orifice discharging on the
+   * local head, which drains a cell to nothing -- so standing a seal in the sump
+   * and walking away emptied it in about thirty milliseconds, and the pool a real
+   * urinal always has could not exist. A trap is not an open hole: it holds water
+   * up to its weir and passes only what arrives above that. This array is that
+   * weir, expressed as a depth on the cells it covers.
+   *
+   * It is also the floor for `excessVolume`, which is the drainable part of the
+   * film. Liquid a fixture is *designed* to retain is not a drainage failure, and
+   * counting it as one would report every sealed fixture as never clearing.
+   */
+  readonly sealThickness: Float64Array;
+
   private nu: number;
   private nv: number;
 
@@ -161,6 +193,8 @@ export class FilmSolver implements FilmSink {
     this.h = new Float64Array(n);
     this.hu = new Float64Array(n);
     this.hv = new Float64Array(n);
+    this.hs = new Float64Array(n);
+    this.hsNew = new Float64Array(n);
     this.hNew = new Float64Array(n);
     this.huNew = new Float64Array(n);
     this.hvNew = new Float64Array(n);
@@ -172,12 +206,18 @@ export class FilmSolver implements FilmSink {
     this.residenceTime = new Float64Array(n);
     this.peakThickness = new Float64Array(n);
     this.edgeAccum = new Float64Array(n);
+    this.sealThickness = new Float64Array(n);
   }
 
   reset(): void {
+    // `sealThickness` deliberately survives: it is a property of the fixture, not
+    // of the run, and it is rebuilt by `Simulation.placeTrapSeal` whenever the
+    // geometry changes. Clearing it here would silently unseal the trap on every
+    // restart and the pool would drain away again.
     this.h.fill(0);
     this.hu.fill(0);
     this.hv.fill(0);
+    this.hs.fill(0);
     this.residenceTime.fill(0);
     this.peakThickness.fill(0);
     this.edgeAccum.fill(0);
@@ -209,7 +249,14 @@ export class FilmSolver implements FilmSink {
    * it is not scripted anywhere -- it is what shallow-water flow does when a fast
    * thin stream runs into slower deeper liquid.
    */
-  deposit(cell: number, volume: number, velU: number, velV: number): void {
+  deposit(
+    cell: number,
+    volume: number,
+    velU: number,
+    velV: number,
+    /** 1 for voided liquid, 0 for flush water. */
+    concentration = 1
+  ): void {
     const area = this.surface.cellArea[cell];
     if (area <= 0) return;
     const dh = volume / area;
@@ -219,8 +266,16 @@ export class FilmSolver implements FilmSink {
     // it and a large addition dominates.
     this.hu[cell] += dh * velU;
     this.hv[cell] += dh * velV;
+    this.hs[cell] += dh * concentration;
     this.h[cell] = h1;
     this.depositedVolume += volume;
+  }
+
+  /** Local concentration of voided liquid, 0 to 1. */
+  concentrationAt(cell: number): number {
+    const h = this.h[cell];
+    if (h <= FILM_DRY_THICKNESS) return 0;
+    return Math.min(1, Math.max(0, this.hs[cell] / h));
   }
 
   /**
@@ -267,11 +322,29 @@ export class FilmSolver implements FilmSink {
     const s = this.surface;
     const du = Math.max(1e-6, s.cellDu[cell]);
     const dv = Math.max(1e-6, s.cellDv[cell]);
-    // Footprint in cells, bounded: one ring is enough at coarse resolution and
-    // more than three would smear the impact over a region the jet never touches.
-    const ru = Math.min(3, Math.max(0, Math.round(footprintRadius / du)));
-    const rv = Math.min(3, Math.max(0, Math.round(footprintRadius / dv)));
-    if (ru === 0 && rv === 0) {
+    const R = Math.max(1e-6, footprintRadius);
+
+    // The footprint is a circle on the wall, so it has to be measured on the
+    // wall.
+    //
+    // This used to normalise the offsets by the *index* extents -- `di / ru` and
+    // `dj / rv` after rounding each to a whole number of cells -- which makes the
+    // deposited patch an ellipse in index space of whatever aspect the grid
+    // happens to have there, not a circle in millimetres. The grid is nowhere
+    // near isotropic: on the default bowl at 72x132, `cellDu` runs 3.7-55.3 mm
+    // against `cellDv` at 1.5-12.1 mm, so one 12 mm footprint came out anywhere
+    // between 0.22 and 3.22 cells across in u and 0.99 to 7.90 in v. Wherever a
+    // rounding hit zero on one axis the patch collapsed to a bar one cell wide,
+    // and the old cap of three cells truncated it in the other direction. The
+    // arms of the cross in the `Film thickness` view start here.
+    //
+    // Offsets are now taken in metres and normalised by the physical radius, so
+    // the patch is the same circle at every resolution and on every part of the
+    // grid, and the radial momentum points along the wall rather than along the
+    // parameterisation.
+    const ru = Math.min(6, Math.ceil(R / du));
+    const rv = Math.min(6, Math.ceil(R / dv));
+    if (ru === 0 || rv === 0) {
       this.deposit(cell, volume, velU, velV);
       return;
     }
@@ -288,7 +361,7 @@ export class FilmSolver implements FilmSink {
       for (let di = -ru; di <= ru; di++) {
         const i = i0 + di;
         if (i < 0 || i >= this.nu) continue;
-        const rn = Math.hypot(ru > 0 ? di / ru : 0, rv > 0 ? dj / rv : 0);
+        const rn = Math.hypot(di * du, dj * dv) / R;
         if (rn > 1) continue;
         wSum += 0.5 * (1 + Math.cos(Math.PI * rn));
       }
@@ -304,9 +377,10 @@ export class FilmSolver implements FilmSink {
       for (let di = -ru; di <= ru; di++) {
         const i = i0 + di;
         if (i < 0 || i >= this.nu) continue;
-        const nu2 = ru > 0 ? di / ru : 0;
-        const nv2 = rv > 0 ? dj / rv : 0;
-        const rn = Math.hypot(nu2, nv2);
+        const offU = di * du;
+        const offV = dj * dv;
+        const dist = Math.hypot(offU, offV);
+        const rn = dist / R;
         if (rn > 1) continue;
         const w = (0.5 * (1 + Math.cos(Math.PI * rn))) / wSum;
 
@@ -315,9 +389,9 @@ export class FilmSolver implements FilmSink {
         // radial direction, which is correct -- that is the stagnation point.
         let su = 0;
         let sv = 0;
-        if (rn > 1e-6) {
-          su = (nu2 / rn) * spreadSpeed;
-          sv = (nv2 / rn) * spreadSpeed;
+        if (dist > 1e-9) {
+          su = (offU / dist) * spreadSpeed;
+          sv = (offV / dist) * spreadSpeed;
         }
         this.deposit(this.idx(i, j), volume * w, velU + su, velV + sv);
       }
@@ -348,7 +422,12 @@ export class FilmSolver implements FilmSink {
     let sum = 0;
     const a = this.surface.cellArea;
     for (let c = 0; c < this.h.length; c++) {
-      const d = this.h[c] - retention;
+      // The floor is whichever is deeper: the residual layer physics leaves
+      // behind, or the seal the fixture is built to hold. Without the second, a
+      // sealed trap reports its own design volume as avoidable residue and every
+      // fixture with one scores as never clearing.
+      const floor = Math.max(retention, this.sealThickness[c]);
+      const d = this.h[c] - floor;
       if (d > 0) sum += d * a[c];
     }
     return sum;
@@ -471,9 +550,14 @@ export class FilmSolver implements FilmSink {
         this.h[c] = 0;
         this.hu[c] = 0;
         this.hv[c] = 0;
+        this.hs[c] = 0;
         this.sanitisedCells++;
         continue;
       }
+      // The tracer is a fraction of the liquid present, so it cannot exceed it or
+      // go negative however the fluxes rounded.
+      if (!Number.isFinite(this.hs[c])) this.hs[c] = 0;
+      else this.hs[c] = Math.min(h, Math.max(0, this.hs[c]));
       if (!Number.isFinite(this.hu[c]) || !Number.isFinite(this.hv[c])) {
         this.hu[c] = 0;
         this.hv[c] = 0;
@@ -557,6 +641,7 @@ export class FilmSolver implements FilmSink {
     this.hNew.set(this.h);
     this.huNew.set(this.hu);
     this.hvNew.set(this.hv);
+    this.hsNew.set(this.hs);
 
     // ---------------------------------------------------------------------
     // 1. Conservative, positivity-preserving advection.
@@ -681,16 +766,21 @@ export class FilmSolver implements FilmSink {
         const hDon = Math.max(FILM_DRY_THICKNESS, this.h[donor]);
         const momU = (this.hu[donor] / hDon) * flux;
         const momV = (this.hv[donor] / hDon) * flux;
+        // The tracer rides the same flux, so what is dissolved in the liquid
+        // cannot be left behind by it or arrive without it.
+        const sol = (this.hs[donor] / hDon) * flux;
 
         if (hasL) {
           this.hNew[cL] -= flux / s.cellArea[cL];
           this.huNew[cL] -= momU / s.cellArea[cL];
           this.hvNew[cL] -= momV / s.cellArea[cL];
+          this.hsNew[cL] -= sol / s.cellArea[cL];
         }
         if (hasR) {
           this.hNew[cR] += flux / s.cellArea[cR];
           this.huNew[cR] += momU / s.cellArea[cR];
           this.hvNew[cR] += momV / s.cellArea[cR];
+          this.hsNew[cR] += sol / s.cellArea[cR];
         }
         // Leaving through a side edge means running down the outside of the
         // fixture: a real staining failure, so it is recorded rather than
@@ -720,16 +810,19 @@ export class FilmSolver implements FilmSink {
         const hDon = Math.max(FILM_DRY_THICKNESS, this.h[donor]);
         const momU = (this.hu[donor] / hDon) * flux;
         const momV = (this.hv[donor] / hDon) * flux;
+        const sol = (this.hs[donor] / hDon) * flux;
 
         if (hasD) {
           this.hNew[cD] -= flux / s.cellArea[cD];
           this.huNew[cD] -= momU / s.cellArea[cD];
           this.hvNew[cD] -= momV / s.cellArea[cD];
+          this.hsNew[cD] -= sol / s.cellArea[cD];
         }
         if (hasU) {
           this.hNew[cU] += flux / s.cellArea[cU];
           this.huNew[cU] += momU / s.cellArea[cU];
           this.hvNew[cU] += momV / s.cellArea[cU];
+          this.hsNew[cU] += sol / s.cellArea[cU];
         }
         if (!hasD) {
           this.spilledTop += Math.abs(flux);
@@ -760,6 +853,7 @@ export class FilmSolver implements FilmSink {
           this.hNew[c] = h;
           this.huNew[c] = 0;
           this.hvNew[c] = 0;
+          this.hsNew[c] = 0;
           continue;
         }
 
@@ -824,15 +918,29 @@ export class FilmSolver implements FilmSink {
         // coefficient to model a strainer or a partly blocked outlet, which is
         // one of the more common real-world causes of standing liquid.
         if (s.cellIsDrain[c]) {
+          // Only the head *above* the seal can leave. A trap passes what arrives
+          // over its weir and keeps the rest; an orifice discharging to zero is a
+          // floor drain, which is a different fixture.
+          const hold = this.sealThickness[c];
+          const over = h - hold;
+          if (over <= 0) {
+            this.hNew[c] = h;
+          } else {
           const gN = Math.max(0.05, press);
-          const vOut = this.params.drainCoefficient * Math.sqrt(2 * gN * h);
-          const removed = Math.min(h, vOut * dt);
+          const vOut = this.params.drainCoefficient * Math.sqrt(2 * gN * over);
+          const removed = Math.min(over, vOut * dt);
+          // Draining removes liquid and whatever is dissolved in it, in
+          // proportion. Anything else concentrates the tracer as a fixture
+          // empties, which would make a well-draining bowl read as the dirtiest.
+          const hBefore = h;
           h -= removed;
+          if (hBefore > 1e-12) this.hsNew[c] *= h / hBefore;
           this.hNew[c] = h;
           this.drainedVolume += removed * s.cellArea[c];
           if (h <= FILM_DRY_THICKNESS) {
             this.huNew[c] = 0;
             this.hvNew[c] = 0;
+          }
           }
         }
 
@@ -844,6 +952,7 @@ export class FilmSolver implements FilmSink {
           const hDrip = this.params.dripThresholdRatio * lCap;
           if (h > hDrip) {
             const excess = h - hDrip;
+            if (h > 1e-12) this.hsNew[c] *= hDrip / h;
             this.hNew[c] = hDrip;
             const vol = excess * s.cellArea[c];
             this.drippedVolume += vol;
@@ -856,6 +965,7 @@ export class FilmSolver implements FilmSink {
     this.h.set(this.hNew);
     this.hu.set(this.huNew);
     this.hv.set(this.hvNew);
+    this.hs.set(this.hsNew);
 
     // Convert accumulated edge outflow into discrete drips once each spot has
     // gathered a droplet's worth. A continuous trickle would never be counted as
@@ -995,13 +1105,13 @@ export class FilmSolver implements FilmSink {
   }
 
   /** Inject a steady flux into a row of cells, for validation cases. */
-  injectRow(vIndex: number, fluxPerWidth: number, dt: number): void {
+  injectRow(vIndex: number, fluxPerWidth: number, dt: number, concentration = 1): void {
     const s = this.surface;
     for (let i = 0; i < this.nu; i++) {
       const c = this.idx(i, vIndex);
       const width = s.cellDu[c];
       const vol = fluxPerWidth * width * dt;
-      this.deposit(c, vol, 0, 0);
+      this.deposit(c, vol, 0, 0, concentration);
     }
   }
 

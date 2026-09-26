@@ -29,7 +29,7 @@ import { FilmSolver, defaultFilmParams } from '../sim/film';
 import { ImpactResolver, defaultImpactParams } from '../sim/impact';
 import { FlowPhase } from '../sim/metrics';
 import { defaultStreamParams } from '../sim/stream';
-import { Simulation, defaultConfig } from '../sim/simulation';
+import { applyPreset, Simulation, defaultConfig } from '../sim/simulation';
 import { getPreset } from '../geometry/presets';
 
 /**
@@ -1104,16 +1104,15 @@ function endToEndTests(): TestResult[] {
   const mk = (preset: string, aim: number, seed: number) => {
     const c = defaultConfig();
     const p = getPreset(preset);
-    c.surface = { ...p.params };
-    // The preset's own casting and metalwork, not the defaults. This took the
-    // interior alone, so the headline claim was measured on two fixtures that
+    // The preset's own casting, metalwork and water, not the defaults. This took
+    // the interior alone, so the headline claim was measured on two fixtures that
     // neither the app nor the picker shows: a `flat-wall` wearing the default
     // bowl's exterior. The casting is solid and splashes, it hides a fifth to a
     // half of the interior from the exit point, and the metalwork stands closer
     // to the user than any ceramic, so "same stream, same seed, same aim" was
     // controlling everything except the part of the fixture nearest the user.
-    c.casting = { ...(p.shell ?? {}) };
-    c.fittings = { ...(p.fittings ?? {}) };
+    // `applyPreset` is one call so a fourth per-preset field cannot re-open it.
+    applyPreset(c, p);
     c.drainTime = 2;
     c.resolutionU = 48;
     c.resolutionV = 96;
@@ -1320,10 +1319,7 @@ function endToEndTests(): TestResult[] {
   {
     const base = () => {
       const c = defaultConfig();
-      const p = getPreset('classic-bowl');
-      c.surface = { ...p.params };
-      c.casting = { ...(p.shell ?? {}) };
-      c.fittings = { ...(p.fittings ?? {}) };
+      applyPreset(c, getPreset('classic-bowl'));
       c.stream.voidVolume = 150e-6;
       c.drainTime = 1;
       c.resolutionU = 48;
@@ -1463,9 +1459,7 @@ function endToEndTests(): TestResult[] {
     const mkRun = (tracking: 'fixed' | 'tracked') => {
       const c = defaultConfig();
       const p = getPreset('classic-bowl');
-      c.surface = { ...p.params };
-      c.casting = { ...(p.shell ?? {}) };
-      c.fittings = { ...(p.fittings ?? {}) };
+      applyPreset(c, p);
       c.stream.voidVolume = 150e-6;
       c.drainTime = 1;
       c.resolutionU = 48;
